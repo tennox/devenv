@@ -114,9 +114,14 @@ with lib; let
     ${concatMapStrings (user: ''
         echo "Adding user: ${user.name}"
         ${optionalString (user.password != null) "password='${user.password}'"}
-        ( echo "CREATE USER IF NOT EXISTS '${user.name}'@'localhost' ${optionalString (user.password != null) "IDENTIFIED BY '$password'"};"
+        (
+          if [ "${user.name}" = "root" ] && [ -n "$password" ]; then
+            echo "ALTER USER 'root'@'localhost' IDENTIFIED BY '$password';"
+          else
+            echo "CREATE USER IF NOT EXISTS '${user.name}'@'${user.host}' ${optionalString (user.password != null) "IDENTIFIED BY '$password'"};"
+          fi
           ${concatStringsSep "\n" (mapAttrsToList (database: permission: ''
-            echo 'GRANT ${permission} ON ${database} TO `${user.name}`@`localhost`;'
+            echo 'GRANT ${permission} ON ${database} TO `${user.name}`@`${user.host}`;'
           '')
           user.ensurePermissions)}
         ) | MYSQL_PWD="" ${mysqlWrappedEmpty}/bin/mysql -u root -N
@@ -223,6 +228,14 @@ in
             description = ''
               Name of the user to ensure.
             '';
+          };
+
+          host = lib.mkOption {
+            type = types.str;
+            description = ''
+              Host of the user to ensure.
+            '';
+            default = "localhost";
           };
 
           password = lib.mkOption {

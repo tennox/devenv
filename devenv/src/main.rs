@@ -1,64 +1,118 @@
-mod cli;
-mod command;
-mod config;
-mod devenv;
-mod log;
+use clap::crate_version;
+use devenv::{
+    Devenv,
+    cli::{Cli, Commands, ContainerCommand, InputsCommand, ProcessesCommand, TasksCommand},
+    config, log,
+};
+use miette::{IntoDiagnostic, Result, WrapErr, bail};
+use std::{env, os::unix::process::CommandExt, process::Command, sync::Arc};
+use tempfile::TempDir;
+use tokio_shutdown::Shutdown;
+use tracing::{info, warn};
 
-use clap::{crate_version, Parser};
-use cli::{Cli, Commands, ContainerCommand, InputsCommand, ProcessesCommand};
-use devenv::Devenv;
-use miette::Result;
+#[tokio::main]
+async fn main() -> Result<()> {
+    let shutdown = Shutdown::new();
+    shutdown.install_signals().await;
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
+    tokio::select! {
+        result = run_devenv(shutdown.clone()) => result,
+        _ = shutdown.wait_for_shutdown() => Ok(()),
+    }
+}
+
+async fn run_devenv(shutdown: Arc<Shutdown>) -> Result<()> {
+    let cli = Cli::parse_and_resolve_options();
+
+    let print_version = || {
+        println!(
+            "devenv {} ({})",
+            crate_version!(),
+            cli.global_options.system
+        );
+        Ok(())
+    };
+
+    let command = match cli.command {
+        None | Some(Commands::Version) => return print_version(),
+        Some(Commands::Direnvrc) => {
+            print!("{}", *devenv::DIRENVRC);
+            return Ok(());
+        }
+        Some(cmd) => cmd,
+    };
 
     let level = if cli.global_options.verbose {
         log::Level::Debug
+    } else if cli.global_options.quiet {
+        log::Level::Silent
     } else {
-        log::Level::Info
+        log::Level::default()
     };
 
-    let logger = log::Logger::new(level);
+    log::init_tracing(
+        level,
+        cli.global_options.log_format,
+        cli.global_options.trace_export_file.as_deref(),
+        shutdown.clone(),
+    );
 
     let mut config = config::Config::load()?;
     for input in cli.global_options.override_input.chunks_exact(2) {
-        config.add_input(&input[0].clone(), &input[1].clone(), &[]);
+        config
+            .override_input_url(&input[0].clone(), &input[1].clone())
+            .wrap_err_with(|| {
+                format!(
+                    "Failed to override input {} with URL {}",
+                    &input[0], &input[1]
+                )
+            })?;
     }
 
-    let options = devenv::DevenvOptions {
-        logger: Some(logger.clone()),
-        global_options: Some(cli.global_options),
+    let mut options = devenv::DevenvOptions {
         config,
-        ..Default::default()
+        global_options: Some(cli.global_options),
+        devenv_root: None,
+        devenv_dotfile: None,
+        shutdown: shutdown.clone(),
     };
 
-    let mut devenv = Devenv::new(options);
-
-    if !matches!(cli.command, Commands::Version {} | Commands::Gc { .. }) {
-        devenv.create_directories()?;
-    }
-
-    match cli.command {
-        Commands::Shell { cmd, args } => devenv.shell(&cmd, &args, true),
-        Commands::Test {
-            dont_override_dotfile,
-        } => {
-            let tmpdir = tempdir::TempDir::new_in(devenv.devenv_root(), ".devenv")
-                .expect("Failed to create temporary directory");
-            if !dont_override_dotfile {
-                logger.info(&format!(
-                    "Overriding .devenv to {}",
-                    tmpdir.path().file_name().unwrap().to_str().unwrap()
-                ));
-                devenv.update_devenv_dotfile(tmpdir.as_ref());
-            }
-            devenv.test()
+    // we let Drop delete the dir after all commands have ran
+    let _tmpdir = if let Commands::Test {
+        dont_override_dotfile,
+    } = command
+    {
+        let pwd = std::env::current_dir()
+            .into_diagnostic()
+            .wrap_err("Failed to get current directory")?;
+        let tmpdir = TempDir::with_prefix_in(".devenv.", pwd)
+            .into_diagnostic()
+            .wrap_err("Failed to create temporary directory")?;
+        if !dont_override_dotfile {
+            let file_name = tmpdir
+                .path()
+                .file_name()
+                .ok_or_else(|| miette::miette!("Temporary directory path is invalid"))?
+                .to_str()
+                .ok_or_else(|| {
+                    miette::miette!("Temporary directory name contains invalid Unicode")
+                })?;
+            info!("Overriding .devenv to {}", file_name);
+            options.devenv_dotfile = Some(tmpdir.path().to_path_buf());
         }
-        Commands::Version {} => Ok(println!(
-            "devenv {} ({})",
-            crate_version!(),
-            devenv.global_options.system
-        )),
+        Some(tmpdir)
+    } else {
+        None
+    };
+
+    let mut devenv = Devenv::new(options).await;
+
+    match command {
+        Commands::Shell { cmd, ref args } => match cmd {
+            Some(cmd) => devenv.exec_in_shell(Some(cmd), args).await,
+            None => devenv.shell().await,
+        },
+        Commands::Test { .. } => devenv.test().await,
         Commands::Container {
             registry,
             copy,
@@ -67,73 +121,128 @@ fn main() -> Result<()> {
             name,
             command,
         } => {
-            devenv.container_name = name.clone();
-            match name {
-                None => {
-                    if let Some(c) = command {
-                        match c {
-                            ContainerCommand::Build { name } => {
-                                devenv.container_name = Some(name.clone());
-                                let _ = devenv.container_build(&name)?;
-                            }
-                            ContainerCommand::Copy { name } => {
-                                devenv.container_name = Some(name.clone());
-                                devenv.container_copy(&name, &copy_args, registry.as_deref())?;
-                            }
-                            ContainerCommand::Run { name } => {
-                                devenv.container_name = Some(name.clone());
-                                devenv.container_run(&name, &copy_args, registry.as_deref())?;
-                            }
-                        }
-                    }
+            // Backwards compatibility for the legacy container flags:
+            //   `devenv container <name> --copy` is now `devenv container copy <name>`
+            //   `devenv container <name> --docker-run` is now `devenv container run <name>`
+            //   `devenv container <name>` is now `devenv container build <name>`
+            let command = if let Some(name) = name {
+                if copy {
+                    warn!(
+                        devenv.is_user_message = true,
+                        "The --copy flag is deprecated. Use `devenv container copy` instead."
+                    );
+                    ContainerCommand::Copy { name }
+                } else if docker_run {
+                    warn!(
+                        devenv.is_user_message = true,
+                        "The --docker-run flag is deprecated. Use `devenv container run` instead."
+                    );
+                    ContainerCommand::Run { name }
+                } else {
+                    warn!(
+                        devenv.is_user_message = true,
+                        "Calling `devenv container` without a subcommand is deprecated. Use `devenv container build {name}` instead."
+                    );
+                    ContainerCommand::Build { name }
                 }
-                Some(name) => {
-                    match (copy, docker_run) {
-                        (true, false) => {
-                            logger.warn(
-                                "--copy flag is deprecated, use `devenv container copy` instead",
-                            );
-                            devenv.container_copy(&name, &copy_args, registry.as_deref())?;
-                        }
-                        (_, true) => {
-                            logger.warn(
-                                "--docker-run flag is deprecated, use `devenv container run` instead",
-                            );
-                            devenv.container_run(&name, &copy_args, registry.as_deref())?;
-                        }
-                        _ => {
-                            logger.warn("Calling without a subcommand is deprecated, use `devenv container build` instead");
-                            let _ = devenv.container_build(&name)?;
-                        }
-                    };
+            } else {
+                // Error out if we don't have a subcommand at this point.
+                if let Some(cmd) = command {
+                    cmd
+                } else {
+                    // Impossible. This handled by clap, but if we have no subcommand at this point, error out.
+                    bail!(
+                        "No container subcommand provided. Use `devenv container build` or specify a command."
+                    )
                 }
             };
+
+            match command {
+                ContainerCommand::Build { name } => {
+                    let path = devenv.container_build(&name).await?;
+                    // Print the path to the built container to stdout
+                    println!("{path}");
+                }
+                ContainerCommand::Copy { name } => {
+                    devenv
+                        .container_copy(&name, &copy_args, registry.as_deref())
+                        .await?;
+                }
+                ContainerCommand::Run { name } => {
+                    devenv
+                        .container_run(&name, &copy_args, registry.as_deref())
+                        .await?;
+                }
+            }
+
             Ok(())
         }
         Commands::Init { target } => devenv.init(&target),
-        Commands::Search { name } => devenv.search(&name),
-        Commands::Gc {} => devenv.gc(),
-        Commands::Info {} => devenv.info(),
-        Commands::Repl {} => devenv.repl(),
-        Commands::Build { attributes } => devenv.build(&attributes),
-        Commands::Update { name } => devenv.update(&name),
-        Commands::Up { process, detach } => devenv.up(process.as_deref(), &detach, &detach),
-        Commands::Processes { command } => match command {
-            ProcessesCommand::Up { process, detach } => {
-                devenv.up(process.as_deref(), &detach, &detach)
+        Commands::Generate { .. } => match which::which("devenv-generate") {
+            Ok(devenv_generate) => {
+                let error = Command::new(devenv_generate)
+                    .args(std::env::args().skip(1).filter(|arg| arg != "generate"))
+                    .exec();
+                miette::bail!("failed to execute devenv-generate {error}");
             }
-            ProcessesCommand::Down {} => devenv.down(),
+            Err(_) => {
+                miette::bail!(indoc::formatdoc! {"
+                    devenv-generate was not found in PATH
+
+                    It was moved to a separate binary due to https://github.com/cachix/devenv/issues/1733
+
+                    For now, use the web version at https://devenv.new
+                "})
+            }
+        },
+        Commands::Search { name } => devenv.search(&name).await,
+        Commands::Gc {} => devenv.gc().await,
+        Commands::Info {} => devenv.info().await,
+        Commands::Repl {} => devenv.repl().await,
+        Commands::Build { attributes } => devenv.build(&attributes).await,
+        Commands::Update { name } => devenv.update(&name).await,
+        Commands::Up { processes, detach }
+        | Commands::Processes {
+            command: ProcessesCommand::Up { processes, detach },
+        } => {
+            let options = devenv::ProcessOptions {
+                detach,
+                log_to_file: detach,
+                ..Default::default()
+            };
+            devenv.up(processes, &options).await
+        }
+        Commands::Processes {
+            command: ProcessesCommand::Down {},
+        } => devenv.down().await,
+        Commands::Tasks { command } => match command {
+            TasksCommand::Run {
+                tasks,
+                mode,
+                show_output,
+            } => devenv.tasks_run(tasks, mode, show_output).await,
+            TasksCommand::List {} => devenv.tasks_list().await,
         },
         Commands::Inputs { command } => match command {
-            InputsCommand::Add { name, url, follows } => devenv.inputs_add(&name, &url, &follows),
+            InputsCommand::Add { name, url, follows } => {
+                devenv.inputs_add(&name, &url, &follows).await
+            }
         },
 
         // hidden
-        Commands::Assemble => devenv.assemble(false),
-        Commands::PrintDevEnv { json } => devenv.print_dev_env(json),
+        Commands::Assemble => devenv.assemble(false).await,
+        Commands::PrintDevEnv { json } => devenv.print_dev_env(json).await,
         Commands::GenerateJSONSchema => {
-            config::write_json_schema();
+            config::write_json_schema()
+                .await
+                .wrap_err("Failed to generate JSON schema")?;
             Ok(())
         }
+        Commands::Mcp {} => {
+            let config = devenv.config.read().await.clone();
+            devenv::mcp::run_mcp_server(config).await
+        }
+        Commands::Direnvrc => unreachable!(),
+        Commands::Version => unreachable!(),
     }
 }

@@ -3,10 +3,17 @@
 let
   cfg = config.android;
 
-  androidEnv = pkgs.callPackage "${pkgs.path}/pkgs/development/mobile/androidenv" {
-    inherit config pkgs;
+  androidEnvModule = pkgs.callPackage "${toString pkgs.path}/pkgs/development/mobile/androidenv";
+  androidEnvArgs = {
+    inherit pkgs;
     licenseAccepted = true;
+  }
+  # `config` was removed in https://github.com/NixOS/nixpkgs/commit/807356fa6960fa76767ee7b696530cf5c671bd62
+  # It was only ever used to set a default for `licenseAccepted`.
+  // lib.optionalAttrs (builtins.hasAttr "config" (builtins.functionArgs androidEnvModule)) {
+    config = { };
   };
+  androidEnv = androidEnvModule androidEnvArgs;
 
   sdkArgs = {
     cmdLineToolsVersion = cfg.cmdLineTools.version;
@@ -217,12 +224,11 @@ in
     android-studio.package = lib.mkOption {
       type = lib.types.package;
       default = pkgs.android-studio;
-      defaultText = "pkgs.android-studio";
+      defaultText = lib.literalExpression "pkgs.android-studio";
       description = ''
         The Android Studio package to use.
         By default, the Android Studio package from nixpkgs is used.
       '';
-      example = "pkgs.android-studio";
     };
 
     flutter.enable = lib.mkOption {
@@ -236,19 +242,18 @@ in
     flutter.package = lib.mkOption {
       type = lib.types.package;
       default = pkgs.flutter;
-      defaultText = "pkgs.flutter";
+      defaultText = lib.literalExpression "pkgs.flutter";
       description = ''
         The Flutter package to use.
         By default, the Flutter package from nixpkgs is used.
       '';
-      example = "pkgs.flutter";
     };
 
     reactNative.enable = lib.mkOption {
       type = lib.types.bool;
       default = false;
       description = ''
-        Whether to include the Flutter tools.
+        Whether to include the React Native tools.
       '';
     };
   };
@@ -258,24 +263,29 @@ in
       androidSdk
       platformTools
       androidEmulator
-    ] ++ (lib.optional cfg.flutter.enable cfg.flutter.package) ++ (lib.optional cfg.android-studio.enable cfg.android-studio.package);
+    ]
+    ++ lib.optional cfg.flutter.enable cfg.flutter.package
+    ++ lib.optional cfg.android-studio.enable cfg.android-studio.package;
 
     # Nested conditional for flutter
     languages = lib.mkMerge [
-      { java.enable = true; }
+      { java.enable = lib.mkDefault true; }
       (lib.mkIf cfg.flutter.enable {
         dart.enable = true;
-        java.jdk.package = pkgs.jdk11;
+        # By default, Flutter uses the JDK version that ships Android Studio.
+        # Sync with https://developer.android.com/build/jdks
+        java.jdk.package = lib.mkDefault pkgs.jdk17;
       })
       (lib.mkIf cfg.reactNative.enable {
         javascript.enable = true;
         javascript.npm.enable = true;
-        java.jdk.package = pkgs.jdk17;
+        # Sync with https://reactnative.dev/docs/set-up-your-environment
+        java.jdk.package = lib.mkDefault pkgs.jdk17;
       })
     ];
 
     env.ANDROID_HOME = "${androidSdk}/libexec/android-sdk";
-    env.ANDROID_NDK_ROOT = "${config.env.ANDROID_HOME}/ndk/";
+    env.ANDROID_NDK_ROOT = "${config.env.ANDROID_HOME}/ndk-bundle";
 
     # override the aapt2 binary that gradle uses with the patched one from the sdk
     env.GRADLE_OPTS = "-Dorg.gradle.project.android.aapt2FromMavenOverride=${androidSdk}/libexec/android-sdk/build-tools/${lib.head cfg.buildTools.version}/aapt2";
@@ -285,7 +295,7 @@ in
 
     enterShell = ''
       set -e
-      export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:${pkgs.lib.makeLibraryPath [pkgs.vulkan-loader pkgs.libGL]}:${config.env.ANDROID_HOME}/build-tools/${lib.head cfg.buildTools.version}/lib64/:${config.env.ANDROID_NDK_ROOT}/${lib.head cfg.ndk.version}/toolchains/llvm/prebuilt/linux-x86_64/lib/:$LD_LIBRARY_PATH"
+      export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:${pkgs.lib.makeLibraryPath [pkgs.vulkan-loader pkgs.libGL]}:${config.env.ANDROID_HOME}/build-tools/${lib.head cfg.buildTools.version}/lib64/:${config.env.ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/lib/:$LD_LIBRARY_PATH"
 
       export PATH="$PATH:${config.env.ANDROID_HOME}/tools:${config.env.ANDROID_HOME}/tools/bin:${config.env.ANDROID_HOME}/platform-tools"
       cat <<EOF > local.properties

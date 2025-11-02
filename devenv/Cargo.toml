@@ -1,17 +1,30 @@
 [package]
 name = "devenv"
-version = "1.0.7"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+# Make `cargo run` default to the devenv CLI
+default-run = "devenv"
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-ansiterm.workspace = true
+devenv-eval-cache.workspace = true
+devenv-tasks.workspace = true
+devenv-cache-core.workspace = true
+http-client-tls.workspace = true
+nix-conf-parser.workspace = true
+
 clap.workspace = true
 cli-table.workspace = true
+console.workspace = true
+dialoguer.workspace = true
 dotlock.workspace = true
-fs2.workspace = true
+fd-lock.workspace = true
+futures.workspace = true
 hex.workspace = true
+hostname.workspace = true
 include_dir.workspace = true
 indoc.workspace = true
 miette.workspace = true
@@ -24,8 +37,45 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 sha2.workspace = true
-tempdir.workspace = true
+sqlx.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tokio-shutdown.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-indicatif.workspace = true
+indicatif.workspace = true
 which.workspace = true
 whoami.workspace = true
 xdg.workspace = true
+similar.workspace = true
+once_cell.workspace = true
+pathdiff.workspace = true
+shell-escape.workspace = true
+rmcp.workspace = true
+rmcp-macros.workspace = true
+async-trait.workspace = true
+secretspec.workspace = true
+secrecy.workspace = true
+
+# Optional snix dependencies
+snix-eval = { workspace = true, optional = true }
+snix-glue = { workspace = true, optional = true }
+snix-castore = { workspace = true, optional = true }
+snix-store = { workspace = true, optional = true }
+snix-build = { workspace = true, optional = true }
+nix-compat = { workspace = true, optional = true }
+nix-compat-derive = { workspace = true, optional = true }
+
+[features]
+default = []
+integration-tests = []
+snix = [
+  "dep:nix-compat",
+  "dep:nix-compat-derive",
+  "dep:snix-build",
+  "dep:snix-castore",
+  "dep:snix-eval",
+  "dep:snix-glue",
+  "dep:snix-store",
+]

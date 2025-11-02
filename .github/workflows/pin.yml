@@ -3,37 +3,56 @@ name: "Pin release on Cachix"
 on:
   workflow_dispatch:
     inputs:
-      tag:
+      ref:
         description: "The existing tag to build and pin"
         type: "string"
         required: true
 
   workflow_call:
+    inputs:
+      ref:
+        description: "Git ref to checkout"
+        required: true
+        type: string
+
+      system:
+        description: "System to pin for"
+        required: true
+        type: string
+
+      runs-on:
+        description: "Runner to use"
+        required: true
+        type: string
+
     secrets:
       CACHIX_AUTH_TOKEN:
         required: true
 
 jobs:
   pin:
-    if: startsWith(github.ref, 'refs/tags/v')
-
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [[ubuntu-latest], [macos-latest], [self-hosted, macOS], [self-hosted, linux, ARM64]]
-
-    runs-on: ${{ matrix.os }}
+    if: startsWith(inputs.ref, 'v')
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
 
     steps:
-    - uses: actions/checkout@v4
-    - uses: cachix/install-nix-action@v26
+    - uses: actions/checkout@v5
+      with:
+        ref: ${{ inputs.ref }}
+
+    - name: Install Nix
+      uses: cachix/install-nix-action@v31
       with:
         extra_nix_config: |
           access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
-    - uses: cachix/cachix-action@v15
+
+    - name: Configure Cachix
+      uses: cachix/cachix-action@v16
       with:
         name: devenv
         authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
     - name: Pin release
-      run: cachix pin devenv ${{ github.ref_name }} $(nix build --accept-flake-config --print-out-paths)
+      run: |
+        tag="${{ inputs.ref }}-${{ inputs.system }}"
+        out_path=$(nix build --accept-flake-config --print-out-paths --system ${{ inputs.system }})
+        cachix pin devenv "$tag" "$out_path"

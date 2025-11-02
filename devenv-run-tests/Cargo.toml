@@ -1,10 +1,16 @@
 [package]
 name = "devenv-run-tests"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 clap.workspace = true
-tempdir.workspace = true
-
-devenv= { path = "../devenv" }
+devenv.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tokio-shutdown.workspace = true
+miette.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true

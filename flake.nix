@@ -2,13 +2,14 @@
   description = "devenv.sh - Fast, Declarative, Reproducible, and Composable Developer Environments";
 
   nixConfig = {
-    extra-trusted-public-keys = "devenv.cachix.org-1:w1cLUi8dv3hnoSPGAuibQv+f9TZLr6cv/Hm9XgU50cw=";
-    extra-substituters = "https://devenv.cachix.org";
+    extra-trusted-public-keys = "devenv.cachix.org-1:w1cLUi8dv3hnoSPGAuibQv+f9TZLr6cv/Hm9XgU50cw= cachix.cachix.org-1:eWNHQldwUO7G2VkjpnjDbWwy4KQ/HNxht7H4SSoMckM=";
+    extra-substituters = "https://devenv.cachix.org https://cachix.cachix.org";
   };
 
+  # this needs to be rolling so we're testing what most devs are using
   inputs.nixpkgs.url = "github:cachix/devenv-nixpkgs/rolling";
-  inputs.pre-commit-hooks = {
-    url = "github:cachix/pre-commit-hooks.nix";
+  inputs.git-hooks = {
+    url = "github:cachix/git-hooks.nix";
     inputs = {
       nixpkgs.follows = "nixpkgs";
       flake-compat.follows = "flake-compat";
@@ -18,80 +19,78 @@
     url = "github:edolstra/flake-compat";
     flake = false;
   };
+  inputs.flake-parts = {
+    url = "github:hercules-ci/flake-parts";
+    inputs = {
+      nixpkgs-lib.follows = "nixpkgs";
+    };
+  };
   inputs.nix = {
-    url = "github:domenkozar/nix/devenv-2.21";
+    url = "github:cachix/nix/devenv-2.30.6";
     inputs = {
       nixpkgs.follows = "nixpkgs";
       flake-compat.follows = "flake-compat";
+      flake-parts.follows = "flake-parts";
+      git-hooks-nix.follows = "git-hooks";
+      nixpkgs-23-11.follows = "";
+      nixpkgs-regression.follows = "";
     };
   };
   inputs.cachix = {
-    url = "github:cachix/cachix";
+    url = "github:cachix/cachix/latest";
     inputs = {
       nixpkgs.follows = "nixpkgs";
-      pre-commit-hooks.follows = "pre-commit-hooks";
       flake-compat.follows = "flake-compat";
+      git-hooks.follows = "git-hooks";
+      devenv.follows = "";
     };
   };
 
-
-  outputs = { self, nixpkgs, pre-commit-hooks, nix, ... }@inputs:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      git-hooks,
+      nix,
+      ...
+    }@inputs:
     let
-      systems = [ "x86_64-linux" "i686-linux" "x86_64-darwin" "aarch64-linux" "aarch64-darwin" ];
-      forAllSystems = f: builtins.listToAttrs (map (name: { inherit name; value = f name; }) systems);
-      mkPackage = pkgs: import ./package.nix { inherit pkgs inputs; };
-      mkDevShellPackage = config: pkgs: import ./src/devenv-devShell.nix { inherit config pkgs; };
-      mkDocOptions = pkgs:
-        let
-          inherit (pkgs) lib;
-          eval = pkgs.lib.evalModules {
-            modules = [
-              ./src/modules/top-level.nix
-              { devenv.warnOnNewVersion = false; }
-            ];
-            specialArgs = { inherit pre-commit-hooks pkgs inputs; };
-          };
-          sources = [
-            { name = "${self}"; url = "https://github.com/cachix/devenv/blob/main"; }
-            { name = "${pre-commit-hooks}"; url = "https://github.com/cachix/pre-commit-hooks.nix/blob/master"; }
-          ];
-          rewriteSource = decl:
-            let
-              prefix = lib.strings.concatStringsSep "/" (lib.lists.take 4 (lib.strings.splitString "/" decl));
-              source = lib.lists.findFirst (src: src.name == prefix) { } sources;
-              path = lib.strings.removePrefix prefix decl;
-              url = "${source.url}${path}";
-            in
-            { name = url; url = url; };
-          options = pkgs.nixosOptionsDoc {
-            options = builtins.removeAttrs eval.options [ "_module" ];
-
-            warningsAreErrors = false;
-
-            transformOptions = opt: (
-              opt // { declarations = map rewriteSource opt.declarations; }
-            );
-          };
-        in
-        options;
-
+      systems = [
+        "x86_64-linux"
+        "i686-linux"
+        "x86_64-darwin"
+        "aarch64-linux"
+        "aarch64-darwin"
+      ];
+      forAllSystems = nixpkgs.lib.genAttrs systems;
     in
     {
-      packages = forAllSystems (system:
+      packages = forAllSystems (
+        system:
         let
-          pkgs = nixpkgs.legacyPackages.${system};
-          options = mkDocOptions pkgs;
+          overlays = [
+            (final: prev: {
+              inherit (inputs.cachix.packages.${system}) cachix;
+              devenv-nix = inputs.nix.packages.${system}.nix-cli;
+            })
+          ];
+          pkgs = import nixpkgs { inherit overlays system; };
+          workspace = pkgs.callPackage ./workspace.nix { };
         in
         {
+          inherit (workspace.crates) devenv devenv-tasks devenv-tasks-fast-build;
           default = self.packages.${system}.devenv;
-          devenv = mkPackage pkgs;
-          devenv-docs-options = options.optionsCommonMark;
-          devenv-docs-options-json = options.optionsJSON;
-        });
+        }
+        // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          devenv-image = import ./containers/devenv/image.nix {
+            inherit pkgs;
+            inherit (self.packages.${system}) devenv;
+            nixInput = inputs.nix;
+          };
+        }
+      );
 
       modules = ./src/modules;
-      isTmpDir = true;
-      hasIsTesting = true;
 
       templates =
         let
@@ -133,37 +132,68 @@
           default = simple;
         };
 
-      flakeModule = import ./flake-module.nix self;
+      flakeModule = self.flakeModules.default; # Backwards compatibility
+      flakeModules = {
+        default = import ./flake-module.nix self;
+        readDevenvRoot =
+          { inputs, lib, ... }:
+          {
+            config =
+              let
+                devenvRootFileContent =
+                  if inputs ? devenv-root then builtins.readFile inputs.devenv-root.outPath else "";
+              in
+              lib.mkIf (devenvRootFileContent != "") {
+                devenv.root = devenvRootFileContent;
+              };
+          };
+      };
 
       lib = {
-        mkConfig = args@{ pkgs, inputs, modules }:
+        mkConfig =
+          args@{
+            pkgs,
+            inputs,
+            modules,
+          }:
           (self.lib.mkEval args).config;
-        mkEval = { pkgs, inputs, modules }:
+        mkEval =
+          {
+            pkgs,
+            inputs,
+            modules,
+          }:
           let
-            moduleInputs = { inherit pre-commit-hooks; } // inputs;
+            moduleInputs = {
+              inherit git-hooks;
+            }
+            // inputs;
             project = inputs.nixpkgs.lib.evalModules {
               specialArgs = moduleInputs // {
-                inherit pkgs;
                 inputs = moduleInputs;
               };
               modules = [
+                { config._module.args.pkgs = inputs.nixpkgs.lib.mkDefault pkgs; }
                 (self.modules + /top-level.nix)
-                ({ config, ... }: {
-                  packages = [
-                    (mkDevShellPackage config pkgs)
-                  ];
-                  devenv.warnOnNewVersion = false;
-                  devenv.flakesIntegration = true;
-                })
-              ] ++ modules;
+                (
+                  { config, ... }:
+                  {
+                    devenv.warnOnNewVersion = false;
+                    devenv.flakesIntegration = true;
+                  }
+                )
+              ]
+              ++ modules;
             };
           in
           project;
-        mkShell = args:
+        mkShell =
+          args:
           let
             config = self.lib.mkConfig args;
           in
-          config.shell // {
+          config.shell
+          // {
             ci = config.ciDerivation;
             inherit config;
           };

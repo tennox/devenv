@@ -6,6 +6,7 @@
       url = "file+file:///dev/null";
       flake = false;
     };
+    flake-parts.url = "github:hercules-ci/flake-parts";
     nixpkgs.url = "github:cachix/devenv-nixpkgs/rolling";
     devenv.url = "github:cachix/devenv";
     nix2container.url = "github:nlewo/nix2container";
@@ -34,12 +35,6 @@
         packages.default = pkgs.hello;
 
         devenv.shells.default = {
-          devenv.root =
-            let
-              devenvRootFileContent = builtins.readFile devenv-root.outPath;
-            in
-            pkgs.lib.mkIf (devenvRootFileContent != "") devenvRootFileContent;
-
           name = "my-project";
 
           imports = [

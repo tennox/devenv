@@ -11,7 +11,7 @@
   # languages.rust.enable = true;
 
   # https://devenv.sh/processes/
-  # processes.cargo-watch.exec = "cargo-watch";
+  # processes.dev.exec = "${lib.getExe pkgs.watchexec} -n -- ls -la";
 
   # https://devenv.sh/services/
   # services.postgres.enable = true;
@@ -21,10 +21,17 @@
     echo hello from $GREET
   '';
 
+  # https://devenv.sh/basics/
   enterShell = ''
-    hello
-    git --version
+    hello         # Run scripts directly
+    git --version # Use packages
   '';
+
+  # https://devenv.sh/tasks/
+  # tasks = {
+  #   "myproj:setup".exec = "mytool build";
+  #   "devenv:enterShell".after = [ "myproj:setup" ];
+  # };
 
   # https://devenv.sh/tests/
   enterTest = ''
@@ -32,8 +39,8 @@
     git --version | grep --color=auto "${pkgs.git.version}"
   '';
 
-  # https://devenv.sh/pre-commit-hooks/
-  # pre-commit.hooks.shellcheck.enable = true;
+  # https://devenv.sh/git-hooks/
+  # git-hooks.hooks.shellcheck.enable = true;
 
   # See full reference at https://devenv.sh/reference/options/
 }

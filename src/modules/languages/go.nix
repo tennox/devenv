@@ -3,13 +3,26 @@
 let
   cfg = config.languages.go;
 
-  goVersion = (lib.versions.major cfg.package.version) + (lib.versions.minor cfg.package.version);
+  # Override the buildGoModule function to use the specified Go package.
+  buildGoModule = pkgs.buildGoModule.override { go = cfg.package; };
+  # A helper function to rebuild a package with the specific Go version.
+  # It expects the package to have a `buildGo*Module` argument in its override function.
+  # This will override multiple buildGo*Module arguments if they exist.
+  buildWithSpecificGo = pkg:
+    let
+      overrideArgs = lib.functionArgs pkg.override;
+      goModuleArgs = lib.filterAttrs (name: _: lib.match "buildGo.*Module" name != null) overrideArgs;
+      goModuleOverrides = lib.mapAttrs (_: _: buildGoModule) goModuleArgs;
+    in
+    if goModuleOverrides != { } then
+      pkg.override goModuleOverrides
+    else
+      throw ''
+        `languages.go` failed to override the Go version for ${pkg.pname or "unknown"}.
+        Expected to find a `buildGo*Module` argument in its override function.
 
-  buildWithSpecificGo = pkg: pkg.override {
-    buildGoModule = pkgs."buildGo${goVersion}Module".override {
-      go = cfg.package;
-    };
-  };
+        Found: ${toString (lib.attrNames overrideArgs)}
+      '';
 in
 {
   options.languages.go = {
@@ -20,6 +33,12 @@ in
       default = pkgs.go;
       defaultText = lib.literalExpression "pkgs.go";
       description = "The Go package to use.";
+    };
+
+    enableHardeningWorkaround = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = "Enable hardening workaround required for Delve debugger (https://github.com/go-delve/delve/issues/3085)";
     };
   };
 
@@ -37,10 +56,16 @@ in
       (buildWithSpecificGo pkgs.go-tools)
       (buildWithSpecificGo pkgs.gopls)
       (buildWithSpecificGo pkgs.gotests)
+
+      # Required by vim-go
+      (buildWithSpecificGo pkgs.iferr)
     ];
+
+    hardeningDisable = lib.optional (cfg.enableHardeningWorkaround) "fortify";
 
     env.GOROOT = cfg.package + "/share/go/";
     env.GOPATH = config.env.DEVENV_STATE + "/go";
+    env.GOTOOLCHAIN = "local";
 
     enterShell = ''
       export PATH=$GOPATH/bin:$PATH

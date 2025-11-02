@@ -1,9 +1,32 @@
-# yaml-language-server: $schema=./docs/devenv.schema.json
+# yaml-language-server: $schema=./docs/src/devenv.schema.json
 inputs:
+  nixpkgs:
+    url: github:cachix/devenv-nixpkgs/rolling
+
+  # Use the local development modules
   devenv:
     url: path:.?dir=src/modules
+
   nix:
-    url: github:domenkozar/nix/devenv-2.21
+    url: github:cachix/nix/devenv-2.30.6
+
+  git-hooks:
+    url: github:cachix/git-hooks.nix
     inputs:
       nixpkgs:
         follows: nixpkgs
+
+  rust-overlay:
+    url: github:oxalica/rust-overlay
+    inputs:
+      nixpkgs:
+        follows: nixpkgs
+
+  devenv-claude-agents:
+    url: github:cachix/devenv-claude-agents
+    flake: false
+
+# Import devenv projects
+imports:
+  - devenv-claude-agents
+  - ./docs

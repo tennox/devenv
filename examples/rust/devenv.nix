@@ -1,5 +1,9 @@
-{ pkgs, lib, ... }:
+{ pkgs, lib, config, ... }:
 
+let
+  # Test the crate2nix import functionality
+  myapp = config.languages.rust.import ./app { };
+in
 {
   languages.rust = {
     enable = true;
@@ -9,12 +13,16 @@
     components = [ "rustc" "cargo" "clippy" "rustfmt" "rust-analyzer" ];
   };
 
-  #pre-commit.hooks = {
-  #  rustfmt.enable = true;
-  #  clippy.enable = true;
-  #};
+  # Include the imported package in the environment
+  packages = [ myapp ];
 
-  packages = lib.optionals pkgs.stdenv.isDarwin (with pkgs.darwin.apple_sdk; [
-    frameworks.Security
-  ]);
+  # Expose the package as an output for testing
+  outputs = {
+    inherit myapp;
+  };
+
+  git-hooks.hooks = {
+    rustfmt.enable = true;
+    clippy.enable = true;
+  };
 }

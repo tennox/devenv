@@ -3,16 +3,24 @@
 let
   cfg = config.languages.rust;
 
-  fenix = config.lib.getInput {
-    name = "fenix";
-    url = "github:nix-community/fenix";
-    attribute = "languages.rust.version";
+  validChannels = [ "nixpkgs" "stable" "beta" "nightly" ];
+
+  rust-overlay = config.lib.getInput {
+    name = "rust-overlay";
+    url = "github:oxalica/rust-overlay";
+    attribute = "languages.rust.channel";
+    follows = [ "nixpkgs" ];
+  };
+
+  crate2nix = config.lib.getInput {
+    name = "crate2nix";
+    url = "github:nix-community/crate2nix";
+    attribute = "languages.rust.import";
     follows = [ "nixpkgs" ];
   };
 in
 {
   imports = [
-    (lib.mkRenamedOptionModule [ "languages" "rust" "version" ] [ "languages" "rust" "channel" ])
     (lib.mkRenamedOptionModule [ "languages" "rust" "packages" ] [ "languages" "rust" "toolchain" ])
   ];
 
@@ -34,16 +42,26 @@ in
       default = [ ];
       defaultText = lib.literalExpression ''[ ]'';
       description = ''
-        List of extra [targets](https://github.com/nix-community/fenix#supported-platforms-and-targets)
+        List of extra [targets](https://doc.rust-lang.org/nightly/rustc/platform-support.html)
         to install. Defaults to only the native target. 
       '';
     };
 
     channel = lib.mkOption {
-      type = lib.types.enum [ "nixpkgs" "stable" "beta" "nightly" ];
+      type = lib.types.enum validChannels;
       default = "nixpkgs";
       defaultText = lib.literalExpression ''"nixpkgs"'';
       description = "The rustup toolchain to install.";
+    };
+
+    version = lib.mkOption {
+      type = lib.types.str;
+      default = "latest";
+      defaultText = lib.literalExpression ''"latest"'';
+      description = ''
+        Which version of rust to use, this value could be `latest`,`1.81.0`, `2021-01-01`.
+        Only works when languages.rust.channel is NOT nixpkgs.
+      '';
     };
 
     rustflags = lib.mkOption {
@@ -54,13 +72,12 @@ in
 
     mold.enable = lib.mkOption {
       type = lib.types.bool;
-      default = pkgs.stdenv.isLinux && pkgs.stdenv.isx86_64 && cfg.targets == [ ];
-      defaultText =
-        lib.literalExpression "pkgs.stdenv.isLinux && pkgs.stdenv.isx86_64 && languages.rust.targets == [ ]";
+      default = false;
       description = ''
-        Enable mold as the linker.
+        Use [mold](https://github.com/rui314/mold) as the linker.
 
-        Enabled by default on x86_64 Linux machines when no cross-compilation targets are specified.
+        mold is a faster drop-in replacement for existing Unix linkers.
+        It is several times quicker than the LLVM lld linker.
       '';
     };
 
@@ -84,13 +101,62 @@ in
       defaultText = lib.literalExpression "nixpkgs";
       description = "Rust component packages. May optionally define additional components, for example `miri`.";
     };
+
+    toolchainPackage = lib.mkOption {
+      type = lib.types.package;
+      description = ''
+        The aggregated toolchain package, which includes the configured components and targets.
+        This is automatically set based on the channel and components configuration.
+      '';
+    };
+
+    import = lib.mkOption {
+      type = lib.types.functionTo (lib.types.functionTo lib.types.package);
+      description = ''
+        Import a Cargo project using cargo2nix.
+
+        This function takes a path to a directory containing a Cargo.toml file
+        and returns a derivation that builds the Rust project using cargo2nix.
+
+        Example usage:
+        ```nix
+        let
+        mypackage = config.languages.rust.import ./path/to/cargo/project {};
+        in {
+        languages.rust.enable = true;
+        packages = [ mypackage ];
+        }
+        ```
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable (lib.mkMerge [
+    {
+      languages.rust.import = path: args:
+        let
+          crate2nixTools = pkgs.callPackage "${crate2nix}/tools.nix" { };
+
+          # Try to infer package name from Cargo.toml or use directory name as fallback
+          packageName = args.packageName or (
+            let
+              cargoToml =
+                if builtins.pathExists (path + "/Cargo.toml")
+                then builtins.fromTOML (builtins.readFile (path + "/Cargo.toml"))
+                else { };
+            in
+              cargoToml.package.name or (builtins.baseNameOf (builtins.toString path))
+          );
+
+          # Use crate2nix IFD to auto-generate
+          cargoNix = crate2nixTools.appliedCargoNix {
+            name = packageName;
+            src = path;
+          };
+        in
+        cargoNix.rootCrate.build.override args;
+    }
     (
-      let
-        mkOverrideTools = lib.mkOverride (lib.modules.defaultOverridePriority - 1);
-      in
       {
         assertions = [
           {
@@ -100,6 +166,17 @@ in
 
               The nixpkgs channel does not support cross-compiling with targets.
               Use the stable, beta, or nightly channels instead. For example:
+
+              languages.rust.channel = "stable";
+            '';
+          }
+          {
+            assertion = cfg.channel == "nixpkgs" -> (cfg.version == "latest");
+            message = ''
+              Cannot use `languages.rust.channel = "nixpkgs"` with `languages.rust.version`.
+
+              The nixpkgs channel does not contain all versions required, and is
+              therefore not supported to be used together.
 
               languages.rust.channel = "stable";
             '';
@@ -127,8 +204,8 @@ in
 
         env =
           let
-            darwinFlags = lib.optionalString pkgs.stdenv.isDarwin "-L framework=${config.devenv.profile}/Library/Frameworks";
             moldFlags = lib.optionalString cfg.mold.enable "-C link-arg=-fuse-ld=mold";
+            optionalEnv = cond: str: if cond then str else null;
           in
           {
             # RUST_SRC_PATH is necessary when rust-src is not at the same location as
@@ -137,40 +214,109 @@ in
               if cfg.toolchain ? rust-src
               then "${cfg.toolchain.rust-src}/lib/rustlib/src/rust/library"
               else pkgs.rustPlatform.rustLibSrc;
-            RUSTFLAGS = "${darwinFlags} ${moldFlags} ${cfg.rustflags}";
-            RUSTDOCFLAGS = "${darwinFlags} ${moldFlags}";
-            CFLAGS = lib.optionalString pkgs.stdenv.isDarwin "-iframework ${config.devenv.profile}/Library/Frameworks";
+            RUSTFLAGS = optionalEnv (moldFlags != "" || cfg.rustflags != "") (lib.concatStringsSep " " (lib.filter (x: x != "") [ moldFlags cfg.rustflags ]));
+            RUSTDOCFLAGS = optionalEnv (moldFlags != "") moldFlags;
           };
 
-        pre-commit.tools.cargo = mkOverrideTools cfg.toolchain.cargo or null;
-        pre-commit.tools.rustfmt = mkOverrideTools cfg.toolchain.rustfmt or null;
-        pre-commit.tools.clippy = mkOverrideTools cfg.toolchain.clippy or null;
+        git-hooks.tools =
+          let
+            mkOverrideTool = lib.mkOverride (lib.modules.defaultOverridePriority - 1);
+          in
+          {
+            cargo = mkOverrideTool cfg.toolchainPackage;
+            rustfmt = mkOverrideTool cfg.toolchainPackage;
+            clippy = mkOverrideTool cfg.toolchainPackage;
+          };
+
+        # Allow clippy to access the internet to fetch dependencies.
+        git-hooks.hooks.clippy.settings.offline = lib.mkDefault false;
       }
     )
 
     (lib.mkIf (cfg.channel == "nixpkgs") {
-      packages = builtins.map (c: cfg.toolchain.${c} or (throw "toolchain.${c}")) cfg.components;
+      languages.rust.toolchainPackage = lib.mkDefault (
+        pkgs.symlinkJoin {
+          name = "rust-toolchain-${cfg.channel}";
+          paths = builtins.map (c: cfg.toolchain.${c} or (throw "toolchain.${c}")) cfg.components;
+        }
+      );
+      packages = [ cfg.toolchainPackage ];
     })
 
     (lib.mkIf (cfg.channel != "nixpkgs") (
       let
-        rustPackages = fenix.packages.${pkgs.stdenv.system};
-        fenixChannel =
-          if cfg.channel == "nightly"
-          then "latest"
-          else cfg.channel;
-        toolchain = rustPackages.${fenixChannel};
+        rustBin = rust-overlay.lib.mkRustBin { } pkgs.buildPackages;
+
+        # WARNING: private API
+        # Import the mkAggregated function.
+        # This symlinkJoins and patches the individual components.
+        mkAggregated = import (rust-overlay + "/lib/mk-aggregated.nix") {
+          inherit (pkgs) lib stdenv symlinkJoin bash curl;
+          inherit (pkgs.buildPackages) rustc;
+          pkgsTargetTarget = pkgs.targetPackages;
+        };
+
+        # Get the toolchain for component resolution with error handling
+        channel = rustBin.${cfg.channel} or (throw "Invalid Rust channel '${cfg.channel}'. Available: ${lib.concatStringsSep ", " (lib.filter (c: c != "nixpkgs") validChannels)}");
+        toolchain = channel.${cfg.version} or (throw "Invalid Rust version '${cfg.version}' for channel '${cfg.channel}'. Available: ${lib.concatStringsSep ", " (builtins.attrNames channel)}");
+        # Extract individual components from toolchain, avoiding the 'rust' profile, which triggers warnings.
+        # This ensures target components like rust-std-${target} are available
+        toolchainComponents = builtins.removeAttrs toolchain [ "rust" ];
+
+        # Get available targets from the manifest
+        availableTargets = toolchain._manifest.pkg.rust-std.target or { };
+        allComponents = toolchain._components or { };
+        availableComponents = toolchain._manifest.profiles.complete or [ ];
+
+        # Ensure native platform target is always included for rust-overlay
+        # Read the native target from the nixpkgs config.
+        nativeTarget = pkgs.stdenv.hostPlatform.rust.rustcTargetSpec;
+        allTargets = lib.unique ([ nativeTarget ] ++ cfg.targets);
+
+        targetComponents = lib.map
+          (target:
+            let
+              targetComponentSet = allComponents.${target} or { };
+              targetRustStd = targetComponentSet.rust-std or null;
+            in
+            if !(availableTargets ? ${target})
+            then throw "Target '${target}' not available in manifest. Available targets: ${lib.concatStringsSep ", " (builtins.attrNames availableTargets)}"
+            else if targetRustStd == null
+            then throw "Target '${target}' component not found in toolchain. Available targets: ${lib.concatStringsSep ", " (builtins.attrNames availableTargets)}"
+            else targetRustStd
+          )
+          allTargets;
+
+        # Resolve regular components with user overrides
+        # Try the component name, then with the -preview suffix for rust-overlay compatibility
+        resolvedComponents = lib.map
+          (c:
+            let
+              resolvedName =
+                if builtins.elem c availableComponents then c
+                else if builtins.elem "${c}-preview" availableComponents then "${c}-preview"
+                else throw "Component '${c}' not found. Available: ${lib.concatStringsSep ", " availableComponents}";
+            in
+              cfg.toolchain.${c} or cfg.toolchain.${resolvedName} or toolchainComponents.${resolvedName}
+          )
+          cfg.components;
+
+        allSelectedComponents = resolvedComponents ++ targetComponents;
+
+        # Create aggregated profile with user overrides and target components
+        # NOTE: this uses private API to retain API compatibility with the previous fenix implementation.
+        # The final toolchain derivation/package should be overridable and profiles should be exposed as an option.
+        # 99% of uses should be covered by the pre-built profiles with overrides.
+        profile = mkAggregated {
+          pname = "rust-${cfg.channel}-${toolchain._manifest.version}";
+          inherit (toolchain._manifest) version date;
+          selectedComponents = allSelectedComponents;
+        };
       in
       {
-        languages.rust.toolchain =
-          (builtins.mapAttrs (_: pkgs.lib.mkDefault) toolchain);
-
-        packages = [
-          (rustPackages.combine (
-            (map (c: toolchain.${c}) cfg.components) ++
-            (map (t: rustPackages.targets.${t}.${fenixChannel}.rust-std) cfg.targets)
-          ))
-        ];
+        languages.rust.toolchain = builtins.mapAttrs (_: lib.mkDefault) toolchainComponents;
+        languages.rust.toolchainPackage = lib.mkDefault profile;
+        packages = [ cfg.toolchainPackage ];
       }
     ))
   ]);
