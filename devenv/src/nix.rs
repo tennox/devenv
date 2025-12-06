@@ -1,82 +1,167 @@
-use crate::{
-    cli, config, devenv,
-    nix_backend::{self, NixBackend},
-    nix_log_bridge::NixLogBridge,
-};
+use crate::{devenv, nix_log_bridge::NixLogBridge, util};
 use async_trait::async_trait;
+use devenv_core::{
+    cachix::{
+        CacheMetadata, CachixCacheInfo, CachixConfig, CachixManager, StorePing,
+        detect_missing_caches,
+    },
+    cli::GlobalOptions,
+    config::{Config, FlakeInput},
+    nix_args::NixArgs,
+    nix_backend::{DevenvPaths, NixBackend, Options},
+};
 use futures::future;
 use miette::{IntoDiagnostic, Result, WrapErr, bail};
 use nix_conf_parser::NixConf;
-use serde::Deserialize;
 use sqlx::SqlitePool;
 use std::collections::{BTreeMap, HashMap};
 use std::env;
-use std::os::unix::fs::symlink;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::sync::OnceCell;
 use tracing::{Instrument, debug, debug_span, error, info, instrument, warn};
 
+// Nix-specific flake template
+const FLAKE_TMPL: &str = include_str!("flake.tmpl.nix");
+
 pub struct Nix {
-    pub options: nix_backend::Options,
+    pub options: Options,
     pool: Arc<OnceCell<SqlitePool>>,
-    database_url: String,
     // TODO: all these shouldn't be here
-    config: config::Config,
-    global_options: cli::GlobalOptions,
-    cachix_caches: Arc<OnceCell<CachixCaches>>,
-    netrc_path: Arc<OnceCell<String>>,
-    paths: nix_backend::DevenvPaths,
+    config: Config,
+    global_options: GlobalOptions,
+    cachix_caches: Arc<OnceCell<CachixCacheInfo>>,
+    cachix_manager: Arc<CachixManager>,
+    paths: DevenvPaths,
     secretspec_resolved: Arc<OnceCell<secretspec::Resolved<HashMap<String, String>>>>,
+    // Note: CachixManager now owns the netrc lifecycle
 }
 
 impl Nix {
     pub async fn new(
-        config: config::Config,
-        global_options: cli::GlobalOptions,
-        paths: nix_backend::DevenvPaths,
+        config: Config,
+        global_options: GlobalOptions,
+        paths: DevenvPaths,
         secretspec_resolved: Arc<OnceCell<secretspec::Resolved<HashMap<String, String>>>>,
+        cachix_manager: Arc<CachixManager>,
+        pool: Option<Arc<OnceCell<SqlitePool>>>,
     ) -> Result<Self> {
-        let options = nix_backend::Options::default();
-
-        let database_url = format!(
-            "sqlite:{}/nix-eval-cache.db",
-            paths.dotfile.to_string_lossy()
-        );
+        let options = Options::default();
 
         Ok(Self {
             options,
-            pool: Arc::new(OnceCell::new()),
-            database_url,
+            pool: pool.unwrap_or_else(|| Arc::new(OnceCell::new())),
             config,
             global_options,
             cachix_caches: Arc::new(OnceCell::new()),
-            netrc_path: Arc::new(OnceCell::new()),
+            cachix_manager,
             paths,
             secretspec_resolved,
         })
     }
 
     // Defer creating local project state
-    pub async fn assemble(&self) -> Result<()> {
-        self.pool
-            .get_or_try_init(|| async {
-                // Extract database path from URL
-                let path = PathBuf::from(self.database_url.trim_start_matches("sqlite:"));
+    pub async fn assemble(&self, args: &NixArgs<'_>) -> Result<()> {
+        // Generate backend-specific configuration files
 
-                // Connect to database and run migrations in one step
-                let db =
-                    devenv_cache_core::db::Database::new(path, &devenv_eval_cache::db::MIGRATIONS)
-                        .await
-                        .map_err(|e| miette::miette!("Failed to initialize database: {}", e))?;
+        // Generate flake.json from flake inputs (with type conversion)
+        let mut flake_inputs = BTreeMap::new();
+        for (input, attrs) in self.config.inputs.iter() {
+            match FlakeInput::try_from(attrs) {
+                Ok(flake_input) => {
+                    flake_inputs.insert(input.clone(), flake_input);
+                }
+                Err(e) => {
+                    error!("Failed to parse input {}: {}", input, e);
+                    bail!("Failed to parse inputs");
+                }
+            }
+        }
+        let flake_inputs_json = serde_json::to_string(&flake_inputs)
+            .map_err(|e| miette::miette!("Failed to serialize flake inputs: {}", e))?;
+        util::write_file_with_lock(self.paths.dotfile.join("flake.json"), &flake_inputs_json)?;
 
-                Ok::<_, miette::Report>(db.pool().clone())
-            })
-            .await?;
+        // Generate devenv.json from devenv configuration
+        let devenv_json = serde_json::to_string(&self.config)
+            .map_err(|e| miette::miette!("Failed to serialize devenv configuration: {}", e))?;
+        util::write_file_with_lock(self.paths.dotfile.join("devenv.json"), &devenv_json)?;
+
+        // Generate cli-options.nix if there are CLI options
+        if !self.global_options.option.is_empty() {
+            let mut cli_options = String::from("{ pkgs, lib, config, ... }: {\n");
+
+            const SUPPORTED_TYPES: &[&str] =
+                &["string", "int", "float", "bool", "path", "pkg", "pkgs"];
+
+            for chunk in self.global_options.option.chunks_exact(2) {
+                // Parse the path and type from the first value
+                let key_parts: Vec<&str> = chunk[0].split(':').collect();
+                if key_parts.len() < 2 {
+                    miette::bail!(
+                        "Invalid option format: '{}'. Must include type, e.g. 'languages.rust.version:string'. Supported types: {}",
+                        chunk[0],
+                        SUPPORTED_TYPES.join(", ")
+                    );
+                }
+
+                let path = key_parts[0];
+                let type_name = key_parts[1];
+
+                // Format value based on type
+                let value = match type_name {
+                    "string" => format!("\"{}\"", &chunk[1]),
+                    "int" => chunk[1].clone(),
+                    "float" => chunk[1].clone(),
+                    "bool" => chunk[1].clone(), // true/false will work directly in Nix
+                    "path" => format!("./{}", &chunk[1]), // relative path
+                    "pkg" => format!("pkgs.{}", &chunk[1]),
+                    "pkgs" => {
+                        // Split by whitespace and format as a Nix list of package references
+                        let items = chunk[1]
+                            .split_whitespace()
+                            .map(|item| format!("pkgs.{item}"))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        format!("[ {items} ]")
+                    }
+                    _ => miette::bail!(
+                        "Unsupported type: '{}'. Supported types: {}",
+                        type_name,
+                        SUPPORTED_TYPES.join(", ")
+                    ),
+                };
+
+                // Use lib.mkForce for all types except pkgs
+                let final_value = if type_name == "pkgs" {
+                    value
+                } else {
+                    format!("lib.mkForce {}", value)
+                };
+                cli_options.push_str(&format!("  {} = {};\n", path, final_value));
+            }
+
+            cli_options.push_str("}\n");
+
+            util::write_file_with_lock(self.paths.dotfile.join("cli-options.nix"), &cli_options)?;
+        } else {
+            // Remove the file if it exists but there are no CLI options
+            let cli_options_path = self.paths.dotfile.join("cli-options.nix");
+            if cli_options_path.exists() {
+                fs::remove_file(&cli_options_path)
+                    .await
+                    .expect("Failed to remove cli-options.nix");
+            }
+        }
+
+        // Generate the flake template with arguments
+        let vars = ser_nix::to_string(args)
+            .map_err(|e| miette::miette!("Failed to serialize devenv flake arguments: {}", e))?;
+        let flake = FLAKE_TMPL.replace("__DEVENV_VARS__", &vars);
+        let flake_path = self.paths.root.join(devenv::DEVENV_FLAKE);
+        util::write_file_with_lock(&flake_path, &flake)?;
 
         Ok(())
     }
@@ -86,7 +171,7 @@ impl Nix {
         // This can happen if the store path is forcefully removed: GC'd or the Nix store is
         // tampered with.
         let refresh_cached_output = fs::canonicalize(gc_root).await.is_err();
-        let options = nix_backend::Options {
+        let options = Options {
             cache_output: true,
             refresh_cached_output,
             ..self.options
@@ -100,25 +185,15 @@ impl Nix {
             .run_nix_with_substituters("nix", &args, &options)
             .await?;
 
-        // Delete any old generations of this profile.
-        let options = nix_backend::Options {
+        // Delete any old generations of this Nix profile.
+        // This is Nix-specific: nix print-dev-env --profile creates a Nix profile
+        // with generation tracking, so we clean up old generations here.
+        let options = Options {
             logging: false,
             ..self.options
         };
         let args: Vec<&str> = vec!["-p", gc_root_str, "--delete-generations", "old"];
         self.run_nix("nix-env", &args, &options).await?;
-
-        // Save the GC root for this profile.
-        let now_ns = get_now_with_nanoseconds();
-        let target = format!("{now_ns}-shell");
-        if let Ok(resolved_gc_root) = fs::canonicalize(gc_root).await {
-            symlink_force(&resolved_gc_root, &self.paths.home_gc.join(target)).await?;
-        } else {
-            warn!(
-                "Failed to resolve the GC root path to the Nix store: {}. Try running devenv again with --refresh-eval-cache.",
-                gc_root.display()
-            );
-        }
 
         Ok(env)
     }
@@ -132,14 +207,14 @@ impl Nix {
     pub async fn build(
         &self,
         attributes: &[&str],
-        options: Option<nix_backend::Options>,
+        options: Option<Options>,
         gc_root: Option<&Path>,
     ) -> Result<Vec<PathBuf>> {
         if attributes.is_empty() {
             return Ok(Vec::new());
         }
 
-        let options = options.unwrap_or(nix_backend::Options {
+        let options = options.unwrap_or(Options {
             cache_output: true,
             ..self.options
         });
@@ -174,7 +249,7 @@ impl Nix {
     }
 
     pub async fn eval(&self, attributes: &[&str]) -> Result<String> {
-        let options = nix_backend::Options {
+        let options = Options {
             cache_output: true,
             ..self.options
         };
@@ -202,7 +277,7 @@ impl Nix {
     }
 
     pub async fn metadata(&self) -> Result<String> {
-        let options = nix_backend::Options {
+        let options = Options {
             cache_output: true,
             ..self.options
         };
@@ -232,7 +307,7 @@ impl Nix {
     pub async fn search(
         &self,
         name: &str,
-        options: Option<nix_backend::Options>,
+        options: Option<Options>,
     ) -> Result<devenv_eval_cache::Output> {
         let opts = options.as_ref().unwrap_or(&self.options);
         self.run_nix_with_substituters(
@@ -273,7 +348,7 @@ impl Nix {
         &self,
         command: &str,
         args: &[&str],
-        options: &nix_backend::Options,
+        options: &Options,
     ) -> Result<devenv_eval_cache::Output> {
         let cmd = self.prepare_command(command, args, options)?;
         self.run_nix_command(cmd, options).await
@@ -283,7 +358,7 @@ impl Nix {
         &self,
         command: &str,
         args: &[&str],
-        options: &nix_backend::Options,
+        options: &Options,
     ) -> Result<devenv_eval_cache::Output> {
         let cmd = self
             .prepare_command_with_substituters(command, args, options)
@@ -295,7 +370,7 @@ impl Nix {
     async fn run_nix_command(
         &self,
         mut cmd: std::process::Command,
-        options: &nix_backend::Options,
+        options: &Options,
     ) -> Result<devenv_eval_cache::Output> {
         use devenv_eval_cache::internal_log::Verbosity;
         use devenv_eval_cache::{NixCommand, supports_eval_caching};
@@ -349,8 +424,8 @@ impl Nix {
             // Setup Nix log bridge for enhanced log processing
             let nix_bridge = NixLogBridge::new();
 
-            // Add stderr processing callback with proper lifetime management
-            let bridge_for_callback = nix_bridge.clone();
+            // Get the log callback from the bridge
+            let log_callback = nix_bridge.get_log_callback();
             let logging = options.logging;
             let quiet = self.global_options.quiet;
             let verbose = self.global_options.verbose;
@@ -358,7 +433,7 @@ impl Nix {
             cached_cmd.on_stderr(move |log| {
                 // Send to Nix log bridge for detailed progress tracking
                 // The bridge will emit appropriate tracing events
-                bridge_for_callback.process_internal_log(log.clone());
+                log_callback(log.clone());
 
                 // Only output to tracing logs if logging is enabled
                 // This provides fallback logging when detailed processing is not needed
@@ -454,7 +529,7 @@ impl Nix {
                 None => "without an exit code".to_string(),
             };
 
-            if !options.logging {
+            if !options.logging && options.bail_on_error {
                 error!(
                     "Command produced the following output:\n{}\n{}",
                     String::from_utf8_lossy(&result.stdout),
@@ -482,93 +557,56 @@ impl Nix {
         &self,
         command: &str,
         args: &[&str],
-        options: &nix_backend::Options,
+        options: &Options,
     ) -> Result<std::process::Command> {
-        let mut final_args = Vec::new();
-        let known_keys_str;
-        let pull_caches_str;
+        let mut final_args: Vec<String> = Vec::new();
         let mut push_cache = None;
 
         if !self.global_options.offline {
-            let cachix_caches = self.get_cachix_caches().await;
+            let trusted_keys_path = &self.cachix_manager.paths.trusted_keys;
 
-            match cachix_caches {
+            match self.get_cachix_caches(trusted_keys_path).await {
                 Err(e) => {
                     warn!("Failed to get cachix caches due to evaluation error");
                     debug!("{}", e);
                 }
                 Ok(cachix_caches) => {
                     push_cache = cachix_caches.caches.push.clone();
-                    // handle cachix.pull
-                    if !cachix_caches.caches.pull.is_empty() {
-                        let mut pull_caches = cachix_caches
-                            .caches
-                            .pull
-                            .iter()
-                            .map(|cache| format!("https://{cache}.cachix.org"))
-                            .collect::<Vec<String>>();
-                        pull_caches.sort();
-                        pull_caches_str = pull_caches.join(" ");
-                        final_args.extend_from_slice(&[
-                            "--option",
-                            "extra-substituters",
-                            &pull_caches_str,
-                        ]);
 
-                        let mut known_keys = cachix_caches
-                            .known_keys
-                            .values()
-                            .cloned()
-                            .collect::<Vec<String>>();
-                        known_keys.sort();
-                        known_keys_str = known_keys.join(" ");
-                        final_args.extend_from_slice(&[
-                            "--option",
-                            "extra-trusted-public-keys",
-                            &known_keys_str,
-                        ]);
+                    // Apply global settings (like netrc-file) first
+                    match self.cachix_manager.get_global_settings() {
+                        Ok(global_settings) => {
+                            for (key, value) in global_settings {
+                                final_args.push("--option".to_string());
+                                final_args.push(key);
+                                final_args.push(value);
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to get global Cachix settings: {}", e);
+                        }
                     }
 
-                    // Configure a netrc file with the auth token if available
-                    if !cachix_caches.caches.pull.is_empty()
-                        && let Ok(auth_token) = env::var("CACHIX_AUTH_TOKEN")
-                    {
-                        let netrc_path = self
-                            .netrc_path
-                            .get_or_try_init(|| async {
-                                let netrc_path = self.paths.dotfile.join("netrc");
-                                let netrc_path_str = netrc_path.to_string_lossy().to_string();
-
-                                self.create_netrc_file(
-                                    &netrc_path,
-                                    &cachix_caches.caches.pull,
-                                    &auth_token,
-                                )
-                                .await?;
-
-                                Ok::<String, miette::Report>(netrc_path_str)
-                            })
-                            .await;
-
-                        match netrc_path {
-                            Ok(netrc_path) => {
-                                final_args.extend_from_slice(&[
-                                    "--option",
-                                    "netrc-file",
-                                    netrc_path,
-                                ]);
+                    // Get Nix settings from CachixManager and apply them
+                    match self.cachix_manager.get_nix_settings(&cachix_caches).await {
+                        Ok(settings) => {
+                            for (key, value) in settings {
+                                final_args.push("--option".to_string());
+                                final_args.push(key);
+                                final_args.push(value);
                             }
-                            Err(e) => {
-                                warn!("${e}")
-                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to apply Cachix settings: {}", e);
                         }
                     }
                 }
             }
         }
 
-        final_args.extend(args.iter().copied());
-        let cmd = self.prepare_command(command, &final_args, options)?;
+        final_args.extend(args.iter().map(|s| s.to_string()));
+        let args_str: Vec<&str> = final_args.iter().map(|s| s.as_str()).collect();
+        let cmd = self.prepare_command(command, &args_str, options)?;
 
         // handle cachix.push
         if let Some(push_cache) = push_cache {
@@ -605,7 +643,7 @@ impl Nix {
         &self,
         command: &str,
         args: &[&str],
-        options: &nix_backend::Options,
+        options: &Options,
     ) -> Result<std::process::Command> {
         let mut flags = options.nix_flags.to_vec();
         flags.push("--max-jobs");
@@ -685,7 +723,7 @@ impl Nix {
     }
 
     async fn get_nix_config(&self) -> Result<NixConf> {
-        let options = nix_backend::Options {
+        let options = Options {
             logging: false,
             ..self.options
         };
@@ -694,58 +732,31 @@ impl Nix {
         Ok(nix_conf)
     }
 
-    async fn create_netrc_file(
-        &self,
-        netrc_path: &Path,
-        pull_caches: &[String],
-        auth_token: &str,
-    ) -> Result<()> {
-        let mut netrc_content = String::new();
-
-        for cache in pull_caches {
-            netrc_content.push_str(&format!(
-                "machine {cache}.cachix.org\nlogin token\npassword {auth_token}\n\n",
-            ));
-        }
-
-        // Create netrc file with restrictive permissions (600)
-        {
-            use tokio::io::AsyncWriteExt;
-
-            let mut file = tokio::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(netrc_path)
-                .await
-                .into_diagnostic()
-                .wrap_err_with(|| {
-                    format!("Failed to create netrc file at {}", netrc_path.display())
-                })?;
-
-            file.write_all(netrc_content.as_bytes())
-                .await
-                .into_diagnostic()
-                .wrap_err_with(|| {
-                    format!("Failed to write netrc content to {}", netrc_path.display())
-                })?;
-        }
-
-        Ok(())
+    async fn is_trusted_user_impl(&self) -> Result<bool> {
+        let options = Options {
+            logging: false,
+            ..self.options
+        };
+        let store_output = self
+            .run_nix("nix", &["store", "ping", "--json"], &options)
+            .await?;
+        let store_ping = serde_json::from_slice::<StorePing>(&store_output.stdout)
+            .into_diagnostic()
+            .wrap_err("Failed to query the Nix store")?;
+        Ok(store_ping.is_trusted)
     }
 
-    async fn get_cachix_caches(&self) -> Result<CachixCaches> {
+    async fn get_cachix_caches(&self, trusted_keys_path: &Path) -> Result<CachixCacheInfo> {
         self.cachix_caches
             .get_or_try_init(|| async {
-        let no_logging = nix_backend::Options {
+        let _no_logging = Options {
             logging: false,
             ..self.options
         };
 
         // Run Nix evaluation and file I/O concurrently
         let cachix_eval_future = self.eval(&["devenv.config.cachix"]);
-        let trusted_keys_path = self.paths.cachix_trusted_keys.clone();
+        let trusted_keys_path = trusted_keys_path.to_path_buf();
         let known_keys_future = tokio::fs::read_to_string(&trusted_keys_path);
 
         let (caches_raw, known_keys_result) = tokio::join!(cachix_eval_future, known_keys_future);
@@ -757,7 +768,7 @@ impl Nix {
 
                 // Return empty caches if the Cachix integration is disabled
                 if !cachix_config.enable {
-                    return Ok(CachixCaches::default());
+                    return Ok(CachixCacheInfo::default());
                 }
 
         let known_keys: BTreeMap<String, String> = known_keys_result
@@ -775,7 +786,7 @@ impl Nix {
                 BTreeMap::new()
             });
 
-        let mut caches = CachixCaches {
+        let mut caches = CachixCacheInfo {
             caches: cachix_config.caches,
             known_keys,
         };
@@ -819,7 +830,7 @@ impl Nix {
                             error!("To create a cache, go to https://app.cachix.org/.");
                             bail!("Cache does not exist or you don't have a CACHIX_AUTH_TOKEN configured.")
                         } else {
-                            let resp_json: CachixResponse =
+                            let resp_json: CacheMetadata =
                                 resp.json().await.into_diagnostic().wrap_err_with(|| {
                                     format!("Failed to parse Cachix API response for cache '{name}'")
                                 })?;
@@ -850,9 +861,7 @@ impl Nix {
         }
 
         if !caches.caches.pull.is_empty() {
-            // Run store ping and file write operations concurrently
-            let store_ping_future = self.run_nix("nix", &["store", "ping", "--json"], &no_logging);
-            let trusted_keys_path = self.paths.cachix_trusted_keys.clone();
+            // Write cache keys and check trusted status concurrently
             let write_keys_future = async {
                 if !new_known_keys.is_empty() {
                     caches.known_keys.extend(new_known_keys.clone());
@@ -871,20 +880,12 @@ impl Nix {
                 }
                 Ok::<(), miette::Report>(())
             };
+            let is_trusted_future = self.is_trusted_user();
 
-            let (store_result, write_result) = tokio::join!(store_ping_future, write_keys_future);
-            let store = store_result?;
+            let (is_trusted_result, write_result) = tokio::join!(is_trusted_future, write_keys_future);
+            let is_trusted = is_trusted_result?;
             write_result?;
 
-            let store_ping = serde_json::from_slice::<StorePing>(&store.stdout)
-                .into_diagnostic()
-                .wrap_err("Failed to query the Nix store")?;
-            let trusted = store_ping.trusted;
-            if trusted.is_none() {
-                warn!(
-                        "You're using an outdated version of Nix. Please upgrade and restart the nix-daemon.",
-                    );
-            }
             let restart_command = if cfg!(target_os = "linux") {
                 "sudo systemctl restart nix-daemon"
             } else {
@@ -908,7 +909,7 @@ impl Nix {
             // If the user is not a trusted user, we can't set up the caches for them.
             // Check if all of the requested caches and their public keys are in the substituters and trusted-public-keys lists.
             // If not, suggest actions to remedy the issue.
-            if trusted == Some(0) {
+            if !is_trusted {
                 let (missing_caches, missing_public_keys) = self
                     .get_nix_config()
                     .await
@@ -1006,22 +1007,6 @@ impl Nix {
             .await.cloned()
     }
 
-    /// Clean up the netrc file if it was created during this session.
-    ///
-    /// This method safely removes the netrc file containing auth tokens,
-    /// handling race conditions where the file might already be removed.
-    /// Only attempts cleanup if a netrc file was actually created.
-    fn cleanup_netrc(&self) {
-        if let Some(netrc_path_str) = self.netrc_path.get() {
-            let netrc_path = Path::new(netrc_path_str);
-            match std::fs::remove_file(netrc_path) {
-                Ok(()) => debug!("Removed netrc file: {}", netrc_path_str),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => warn!("Failed to remove netrc file {}: {}", netrc_path_str, e),
-            }
-        }
-    }
-
     fn name(&self) -> &'static str {
         "nix"
     }
@@ -1031,7 +1016,7 @@ impl Nix {
     /// This builds `nixpkgs#legacyPackages.{system}.bashInteractive.out` and returns
     /// the path to the bash executable. The result is cached unless refresh_cached_output is true.
     async fn get_bash(&self, refresh_cached_output: bool) -> Result<String> {
-        let options = nix_backend::Options {
+        let options = Options {
             cache_output: true,
             refresh_cached_output,
             ..self.options
@@ -1067,16 +1052,10 @@ impl Nix {
     }
 }
 
-impl Drop for Nix {
-    fn drop(&mut self) {
-        self.cleanup_netrc();
-    }
-}
-
 #[async_trait(?Send)]
 impl NixBackend for Nix {
-    async fn assemble(&self) -> Result<()> {
-        self.assemble().await
+    async fn assemble(&self, args: &NixArgs<'_>) -> Result<()> {
+        self.assemble(args).await
     }
 
     async fn dev_env(&self, json: bool, gc_root: &Path) -> Result<devenv_eval_cache::Output> {
@@ -1090,7 +1069,7 @@ impl NixBackend for Nix {
     async fn build(
         &self,
         attributes: &[&str],
-        options: Option<nix_backend::Options>,
+        options: Option<Options>,
         gc_root: Option<&Path>,
     ) -> Result<Vec<PathBuf>> {
         self.build(attributes, options, gc_root).await
@@ -1111,7 +1090,7 @@ impl NixBackend for Nix {
     async fn search(
         &self,
         name: &str,
-        options: Option<nix_backend::Options>,
+        options: Option<Options>,
     ) -> Result<devenv_eval_cache::Output> {
         self.search(name, options).await
     }
@@ -1127,41 +1106,10 @@ impl NixBackend for Nix {
     async fn get_bash(&self, refresh_cached_output: bool) -> Result<String> {
         self.get_bash(refresh_cached_output).await
     }
-}
 
-async fn symlink_force(link_path: &Path, target: &Path) -> Result<()> {
-    let _lock = dotlock::Dotlock::create(target.with_extension("lock")).unwrap();
-
-    debug!(
-        "Creating symlink {} -> {}",
-        link_path.display(),
-        target.display()
-    );
-
-    if target.exists() {
-        fs::remove_file(target)
-            .await
-            .map_err(|e| miette::miette!("Failed to remove {}: {}", target.display(), e))?;
+    async fn is_trusted_user(&self) -> Result<bool> {
+        self.is_trusted_user_impl().await
     }
-
-    symlink(link_path, target).map_err(|e| {
-        miette::miette!(
-            "Failed to create symlink: {} -> {}: {}",
-            link_path.display(),
-            target.display(),
-            e
-        )
-    })?;
-
-    Ok(())
-}
-
-fn get_now_with_nanoseconds() -> String {
-    let now = SystemTime::now();
-    let duration = now.duration_since(UNIX_EPOCH).expect("Time went backwards");
-    let secs = duration.as_secs();
-    let nanos = duration.subsec_nanos();
-    format!("{secs}.{nanos}")
 }
 
 // Display a command as a pretty string.
@@ -1173,159 +1121,4 @@ fn display_command(cmd: &std::process::Command) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     format!("{command} {args}")
-}
-
-/// The Cachix module configuration
-#[derive(Deserialize, Default, Clone)]
-pub struct CachixConfig {
-    enable: bool,
-    #[serde(flatten)]
-    caches: Cachix,
-}
-
-#[derive(Deserialize, Default, Clone)]
-pub struct Cachix {
-    pub pull: Vec<String>,
-    pub push: Option<String>,
-}
-
-#[derive(Deserialize, Default, Clone)]
-pub struct CachixCaches {
-    caches: Cachix,
-    known_keys: BTreeMap<String, String>,
-}
-
-#[derive(Deserialize, Clone)]
-struct CachixResponse {
-    #[serde(rename = "publicSigningKeys")]
-    public_signing_keys: Vec<String>,
-}
-
-#[derive(Deserialize, Clone)]
-struct StorePing {
-    trusted: Option<u8>,
-}
-
-fn detect_missing_caches(caches: &CachixCaches, nix_conf: NixConf) -> (Vec<String>, Vec<String>) {
-    let mut missing_caches = Vec::new();
-    let mut missing_public_keys = Vec::new();
-
-    let substituters = nix_conf
-        .get("substituters")
-        .map(|s| s.split_whitespace().collect::<Vec<_>>());
-    let extra_substituters = nix_conf
-        .get("extra-substituters")
-        .map(|s| s.split_whitespace().collect::<Vec<_>>());
-    let all_substituters = substituters
-        .into_iter()
-        .flatten()
-        .chain(extra_substituters.into_iter().flatten())
-        .collect::<Vec<_>>();
-
-    for cache in caches.caches.pull.iter() {
-        let cache_url = format!("https://{cache}.cachix.org");
-        if !all_substituters.iter().any(|s| s == &cache_url) {
-            missing_caches.push(cache_url);
-        }
-    }
-
-    let trusted_public_keys = nix_conf
-        .get("trusted-public-keys")
-        .map(|s| s.split_whitespace().collect::<Vec<_>>());
-    let extra_trusted_public_keys = nix_conf
-        .get("extra-trusted-public-keys")
-        .map(|s| s.split_whitespace().collect::<Vec<_>>());
-    let all_trusted_public_keys = trusted_public_keys
-        .into_iter()
-        .flatten()
-        .chain(extra_trusted_public_keys.into_iter().flatten())
-        .collect::<Vec<_>>();
-
-    for (_name, key) in caches.known_keys.iter() {
-        if !all_trusted_public_keys.iter().any(|p| p == key) {
-            missing_public_keys.push(key.clone());
-        }
-    }
-
-    (missing_caches, missing_public_keys)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_trusted() {
-        let store_ping = r#"{"trusted":1,"url":"daemon","version":"2.18.1"}"#;
-        let store_ping: StorePing = serde_json::from_str(store_ping).unwrap();
-        assert_eq!(store_ping.trusted, Some(1));
-    }
-
-    #[test]
-    fn test_no_trusted() {
-        let store_ping = r#"{"url":"daemon","version":"2.18.1"}"#;
-        let store_ping: StorePing = serde_json::from_str(store_ping).unwrap();
-        assert_eq!(store_ping.trusted, None);
-    }
-
-    #[test]
-    fn test_not_trusted() {
-        let store_ping = r#"{"trusted":0,"url":"daemon","version":"2.18.1"}"#;
-        let store_ping: StorePing = serde_json::from_str(store_ping).unwrap();
-        assert_eq!(store_ping.trusted, Some(0));
-    }
-
-    #[test]
-    fn test_missing_substituters() {
-        let mut cachix = CachixCaches::default();
-        cachix.caches.pull = vec!["cache1".to_string(), "cache2".to_string()];
-        cachix
-            .known_keys
-            .insert("cache1".to_string(), "key1".to_string());
-        cachix
-            .known_keys
-            .insert("cache2".to_string(), "key2".to_string());
-        let nix_conf = NixConf::parse_stdout(
-            r#"
-              substituters = https://cache1.cachix.org https://cache3.cachix.org
-              trusted-public-keys = key1 key3
-            "#
-            .as_bytes(),
-        )
-        .expect("Failed to parse NixConf");
-        assert_eq!(
-            detect_missing_caches(&cachix, nix_conf),
-            (
-                vec!["https://cache2.cachix.org".to_string()],
-                vec!["key2".to_string()]
-            )
-        );
-    }
-
-    #[test]
-    fn test_extra_missing_substituters() {
-        let mut cachix = CachixCaches::default();
-        cachix.caches.pull = vec!["cache1".to_string(), "cache2".to_string()];
-        cachix
-            .known_keys
-            .insert("cache1".to_string(), "key1".to_string());
-        cachix
-            .known_keys
-            .insert("cache2".to_string(), "key2".to_string());
-        let nix_conf = NixConf::parse_stdout(
-            r#"
-              extra-substituters = https://cache1.cachix.org https://cache3.cachix.org
-              extra-trusted-public-keys = key1 key3
-            "#
-            .as_bytes(),
-        )
-        .expect("Failed to parse NixConf");
-        assert_eq!(
-            detect_missing_caches(&cachix, nix_conf),
-            (
-                vec!["https://cache2.cachix.org".to_string()],
-                vec!["key2".to_string()]
-            )
-        );
-    }
 }

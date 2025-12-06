@@ -1021,6 +1021,106 @@ list of string
 
 
 
+## changelogs
+
+
+
+List of changelog entries for this module.
+
+
+
+*Type:*
+list of (submodule)
+
+
+
+*Default:*
+` [ ] `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/changelogs.nix](https://github.com/cachix/devenv/blob/main/src/modules/changelogs.nix)
+
+
+
+## changelogs.\*.date
+
+
+
+Date of the changelog entry in YYYY-MM-DD format.
+
+
+
+*Type:*
+string matching the pattern ^\[0-9]{4}-\[0-9]{2}-\[0-9]{2}$
+
+
+
+*Example:*
+` "2025-01-15" `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/changelogs.nix](https://github.com/cachix/devenv/blob/main/src/modules/changelogs.nix)
+
+
+
+## changelogs.\*.description
+
+
+
+Markdown description of the change.
+
+
+
+*Type:*
+string
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/changelogs.nix](https://github.com/cachix/devenv/blob/main/src/modules/changelogs.nix)
+
+
+
+## changelogs.\*.title
+
+
+
+Title of the changelog entry.
+
+
+
+*Type:*
+string
+
+
+
+*Example:*
+` "git-hooks.package is now pkgs.prek" `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/changelogs.nix](https://github.com/cachix/devenv/blob/main/src/modules/changelogs.nix)
+
+
+
+## changelogs.\*.when
+
+
+
+Whether to include this changelog entry (useful for conditional changelogs).
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/changelogs.nix](https://github.com/cachix/devenv/blob/main/src/modules/changelogs.nix)
+
+
+
 ## claude.code.enable
 
 
@@ -1746,156 +1846,6 @@ list of string
 
 *Declared by:*
  - [https://github.com/cachix/devenv/blob/main/src/modules/integrations/claude.nix](https://github.com/cachix/devenv/blob/main/src/modules/integrations/claude.nix)
-
-
-
-## configurations
-
-
-
-Configurations for NixOS, home-manager, and nix-darwin.
-
-
-
-*Type:*
-attribute set of (submodule)
-
-
-
-*Default:*
-` { } `
-
-*Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/configurations.nix](https://github.com/cachix/devenv/blob/main/src/modules/configurations.nix)
-
-
-
-## configurations.\<name>.home-manager
-
-
-
-Home Manager configuration for the configuration.
-
-
-
-*Type:*
-null or unspecified value
-
-
-
-*Default:*
-` null `
-
-
-
-*Example:*
-
-```
-{
-  home.username = "jdoe";
-  home.homeDirectory = "/home/jdoe";
-  programs.git.enable = true;
-}
-
-```
-
-*Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/configurations.nix](https://github.com/cachix/devenv/blob/main/src/modules/configurations.nix)
-
-
-
-## configurations.\<name>.nix-darwin
-
-
-
-nix-darwin configuration for the configuration.
-
-
-
-*Type:*
-null or unspecified value
-
-
-
-*Default:*
-` null `
-
-
-
-*Example:*
-
-```
-{ pkgs, ... }: {
-  environment.systemPackages = [
-    pkgs.vim
-  ];
-  services.nix-daemon.enable = true;
-}
-
-```
-
-*Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/configurations.nix](https://github.com/cachix/devenv/blob/main/src/modules/configurations.nix)
-
-
-
-## configurations.\<name>.nixos
-
-
-
-NixOS configuration for the configuration.
-
-
-
-*Type:*
-null or unspecified value
-
-
-
-*Default:*
-` null `
-
-
-
-*Example:*
-
-```
-{
-  fileSystems."/".device = "/dev/sda1";
-  boot.loader.systemd-boot.enable = true;
-  services.openssh.enable = true;
-}
-
-```
-
-*Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/configurations.nix](https://github.com/cachix/devenv/blob/main/src/modules/configurations.nix)
-
-
-
-## configurations.\<name>.system
-
-
-
-System architecture for the configuration.
-
-
-
-*Type:*
-string
-
-
-
-*Default:*
-` pkgs.stdenv.system `
-
-
-
-*Example:*
-` "x86_64-linux" `
-
-*Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/configurations.nix](https://github.com/cachix/devenv/blob/main/src/modules/configurations.nix)
 
 
 
@@ -2718,7 +2668,7 @@ string
 
 
 *Default:*
-` "1.10" `
+` "1.11.2" `
 
 *Declared by:*
  - [https://github.com/cachix/devenv/blob/main/src/modules/update-check.nix](https://github.com/cachix/devenv/blob/main/src/modules/update-check.nix)
@@ -14163,6 +14113,48 @@ package
 
 
 
+## languages.haskell.cabal.enable
+
+
+
+Whether to enable Cabal.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/haskell.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/haskell.nix)
+
+
+
+## languages.haskell.cabal.package
+
+
+
+Cabal package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.cabal-install `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/haskell.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/haskell.nix)
+
+
+
 ## languages.haskell.languageServer
 
 
@@ -16108,7 +16100,7 @@ boolean
 ` true `
 
 *Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix)
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
 
 
 
@@ -16129,7 +16121,7 @@ package
 ` pkgs.python3 `
 
 *Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix)
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
 
 
 
@@ -16156,7 +16148,7 @@ string
 ` "./directory" `
 
 *Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix)
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
 
 
 
@@ -16183,7 +16175,7 @@ list of absolute path
 ```
 
 *Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix)
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
 
 
 
@@ -16208,7 +16200,36 @@ boolean
 ` false `
 
 *Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix)
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
+
+
+
+## languages.python.patches.buildEnv.enable
+
+
+
+Whether to apply fixes to Python’s ` buildEnv ` for correct runtime initialization:
+
+ - Executables use ` --inherit-argv0 ` and ` --resolve-argv0 ` to ensure Python initializes with correct ` sys.prefix ` and ` sys.base_prefix `
+ - Python package scripts are unwrapped to invoke the environment’s interpreter directly
+
+Without these fixes, venvs cannot access environment packages via ` --system-site-packages `.
+
+Enabled by default.
+Newer nixpkgs releases may include upstream fixes that make this patch obsolete.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
 
 
 
@@ -16234,7 +16255,7 @@ boolean
 ` true `
 
 *Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix)
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
 
 
 
@@ -16255,7 +16276,7 @@ package
 ` pkgs.poetry `
 
 *Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix)
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
 
 
 
@@ -16276,7 +16297,7 @@ boolean
 ` false `
 
 *Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix)
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
 
 
 
@@ -16302,7 +16323,7 @@ boolean
 ` true `
 
 *Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix)
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
 
 
 
@@ -16323,7 +16344,7 @@ boolean
 ` false `
 
 *Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix)
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
 
 
 
@@ -16344,7 +16365,7 @@ boolean
 ` false `
 
 *Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix)
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
 
 
 
@@ -16365,7 +16386,7 @@ boolean
 ` false `
 
 *Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix)
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
 
 
 
@@ -16386,7 +16407,7 @@ list of string
 ` [ ] `
 
 *Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix)
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
 
 
 
@@ -16407,7 +16428,7 @@ list of string
 ` [ ] `
 
 *Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix)
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
 
 
 
@@ -16428,7 +16449,7 @@ list of string
 ` [ ] `
 
 *Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix)
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
 
 
 
@@ -16449,7 +16470,7 @@ boolean
 ` false `
 
 *Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix)
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
 
 
 
@@ -16470,7 +16491,7 @@ list of string
 ` [ ] `
 
 *Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix)
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
 
 
 
@@ -16491,7 +16512,7 @@ boolean
 ` false `
 
 *Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix)
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
 
 
 
@@ -16512,7 +16533,7 @@ boolean
 ` false `
 
 *Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix)
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
 
 
 
@@ -16533,7 +16554,7 @@ one of “no”, “little”, “more”, “debug”
 ` "no" `
 
 *Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix)
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
 
 
 
@@ -16559,7 +16580,7 @@ boolean
 ` true `
 
 *Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix)
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
 
 
 
@@ -16580,7 +16601,7 @@ package
 ` pkgs.uv `
 
 *Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix)
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
 
 
 
@@ -16606,7 +16627,7 @@ boolean
 ` true `
 
 *Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix)
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
 
 
 
@@ -16627,7 +16648,7 @@ list of string
 ` [ ] `
 
 *Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix)
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
 
 
 
@@ -16648,7 +16669,7 @@ boolean
 ` false `
 
 *Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix)
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
 
 
 
@@ -16669,7 +16690,7 @@ boolean
 ` false `
 
 *Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix)
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
 
 
 
@@ -16690,7 +16711,7 @@ boolean
 ` false `
 
 *Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix)
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
 
 
 
@@ -16711,7 +16732,7 @@ list of string
 ` [ ] `
 
 *Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix)
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
 
 
 
@@ -16732,7 +16753,7 @@ list of string
 ` [ ] `
 
 *Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix)
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
 
 
 
@@ -16753,7 +16774,7 @@ list of string
 ` [ ] `
 
 *Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix)
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
 
 
 
@@ -16779,7 +16800,7 @@ boolean
 ` true `
 
 *Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix)
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
 
 
 
@@ -16800,7 +16821,7 @@ boolean
 ` false `
 
 *Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix)
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
 
 
 
@@ -16822,7 +16843,7 @@ null or strings concatenated with “\\n” or absolute path
 ` null `
 
 *Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix)
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
 
 
 
@@ -16849,7 +16870,7 @@ null or string
 ` "3.11 or 3.11.2" `
 
 *Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/python.nix)
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
 
 
 
@@ -18405,6 +18426,33 @@ package
 
 
 
+## languages.zig.version
+
+
+
+The Zig version to use.
+This automatically sets the ` languages.zig.package ` and ` languages.zig.zls.package ` using [zig-overlay](https://github.com/mitchellh/zig-overlay).
+
+
+
+*Type:*
+null or string
+
+
+
+*Default:*
+` null `
+
+
+
+*Example:*
+` "0.15.1" `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/zig.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/zig.nix)
+
+
+
 ## languages.zig.zls.package
 
 
@@ -18423,6 +18471,156 @@ package
 
 *Declared by:*
  - [https://github.com/cachix/devenv/blob/main/src/modules/languages/zig.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/zig.nix)
+
+
+
+## machines
+
+
+
+Machines for NixOS, home-manager, and nix-darwin.
+
+
+
+*Type:*
+attribute set of (submodule)
+
+
+
+*Default:*
+` { } `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/machines.nix](https://github.com/cachix/devenv/blob/main/src/modules/machines.nix)
+
+
+
+## machines.\<name>.home-manager
+
+
+
+Home Manager configuration for the machine.
+
+
+
+*Type:*
+null or unspecified value
+
+
+
+*Default:*
+` null `
+
+
+
+*Example:*
+
+```
+{
+  home.username = "jdoe";
+  home.homeDirectory = "/home/jdoe";
+  programs.git.enable = true;
+}
+
+```
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/machines.nix](https://github.com/cachix/devenv/blob/main/src/modules/machines.nix)
+
+
+
+## machines.\<name>.nix-darwin
+
+
+
+nix-darwin configuration for the machine.
+
+
+
+*Type:*
+null or unspecified value
+
+
+
+*Default:*
+` null `
+
+
+
+*Example:*
+
+```
+{ pkgs, ... }: {
+  environment.systemPackages = [
+    pkgs.vim
+  ];
+  services.nix-daemon.enable = true;
+}
+
+```
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/machines.nix](https://github.com/cachix/devenv/blob/main/src/modules/machines.nix)
+
+
+
+## machines.\<name>.nixos
+
+
+
+NixOS configuration for the machine.
+
+
+
+*Type:*
+null or unspecified value
+
+
+
+*Default:*
+` null `
+
+
+
+*Example:*
+
+```
+{
+  fileSystems."/".device = "/dev/sda1";
+  boot.loader.systemd-boot.enable = true;
+  services.openssh.enable = true;
+}
+
+```
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/machines.nix](https://github.com/cachix/devenv/blob/main/src/modules/machines.nix)
+
+
+
+## machines.\<name>.system
+
+
+
+System architecture for the machine.
+
+
+
+*Type:*
+string
+
+
+
+*Default:*
+` pkgs.stdenv.system `
+
+
+
+*Example:*
+` "x86_64-linux" `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/machines.nix](https://github.com/cachix/devenv/blob/main/src/modules/machines.nix)
 
 
 
@@ -23391,6 +23589,58 @@ string
 
 
 
+## services.mongodb.replication.enable
+
+
+
+Whether to enable MongoDB replication with a 1-node replica-set…
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` false `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/services/mongodb.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/mongodb.nix)
+
+
+
+## services.mongodb.replication.replSet
+
+
+
+Replica-set name
+
+
+
+*Type:*
+string
+
+
+
+*Default:*
+` "rs0" `
+
+
+
+*Example:*
+` "rs0" `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/services/mongodb.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/mongodb.nix)
+
+
+
 ## services.mysql.enable
 
 
@@ -24360,6 +24610,167 @@ strings concatenated with “\\n”
 
 *Declared by:*
  - [https://github.com/cachix/devenv/blob/main/src/modules/services/nginx.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/nginx.nix)
+
+
+
+## services.nixseparatedebuginfod.enable
+
+
+
+Whether to enable nixseparatedebuginfod.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` false `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/services/nixseparatedebuginfod.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/nixseparatedebuginfod.nix)
+
+
+
+## services.nixseparatedebuginfod.package
+
+
+
+nixseparatedebuginfod package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.nixseparatedebuginfod2 `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/services/nixseparatedebuginfod.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/nixseparatedebuginfod.nix)
+
+
+
+## services.nixseparatedebuginfod.cache.directory
+
+
+
+Override the directory where files downloaded from the substituter are stored.
+
+Default is ` $XDG_CACHE_DIR/nixseparatedebuginfod2 `.
+
+
+
+*Type:*
+null or string
+
+
+
+*Default:*
+` null `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/services/nixseparatedebuginfod.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/nixseparatedebuginfod.nix)
+
+
+
+## services.nixseparatedebuginfod.cache.expiration
+
+
+
+How long to keep cache entries.
+A number followed by a unit.
+
+
+
+*Type:*
+string
+
+
+
+*Default:*
+` "1d" `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/services/nixseparatedebuginfod.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/nixseparatedebuginfod.nix)
+
+
+
+## services.nixseparatedebuginfod.host
+
+
+
+IP address for nixseparatedebuginfod to listen on.
+
+
+
+*Type:*
+string
+
+
+
+*Default:*
+` "127.0.0.1" `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/services/nixseparatedebuginfod.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/nixseparatedebuginfod.nix)
+
+
+
+## services.nixseparatedebuginfod.port
+
+
+
+Port for nixseparatedebuginfod to listen on.
+
+
+
+*Type:*
+16 bit unsigned integer; between 0 and 65535 (both inclusive)
+
+
+
+*Default:*
+` 1949 `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/services/nixseparatedebuginfod.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/nixseparatedebuginfod.nix)
+
+
+
+## services.nixseparatedebuginfod.substituters
+
+
+
+Substituters to fetch debuginfo from.
+
+
+
+*Type:*
+list of string
+
+
+
+*Default:*
+
+```
+[
+  "local:"
+  "https://cache.nixos.org"
+]
+```
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/services/nixseparatedebuginfod.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/nixseparatedebuginfod.nix)
 
 
 

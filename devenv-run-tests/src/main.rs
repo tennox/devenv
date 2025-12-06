@@ -1,5 +1,5 @@
 use clap::Parser;
-use devenv::{Devenv, DevenvOptions, log};
+use devenv::{Config, Devenv, DevenvOptions, log};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -359,7 +359,7 @@ async fn run_tests_in_directory(args: &RunArgs) -> Result<Vec<TestResult>> {
         }
 
         // Now load config from the current directory (which might be temp dir)
-        let mut config = devenv::config::Config::load_from(&devenv_root)?;
+        let mut config = Config::load_from(&devenv_root)?;
         for input in args.override_input.chunks_exact(2) {
             config
                 .override_input_url(&input[0], &input[1])
@@ -534,6 +534,8 @@ exec '{bin_dir}/devenv' \
     let mut env = vec![
         ("DEVENV_RUN_TESTS", "1".to_string()),
         ("DEVENV_NIX", env::var("DEVENV_NIX").unwrap_or_default()),
+        // Path to the devenv repo being tested, for tests that need to use it as an input
+        ("DEVENV_REPO", cwd.display().to_string()),
         (
             "PATH",
             format!(

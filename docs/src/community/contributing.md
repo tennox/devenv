@@ -22,14 +22,18 @@ We have a rule that new features need to come with documentation and tests (`dev
 
 2. `<PATH-TO-DEVENV-SOURCE-CODE>/result/bin/devenv init`
 
-3. Add devenv input pointing to local source directory to `devenv.yaml`
+3. Add devenv input pointing to local source directory to `devenv.yaml` under `inputs`
 
-```
-devenv:
-  url: path:<PATH-TO-DEVENV-SOURCE-CODE>?dir=src/modules
-```
+    ```
+    inputs:
+      ...
+      devenv:
+        url: path:<PATH-TO-DEVENV-SOURCE-CODE>?dir=src/modules
+    ```
 
 4. `<PATH-TO-DEVENV-SOURCE-CODE>/result/bin/devenv update`
+
+    Now, that `devenv.yaml` is pointing to the local version of `src/modules`, changes made in `src/modules` will be picked up immediately on next shell activation. (No need to rebuild the binary.)
 
 ## Repository structure
 
@@ -40,6 +44,36 @@ devenv:
 - Documentation is in `docs/`.
 - To run a development server, run `devenv up`.
 - To run a test from `examples/` or `tests/`, run `<PATH-TO-DEVENV-SOURCE-CODE>/result/bin/devenv-run-tests --only <name>`.
+
+## Adding changelogs for breaking and behavior changes
+
+When making breaking changes or important behavior changes that affect users, add a changelog entry so they are informed after running `devenv update`.
+
+Changelogs are defined in any `devenv.nix` module or configuration using the `changelogs` option:
+
+```nix
+{
+  changelogs = [
+    {
+      date = "2025-01-15";
+      title = "git-hooks.package is now pkgs.prek";
+      when = config.git-hooks.enable;  # Condition for showing this changelog
+      description = ''
+        The git-hooks.package option now defaults to pkgs.prek instead of pkgs.pre-commit.
+        If you were using a custom package, please update your configuration.
+      '';
+    }
+  ];
+}
+```
+
+Each changelog entry requires:
+- `date`: A YYYY-MM-DD formatted date string
+- `title`: A short description of the breaking change or behavior change
+- `when`: A boolean condition for when to show this changelog (e.g., based on whether a feature is enabled)
+- `description`: A markdown-formatted detailed description of the change and any migration steps
+
+Changelogs are deduplicated based on date and title, so you can safely update the description without affecting deduplication. Users can view all relevant changelogs with the `devenv changelogs` command.
 
 ## Contributing language improvements
 

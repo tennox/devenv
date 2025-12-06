@@ -58,8 +58,16 @@ impl TaskState {
             return Ok(false);
         }
 
+        // Include the command path in the files to check, so that
+        // changes to the task's exec script or dependencies will invalidate the cache.
+        // This works because Nix store paths are content-addressed.
+        let mut files_to_check = self.task.exec_if_modified.clone();
+        if let Some(cmd) = &self.task.command {
+            files_to_check.push(cmd.clone());
+        }
+
         cache
-            .check_modified_files(&self.task.name, &self.task.exec_if_modified)
+            .check_modified_files(&self.task.name, &files_to_check)
             .await
     }
 
@@ -360,8 +368,14 @@ impl TaskState {
         // Track EOF status for stdout and stderr streams
         let mut stdout_closed = false;
         let mut stderr_closed = false;
+        let mut exit_status: Option<std::process::ExitStatus> = None;
 
         loop {
+            // If child has exited and both pipes are closed, we're done
+            if exit_status.is_some() && stdout_closed && stderr_closed {
+                break;
+            }
+
             tokio::select! {
                 result = stdout_reader.next_line(), if !stdout_closed => {
                     match result {
@@ -386,8 +400,10 @@ impl TaskState {
                 result = stderr_reader.next_line(), if !stderr_closed => {
                     match result {
                         Ok(Some(line)) => {
-                            if self.verbosity == VerbosityLevel::Verbose || self.task.show_output || is_process {
+                            if self.verbosity == VerbosityLevel::Verbose || self.task.show_output {
                                 eprintln!("[{}] {}", self.task.name, line);
+                            } else if is_process {
+                                eprintln!("{}", line);
                             }
                             stderr_lines.push((std::time::Instant::now(), line));
                         },
@@ -401,7 +417,7 @@ impl TaskState {
                         },
                     }
                 }
-                result = child.wait() => {
+                result = child.wait(), if exit_status.is_none() => {
                     match result {
                         Ok(status) => {
                             // Emit tracing event for command completion
@@ -417,18 +433,8 @@ impl TaskState {
                                 cache.update_file_state(&self.task.name, &path).await?;
                             }
 
-                            if status.success() {
-                                return Ok(TaskCompleted::Success(now.elapsed(), Self::get_outputs(&outputs_file).await));
-                            } else {
-                                return Ok(TaskCompleted::Failed(
-                                    now.elapsed(),
-                                    TaskFailure {
-                                        stdout: stdout_lines,
-                                        stderr: stderr_lines,
-                                        error: format!("Task exited with status: {status}"),
-                                    },
-                                ));
-                            }
+                            // Store exit status and continue draining pipes
+                            exit_status = Some(status);
                         },
                         Err(e) => {
                             error!("{}> Error waiting for command: {}", self.task.name, e);
@@ -472,6 +478,24 @@ impl TaskState {
                     return Ok(TaskCompleted::Cancelled(Some(now.elapsed())));
                 }
             }
+        }
+
+        // Return based on the stored exit status
+        let status = exit_status.expect("Loop exited without exit status");
+        if status.success() {
+            Ok(TaskCompleted::Success(
+                now.elapsed(),
+                Self::get_outputs(&outputs_file).await,
+            ))
+        } else {
+            Ok(TaskCompleted::Failed(
+                now.elapsed(),
+                TaskFailure {
+                    stdout: stdout_lines,
+                    stderr: stderr_lines,
+                    error: format!("Task exited with status: {status}"),
+                },
+            ))
         }
     }
 }

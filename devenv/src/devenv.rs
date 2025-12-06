@@ -1,9 +1,18 @@
-use super::{cli, config, log::HumanReadableDuration, nix_backend, tasks, util};
+use super::{log::HumanReadableDuration, tasks, util};
 use ::nix::sys::signal;
 use ::nix::unistd::Pid;
 use clap::crate_version;
 use cli_table::Table;
 use cli_table::{WithTitle, print_stderr};
+use devenv_core::{
+    cachix::{CachixManager, CachixPaths},
+    cli::GlobalOptions,
+    config::{Config, NixBackendType},
+    nix_args::{NixArgs, SecretspecData},
+    nix_backend::{DevenvPaths, NixBackend, Options},
+};
+#[cfg(feature = "snix")]
+use devenv_snix_backend;
 use include_dir::{Dir, include_dir};
 use miette::{IntoDiagnostic, Result, WrapErr, bail, miette};
 use once_cell::sync::Lazy;
@@ -11,8 +20,8 @@ use secrecy::ExposeSecret;
 use serde::Deserialize;
 use sha2::Digest;
 use similar::{ChangeTag, TextDiff};
+use sqlx::SqlitePool;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ffi::OsStr;
 use std::io::Write;
 use std::os::unix::{fs::PermissionsExt, process::CommandExt};
 use std::path::{Path, PathBuf};
@@ -29,7 +38,6 @@ use tokio::sync::{OnceCell, RwLock, Semaphore};
 use tracing::{Instrument, debug, error, info, info_span, instrument, trace, warn};
 
 // templates
-const FLAKE_TMPL: &str = include_str!("flake.tmpl.nix");
 const REQUIRED_FILES: [&str; 4] = ["devenv.nix", "devenv.yaml", ".envrc", ".gitignore"];
 const EXISTING_REQUIRED_FILES: [&str; 1] = [".gitignore"];
 const PROJECT_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/init");
@@ -53,8 +61,8 @@ pub(crate) const DEVENV_FLAKE: &str = ".devenv.flake.nix";
 
 #[derive(Debug)]
 pub struct DevenvOptions {
-    pub config: config::Config,
-    pub global_options: Option<cli::GlobalOptions>,
+    pub config: Config,
+    pub global_options: Option<GlobalOptions>,
     pub devenv_root: Option<PathBuf>,
     pub devenv_dotfile: Option<PathBuf>,
     pub shutdown: Arc<tokio_shutdown::Shutdown>,
@@ -63,7 +71,7 @@ pub struct DevenvOptions {
 impl DevenvOptions {
     pub fn new(shutdown: Arc<tokio_shutdown::Shutdown>) -> Self {
         Self {
-            config: config::Config::default(),
+            config: Config::default(),
             global_options: None,
             devenv_root: None,
             devenv_dotfile: None,
@@ -75,7 +83,7 @@ impl DevenvOptions {
 impl Default for DevenvOptions {
     fn default() -> Self {
         Self {
-            config: config::Config::default(),
+            config: Config::default(),
             global_options: None,
             devenv_root: None,
             devenv_dotfile: None,
@@ -96,17 +104,17 @@ pub struct ProcessOptions<'a> {
 }
 
 pub struct Devenv {
-    pub config: Arc<RwLock<config::Config>>,
-    pub global_options: cli::GlobalOptions,
+    pub config: Arc<RwLock<Config>>,
+    pub global_options: GlobalOptions,
 
-    pub nix: Arc<Box<dyn nix_backend::NixBackend>>,
+    pub nix: Arc<Box<dyn NixBackend>>,
 
     // All kinds of paths
     devenv_root: PathBuf,
     devenv_dotfile: PathBuf,
     devenv_dot_gc: PathBuf,
     devenv_home_gc: PathBuf,
-    devenv_tmp: String,
+    devenv_tmp: PathBuf,
     devenv_runtime: PathBuf,
 
     // Whether assemble has been run.
@@ -116,6 +124,9 @@ pub struct Devenv {
     assemble_lock: Arc<Semaphore>,
 
     has_processes: Arc<OnceCell<bool>>,
+
+    // Eval-cache pool (framework layer concern, used by backends)
+    eval_cache_pool: Arc<OnceCell<SqlitePool>>,
 
     // Secretspec resolved data to pass to Nix
     secretspec_resolved: Arc<OnceCell<secretspec::Resolved<HashMap<String, String>>>>,
@@ -147,8 +158,10 @@ impl Devenv {
             .unwrap_or(devenv_root.join(".devenv"));
         let devenv_dot_gc = devenv_dotfile.join("gc");
 
-        let devenv_tmp = std::env::var("XDG_RUNTIME_DIR")
-            .unwrap_or_else(|_| std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()));
+        let devenv_tmp =
+            PathBuf::from(std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| {
+                std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string())
+            }));
         // first 7 chars of sha256 hash of devenv_state
         let devenv_state_hash = {
             let mut hasher = sha2::Sha256::new();
@@ -156,8 +169,7 @@ impl Devenv {
             let result = hasher.finalize();
             hex::encode(result)
         };
-        let devenv_runtime =
-            Path::new(&devenv_tmp).join(format!("devenv-{}", &devenv_state_hash[..7]));
+        let devenv_runtime = devenv_tmp.join(format!("devenv-{}", &devenv_state_hash[..7]));
 
         let global_options = options.global_options.unwrap_or_default();
 
@@ -172,34 +184,47 @@ impl Devenv {
         let backend_type = options.config.backend.clone();
 
         // Create DevenvPaths struct
-        let paths = nix_backend::DevenvPaths {
+        let paths = DevenvPaths {
             root: devenv_root.clone(),
             dotfile: devenv_dotfile.clone(),
             dot_gc: devenv_dot_gc.clone(),
             home_gc: devenv_home_gc.clone(),
-            cachix_trusted_keys,
         };
+
+        // Create CachixPaths for Nix backend
+        let cachix_paths = CachixPaths {
+            trusted_keys: cachix_trusted_keys,
+            netrc: devenv_dotfile.join("netrc"),
+        };
+        let cachix_manager = Arc::new(CachixManager::new(cachix_paths));
 
         // Create shared secretspec_resolved Arc to share between Devenv and Nix
         let secretspec_resolved = Arc::new(OnceCell::new());
 
-        let nix: Box<dyn nix_backend::NixBackend> = match backend_type {
-            config::NixBackendType::Nix => Box::new(
+        // Create eval-cache pool (framework layer concern, used by backends)
+        let eval_cache_pool = Arc::new(OnceCell::new());
+
+        let nix: Box<dyn NixBackend> = match backend_type {
+            NixBackendType::Nix => Box::new(
                 crate::nix::Nix::new(
                     options.config.clone(),
                     global_options.clone(),
                     paths,
                     secretspec_resolved.clone(),
+                    cachix_manager.clone(),
+                    Some(eval_cache_pool.clone()),
                 )
                 .await
                 .expect("Failed to initialize Nix backend"),
             ),
             #[cfg(feature = "snix")]
-            config::NixBackendType::Snix => Box::new(
-                crate::snix_backend::SnixBackend::new(
+            NixBackendType::Snix => Box::new(
+                devenv_snix_backend::SnixBackend::new(
                     options.config.clone(),
                     global_options.clone(),
                     paths,
+                    cachix_manager,
+                    Some(eval_cache_pool.clone()),
                 )
                 .await
                 .expect("Failed to initialize Snix backend"),
@@ -219,6 +244,7 @@ impl Devenv {
             assembled: Arc::new(AtomicBool::new(false)),
             assemble_lock: Arc::new(Semaphore::new(1)),
             has_processes: Arc::new(OnceCell::new()),
+            eval_cache_pool,
             secretspec_resolved,
             container_name: None,
             shutdown: options.shutdown,
@@ -231,6 +257,15 @@ impl Devenv {
 
     pub fn processes_pid(&self) -> PathBuf {
         self.devenv_dotfile.join("processes.pid")
+    }
+
+    pub fn paths(&self) -> DevenvPaths {
+        DevenvPaths {
+            root: self.devenv_root.clone(),
+            dotfile: self.devenv_dotfile.clone(),
+            dot_gc: self.devenv_dot_gc.clone(),
+            home_gc: self.devenv_home_gc.clone(),
+        }
     }
 
     pub fn init(&self, target: &Option<PathBuf>) -> Result<()> {
@@ -294,6 +329,11 @@ impl Devenv {
             config.write().await?;
         }
         Ok(())
+    }
+
+    pub async fn changelogs(&self) -> Result<()> {
+        let changelog = crate::changelog::Changelog::new(&**self.nix, &self.paths());
+        changelog.show_all().await
     }
 
     pub async fn print_dev_env(&self, json: bool) -> Result<()> {
@@ -446,6 +486,13 @@ impl Devenv {
 
         let span = info_span!("update", devenv.user_message = msg);
         self.nix.update(input_name).instrument(span).await?;
+
+        // Show new changelogs (if any)
+        let changelog = crate::changelog::Changelog::new(&**self.nix, &self.paths());
+        if let Err(e) = changelog.show_new().await {
+            // Don't fail the update if changelogs fail to load
+            tracing::warn!("Failed to show changelogs: {}", e);
+        }
 
         Ok(())
     }
@@ -656,7 +703,7 @@ impl Devenv {
     }
 
     async fn search_options(&self, name: &str) -> Result<Vec<DevenvOptionResult>> {
-        let build_options = nix_backend::Options {
+        let build_options = Options {
             logging: false,
             cache_output: true,
             ..Default::default()
@@ -692,7 +739,7 @@ impl Devenv {
     }
 
     async fn search_packages(&self, name: &str) -> Result<Vec<DevenvPackageResult>> {
-        let search_options = nix_backend::Options {
+        let search_options = Options {
             logging: false,
             cache_output: true,
             ..Default::default()
@@ -853,7 +900,8 @@ impl Devenv {
             })?;
 
         // Run script and capture its environment exports
-        self.prepare_shell(&Some(script_path.to_string_lossy().into()), &[])
+        let exit_status = self
+            .prepare_shell(&Some(script_path.to_string_lossy().into()), &[])
             .await?
             .stderr(Stdio::inherit())
             .stdout(Stdio::inherit())
@@ -864,6 +912,10 @@ impl Devenv {
             .await
             .into_diagnostic()
             .wrap_err("Failed to wait for environment capture script to complete")?;
+
+        if !exit_status.success() {
+            miette::bail!("Shell environment capture failed");
+        }
 
         // Parse the environment variables
         let file = File::open(&env_path)
@@ -1271,30 +1323,7 @@ impl Devenv {
             miette::miette!("Failed to create {}: {}", self.devenv_dot_gc.display(), e)
         })?;
 
-        // Initialise any Nix state
-        self.nix.assemble().await?;
-
-        let mut flake_inputs = BTreeMap::new();
         let config = self.config.read().await;
-        for (input, attrs) in config.inputs.iter() {
-            match config::FlakeInput::try_from(attrs) {
-                Ok(flake_input) => {
-                    flake_inputs.insert(input.clone(), flake_input);
-                }
-                Err(e) => {
-                    error!("Failed to parse input {}: {}", input, e);
-                    bail!("Failed to parse inputs");
-                }
-            }
-        }
-        util::write_file_with_lock(
-            self.devenv_dotfile.join("flake.json"),
-            serde_json::to_string(&flake_inputs).unwrap(),
-        )?;
-        util::write_file_with_lock(
-            self.devenv_dotfile.join("devenv.json"),
-            serde_json::to_string(&*config).unwrap(),
-        )?;
         // TODO: superceded by eval caching.
         // Remove once direnvrc migration is implemented.
         util::write_file_with_lock(
@@ -1307,6 +1336,24 @@ impl Devenv {
             .map_err(|e| {
                 miette::miette!("Failed to create {}: {}", self.devenv_runtime.display(), e)
             })?;
+
+        // Initialize eval-cache database (framework layer concern, used by backends)
+        if self.global_options.eval_cache {
+            self.eval_cache_pool
+                .get_or_try_init(|| async {
+                    let db_path = self.devenv_dotfile.join("nix-eval-cache.db");
+                    let db = devenv_cache_core::db::Database::new(
+                        db_path,
+                        &devenv_eval_cache::db::MIGRATIONS,
+                    )
+                    .await
+                    .map_err(|e| {
+                        miette::miette!("Failed to initialize eval cache database: {}", e)
+                    })?;
+                    Ok::<_, miette::Report>(db.pool().clone())
+                })
+                .await?;
+        }
 
         // Check for secretspec.toml and load secrets
         let secretspec_path = self.devenv_root.join("secretspec.toml");
@@ -1324,15 +1371,15 @@ impl Devenv {
                     "{}",
                     indoc::formatdoc! {"
                     Found secretspec.toml but secretspec integration is not enabled.
-                    
+
                     To enable, add to devenv.yaml:
                       secretspec:
                         enable: true
-                    
+
                     To disable this message:
                       secretspec:
                         enable: false
-                    
+
                     Learn more: https://devenv.sh/integrations/secretspec/
                 "}
                 );
@@ -1362,184 +1409,91 @@ impl Devenv {
                 }
 
                 // Validate secrets
-                match secrets.validate()? {
-                    Ok(validated_secrets) => {
-                        // Store resolved secrets in OnceCell for Nix to use
-                        let resolved = secretspec::Resolved {
-                            secrets: validated_secrets
-                                .resolved
-                                .secrets
-                                .into_iter()
-                                .map(|(k, v)| (k, v.expose_secret().to_string()))
-                                .collect(),
-                            provider: validated_secrets.resolved.provider,
-                            profile: validated_secrets.resolved.profile,
-                        };
+                let validated_secrets = secrets.check()?;
 
-                        self.secretspec_resolved
-                            .set(resolved)
-                            .map_err(|_| miette!("Secretspec resolved already set"))?;
-                    }
-                    Err(validation_errors) => {
-                        bail!(
-                            "Required secrets are missing: {} (provider: {}, profile: {})",
-                            validation_errors.missing_required.join(", "),
-                            validation_errors.provider,
-                            validation_errors.profile
-                        );
-                    }
-                }
-            }
-        }
-
-        // Create cli-options.nix if there are CLI options
-        if !self.global_options.option.is_empty() {
-            let mut cli_options = String::from("{ pkgs, lib, config, ... }: {\n");
-
-            const SUPPORTED_TYPES: &[&str] =
-                &["string", "int", "float", "bool", "path", "pkg", "pkgs"];
-
-            for chunk in self.global_options.option.chunks_exact(2) {
-                // Parse the path and type from the first value
-                let key_parts: Vec<&str> = chunk[0].split(':').collect();
-                if key_parts.len() < 2 {
-                    miette::bail!(
-                        "Invalid option format: '{}'. Must include type, e.g. 'languages.rust.version:string'. Supported types: {}",
-                        chunk[0],
-                        SUPPORTED_TYPES.join(", ")
-                    );
-                }
-
-                let path = key_parts[0];
-                let type_name = key_parts[1];
-
-                // Format value based on type
-                let value = match type_name {
-                    "string" => format!("\"{}\"", &chunk[1]),
-                    "int" => chunk[1].clone(),
-                    "float" => chunk[1].clone(),
-                    "bool" => chunk[1].clone(), // true/false will work directly in Nix
-                    "path" => format!("./{}", &chunk[1]), // relative path
-                    "pkg" => format!("pkgs.{}", &chunk[1]),
-                    "pkgs" => {
-                        // Split by whitespace and format as a Nix list of package references
-                        let items = chunk[1]
-                            .split_whitespace()
-                            .map(|item| format!("pkgs.{item}"))
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        format!("[ {items} ]")
-                    }
-                    _ => miette::bail!(
-                        "Unsupported type: '{}'. Supported types: {}",
-                        type_name,
-                        SUPPORTED_TYPES.join(", ")
-                    ),
+                // Store resolved secrets in OnceCell for Nix to use
+                let resolved = secretspec::Resolved {
+                    secrets: validated_secrets
+                        .resolved
+                        .secrets
+                        .into_iter()
+                        .map(|(k, v)| (k, v.expose_secret().to_string()))
+                        .collect(),
+                    provider: validated_secrets.resolved.provider,
+                    profile: validated_secrets.resolved.profile,
                 };
 
-                // Use lib.mkForce for all types except pkgs
-                let final_value = if type_name == "pkgs" {
-                    value
-                } else {
-                    format!("lib.mkForce {value}")
-                };
-                cli_options.push_str(&format!("  {path} = {final_value};\n"));
-            }
-
-            cli_options.push_str("}\n");
-
-            util::write_file_with_lock(self.devenv_dotfile.join("cli-options.nix"), &cli_options)?;
-        } else {
-            // Remove the file if it exists but there are no CLI options
-            let cli_options_path = self.devenv_dotfile.join("cli-options.nix");
-            if cli_options_path.exists() {
-                fs::remove_file(&cli_options_path)
-                    .await
-                    .expect("Failed to remove cli-options.nix");
+                self.secretspec_resolved
+                    .set(resolved)
+                    .map_err(|_| miette!("Secretspec resolved already set"))?;
             }
         }
 
         // Create flake.devenv.nix
-        //
-        // `devenv_root` is an absolute string path to the root of the project directory.
-        // `devenv_dotfile` is an absolute string path to the devenv dotfile directory.
-        // `devenv_dotfile_path` is a relative Nix path to the dotfile directory.
-        //  This is used to load in additional files from the dotfile directory.
-        // `devenv_tmpdir` is an absolute string path to the temporary directory for this shell.
-        // `devenv_runtime` is an absolute string path to the runtime directory for this shell.
-        // `devenv_istesting` is a boolean indicating if the shell is being assembled for testing.
-        // `container_name` indicates the name of the container being built, copied, or run, if any.
-        let active_profiles = if self.global_options.profile.is_empty() {
-            "[ ]".to_string()
-        } else {
-            format!(
-                "[ {} ]",
-                self.global_options
-                    .profile
-                    .iter()
-                    .map(|p| format!("\"{p}\""))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            )
-        };
 
         // Get current hostname and username using system APIs
         let hostname = hostname::get()
             .ok()
-            .and_then(|h| h.to_str().map(|s| s.to_string()))
-            .unwrap_or_else(|| "unknown".to_string());
+            .map(|h| h.to_string_lossy().into_owned());
 
-        let username = whoami::username();
+        let username = whoami::fallible::username().ok();
+
+        // TODO: remove in the next release
+        let dotfile_relative_path = PathBuf::from(format!(
+            "./{}",
+            self.devenv_dotfile
+                .file_name()
+                // This should never fail
+                .expect("Failed to extract the directory name from devenv_dotfile")
+                .to_string_lossy()
+        ));
 
         // Get git repository root from config (already detected during config load)
-        let git_root = config
-            .git_root
-            .as_ref()
-            .map(|path| format!("\"{}\"", path.display()))
-            .unwrap_or_else(|| "null".to_string());
+        let git_root = config.git_root.clone();
 
-        let vars = indoc::formatdoc!(
-            "version = \"{version}\";
-            system = \"{system}\";
-            devenv_root = \"{devenv_root}\";
-            devenv_dotfile = \"{devenv_dotfile}\";
-            devenv_dotfile_path = ./{devenv_dotfile_name};
-            devenv_tmpdir = \"{devenv_tmpdir}\";
-            devenv_runtime = \"{devenv_runtime}\";
-            devenv_istesting = {devenv_istesting};
-            devenv_direnvrc_latest_version = {direnv_version};
-            container_name = {container_name};
-            active_profiles = {active_profiles};
-            hostname = \"{hostname}\";
-            username = \"{username}\";
-            git_root = {git_root};
-            ",
-            version = crate_version!(),
-            system = self.global_options.system,
-            devenv_root = self.devenv_root.display(),
-            devenv_dotfile = self.devenv_dotfile.display(),
-            devenv_dotfile_name = self
-                .devenv_dotfile
-                .file_name()
-                .and_then(OsStr::to_str)
-                .unwrap(),
-            container_name = self
-                .container_name
-                .as_deref()
-                .map(|s| format!("\"{s}\""))
-                .unwrap_or_else(|| "null".to_string()),
-            devenv_tmpdir = self.devenv_tmp,
-            devenv_runtime = self.devenv_runtime.display(),
-            devenv_istesting = is_testing,
-            direnv_version = DIRENVRC_VERSION.to_string(),
-            active_profiles = active_profiles,
-            hostname = hostname,
-            username = username,
-            git_root = git_root
-        );
-        let flake = FLAKE_TMPL.replace("__DEVENV_VARS__", &vars);
-        let flake_path = self.devenv_root.join(DEVENV_FLAKE);
-        util::write_file_with_lock(&flake_path, &flake)?;
+        // Convert secretspec::Resolved to SecretspecData if available
+        let secretspec_data: Option<SecretspecData> =
+            self.secretspec_resolved
+                .get()
+                .map(|resolved| SecretspecData {
+                    profile: resolved.profile.clone(),
+                    provider: resolved.provider.clone(),
+                    secrets: resolved.secrets.clone(),
+                });
+
+        // Determine active profiles: CLI overrides YAML
+        // If CLI profiles are specified, use those. Otherwise, use YAML profile if set.
+        let active_profiles = if !self.global_options.profile.is_empty() {
+            self.global_options.profile.clone()
+        } else if let Some(yaml_profile) = &config.profile {
+            vec![yaml_profile.clone()]
+        } else {
+            Vec::new()
+        };
+
+        // Create the Nix arguments struct
+        let project_input_ref = format!("path:{}", self.devenv_root.display());
+        let args = NixArgs {
+            version: crate_version!(),
+            system: &self.global_options.system,
+            devenv_root: &self.devenv_root,
+            project_input_ref: &project_input_ref,
+            devenv_dotfile: &self.devenv_dotfile,
+            devenv_dotfile_path: &dotfile_relative_path,
+            devenv_tmpdir: &self.devenv_tmp,
+            devenv_runtime: &self.devenv_runtime,
+            devenv_istesting: is_testing,
+            devenv_direnvrc_latest_version: *DIRENVRC_VERSION,
+            container_name: self.container_name.as_deref(),
+            active_profiles: &active_profiles,
+            hostname: hostname.as_deref(),
+            username: username.as_deref(),
+            git_root: git_root.as_deref(),
+            secretspec: secretspec_data.as_ref(),
+        };
+
+        // Initialise the backend (generates flake and other backend-specific files)
+        self.nix.assemble(&args).await?;
 
         self.assembled.store(true, Ordering::Release);
         Ok(())
@@ -1552,6 +1506,55 @@ impl Devenv {
         let gc_root = self.devenv_dot_gc.join("shell");
         let span = tracing::debug_span!("evaluating_dev_env");
         let env = self.nix.dev_env(json, &gc_root).instrument(span).await?;
+
+        // Save timestamped GC root symlink for history tracking and GC protection
+        // This is backend-independent: all backends create a gc_root symlink,
+        // and we want to track the history of shell environments.
+        if let Ok(resolved_gc_root) = fs::canonicalize(&gc_root).await {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let now = SystemTime::now();
+            let duration = now
+                .duration_since(UNIX_EPOCH)
+                .expect("System time before UNIX epoch");
+            let secs = duration.as_secs();
+            let nanos = duration.subsec_nanos();
+            let timestamp = format!("{secs}.{nanos}");
+            let target = format!("{timestamp}-shell");
+
+            let home_gc_target = self.devenv_home_gc.join(&target);
+
+            // Create timestamped symlink (devenv's GC protection layer)
+            if let Err(e) = async {
+                if home_gc_target.exists() {
+                    fs::remove_file(&home_gc_target)
+                        .await
+                        .map_err(|e| miette::miette!("Failed to remove existing symlink: {}", e))?;
+                }
+                tokio::task::spawn_blocking({
+                    let resolved = resolved_gc_root.clone();
+                    let target_path = home_gc_target.clone();
+                    move || std::os::unix::fs::symlink(&resolved, &target_path)
+                })
+                .await
+                .map_err(|e| miette::miette!("Failed to spawn symlink task: {}", e))?
+                .map_err(|e| miette::miette!("Failed to create symlink: {}", e))?;
+                Ok::<_, miette::Report>(())
+            }
+            .await
+            {
+                warn!(
+                    "Failed to create timestamped GC root symlink: {}. \
+                     This may affect GC protection but won't prevent the shell from working.",
+                    e
+                );
+            }
+        } else {
+            warn!(
+                "Failed to resolve the GC root path to the Nix store: {}. \
+                 Try running devenv again with --refresh-eval-cache.",
+                gc_root.display()
+            );
+        }
 
         use devenv_eval_cache::command::{FileInputDesc, Input};
         util::write_file_with_lock(
@@ -1690,22 +1693,6 @@ fn cleanup_symlinks(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
 }
 
 fn print_tasks_tree(tasks: &Vec<tasks::TaskConfig>) {
-    // Group tasks by their prefix (namespace)
-    let mut namespaces: BTreeMap<String, Vec<&tasks::TaskConfig>> = BTreeMap::new();
-    let mut standalone_tasks: Vec<&tasks::TaskConfig> = Vec::new();
-
-    for task in tasks {
-        if let Some(colon_pos) = task.name.find(':') {
-            let namespace = &task.name[..colon_pos];
-            namespaces
-                .entry(namespace.to_string())
-                .or_default()
-                .push(task);
-        } else {
-            standalone_tasks.push(task);
-        }
-    }
-
     // Build dependency information
     let mut task_deps: HashMap<String, Vec<String>> = HashMap::new();
     let mut task_dependents: HashMap<String, Vec<String>> = HashMap::new();
@@ -1739,153 +1726,35 @@ fn print_tasks_tree(tasks: &Vec<tasks::TaskConfig>) {
 
     let mut visited = HashSet::new();
 
-    // Print namespaced tasks grouped by namespace
-    for (namespace, tasks_in_ns) in namespaces.iter() {
-        println!("{namespace}:");
-
-        // Find roots within this namespace
-        let mut ns_roots: Vec<&str> = Vec::new();
-        for task in tasks_in_ns {
-            let deps = task_deps.get(&task.name).unwrap();
-            if deps.is_empty()
-                || !deps
-                    .iter()
-                    .any(|d| task_names.contains(d) && d.starts_with(&format!("{namespace}:")))
-            {
-                ns_roots.push(&task.name);
-            }
-        }
-
-        // If no roots found, use all tasks in namespace
-        if ns_roots.is_empty() {
-            ns_roots = tasks_in_ns.iter().map(|t| t.name.as_str()).collect();
-        }
-
-        ns_roots.sort();
-
-        let sub_prefix = "  ";
-        for (i, root) in ns_roots.iter().enumerate() {
-            if !visited.contains(*root) {
-                let is_last = i == ns_roots.len() - 1;
-                print_task_tree_with_namespace(
-                    root,
-                    &task_dependents,
-                    &task_configs,
-                    &mut visited,
-                    sub_prefix,
-                    is_last,
-                    namespace,
-                );
-            }
+    // Find root tasks (those with no dependencies)
+    let mut roots: Vec<&str> = Vec::new();
+    for task in tasks {
+        let deps = task_deps.get(&task.name).unwrap();
+        if deps.is_empty() || !deps.iter().any(|d| task_names.contains(d)) {
+            roots.push(&task.name);
         }
     }
 
-    // Print standalone tasks (without namespace)
-    if !standalone_tasks.is_empty() {
-        if !namespaces.is_empty() {
-            println!("(standalone)");
-        }
-
-        // Find roots among standalone tasks
-        let mut standalone_roots: Vec<&str> = Vec::new();
-        for task in &standalone_tasks {
-            let deps = task_deps.get(&task.name).unwrap();
-            if deps.is_empty()
-                || !deps
-                    .iter()
-                    .any(|d| task_names.contains(d) && !d.contains(':'))
-            {
-                standalone_roots.push(&task.name);
-            }
-        }
-
-        if standalone_roots.is_empty() {
-            standalone_roots = standalone_tasks.iter().map(|t| t.name.as_str()).collect();
-        }
-
-        standalone_roots.sort();
-
-        let sub_prefix = if namespaces.is_empty() { "" } else { "  " };
-        for (i, root) in standalone_roots.iter().enumerate() {
-            if !visited.contains(*root) {
-                let is_last = i == standalone_roots.len() - 1;
-                print_task_tree(
-                    root,
-                    &task_dependents,
-                    &task_configs,
-                    &mut visited,
-                    sub_prefix,
-                    is_last,
-                );
-            }
-        }
-    }
-}
-
-fn print_task_tree_with_namespace(
-    task_name: &str,
-    task_dependents: &HashMap<String, Vec<String>>,
-    task_configs: &HashMap<String, &tasks::TaskConfig>,
-    visited: &mut HashSet<String>,
-    prefix: &str,
-    is_last: bool,
-    namespace: &str,
-) {
-    if visited.contains(task_name) {
-        return;
-    }
-    visited.insert(task_name.to_string());
-
-    // Print the current task with tree formatting, stripping the namespace prefix
-    let connector = if is_last { "└── " } else { "├── " };
-    let display_name = task_name
-        .strip_prefix(&format!("{namespace}:"))
-        .unwrap_or(task_name);
-    print!("{prefix}{connector}{display_name}");
-
-    // Add additional info if available
-    if let Some(task) = task_configs.get(task_name) {
-        let mut extra_info = Vec::new();
-
-        if task.status.is_some() {
-            extra_info.push("has status check".to_string());
-        }
-
-        if !task.exec_if_modified.is_empty() {
-            let files = task.exec_if_modified.join(", ");
-            extra_info.push(format!("watches: {files}"));
-        }
-
-        if !extra_info.is_empty() {
-            print!(" ({})", extra_info.join(", "));
-        }
+    // If no roots found, use all tasks
+    if roots.is_empty() {
+        roots = tasks.iter().map(|t| t.name.as_str()).collect();
     }
 
-    println!();
+    roots.sort();
 
-    // Get children (tasks that depend on this task) within the same namespace
-    let children = task_dependents.get(task_name).cloned().unwrap_or_default();
-    let mut children: Vec<_> = children
-        .into_iter()
-        .filter(|t| task_configs.contains_key(t) && t.starts_with(&format!("{namespace}:")))
-        .collect();
-    children.sort();
-
-    // Determine the new prefix for children
-    let new_prefix = format!("{}{}", prefix, if is_last { "    " } else { "│   " });
-
-    // Print children
-    for (i, child) in children.iter().enumerate() {
-        let is_last_child = i == children.len() - 1;
-        print_task_tree_with_namespace(
-            child,
-            task_dependents,
-            task_configs,
-            visited,
-            &new_prefix,
-            is_last_child,
-            namespace,
-        );
+    // Print all tasks as top-level with their full names
+    for (i, root) in roots.iter().enumerate() {
+        if !visited.contains(*root) {
+            let is_last = i == roots.len() - 1;
+            print_task_tree(
+                root,
+                &task_dependents,
+                &task_configs,
+                &mut visited,
+                "",
+                is_last,
+            );
+        }
     }
 }
 
@@ -1948,5 +1817,158 @@ fn print_task_tree(
             &new_prefix,
             is_last_child,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_print_tasks_tree_flat_hierarchy_sorted() {
+        use tasks::TaskConfig;
+
+        // Create test tasks with 2 levels of hierarchy
+        let test_tasks = vec![
+            // Root tasks (no dependencies)
+            TaskConfig {
+                name: "devenv:typecheck".to_string(),
+                r#type: Default::default(),
+                after: vec![],
+                before: vec![],
+                command: Some("echo typecheck".to_string()),
+                status: None,
+                exec_if_modified: vec![],
+                inputs: None,
+                cwd: None,
+                show_output: false,
+            },
+            TaskConfig {
+                name: "devenv:lint".to_string(),
+                r#type: Default::default(),
+                after: vec![],
+                before: vec![],
+                command: Some("echo lint".to_string()),
+                status: None,
+                exec_if_modified: vec![],
+                inputs: None,
+                cwd: None,
+                show_output: false,
+            },
+            // Level 2 tasks (depend on Level 1)
+            TaskConfig {
+                name: "devenv:test".to_string(),
+                r#type: Default::default(),
+                after: vec!["devenv:lint".to_string(), "devenv:typecheck".to_string()],
+                before: vec![],
+                command: Some("echo test".to_string()),
+                status: None,
+                exec_if_modified: vec![],
+                inputs: None,
+                cwd: None,
+                show_output: false,
+            },
+            // Different namespace
+            TaskConfig {
+                name: "myapp:setup".to_string(),
+                r#type: Default::default(),
+                after: vec![],
+                before: vec![],
+                command: Some("echo setup".to_string()),
+                status: None,
+                exec_if_modified: vec![],
+                inputs: None,
+                cwd: None,
+                show_output: false,
+            },
+            TaskConfig {
+                name: "myapp:build".to_string(),
+                r#type: Default::default(),
+                after: vec!["myapp:setup".to_string()],
+                before: vec![],
+                command: Some("echo build".to_string()),
+                status: None,
+                exec_if_modified: vec![],
+                inputs: None,
+                cwd: None,
+                show_output: false,
+            },
+            // Level 3 (deeply nested)
+            TaskConfig {
+                name: "myapp:package".to_string(),
+                r#type: Default::default(),
+                after: vec!["myapp:build".to_string()],
+                before: vec![],
+                command: Some("echo package".to_string()),
+                status: None,
+                exec_if_modified: vec![],
+                inputs: None,
+                cwd: None,
+                show_output: false,
+            },
+            // Standalone task
+            TaskConfig {
+                name: "cleanup".to_string(),
+                r#type: Default::default(),
+                after: vec![],
+                before: vec![],
+                command: Some("echo cleanup".to_string()),
+                status: None,
+                exec_if_modified: vec![],
+                inputs: None,
+                cwd: None,
+                show_output: false,
+            },
+        ];
+
+        // Build the same structures that print_tasks_tree builds
+        let mut task_deps: HashMap<String, Vec<String>> = HashMap::new();
+        let task_names: HashSet<String> = test_tasks.iter().map(|t| t.name.clone()).collect();
+
+        for task in &test_tasks {
+            task_deps.insert(task.name.clone(), task.after.clone());
+        }
+
+        // Find root tasks (those with no dependencies)
+        let mut roots: Vec<&str> = Vec::new();
+        for task in &test_tasks {
+            let deps = task_deps.get(&task.name).unwrap();
+            if deps.is_empty() || !deps.iter().any(|d| task_names.contains(d)) {
+                roots.push(&task.name);
+            }
+        }
+
+        roots.sort();
+
+        // Verify roots are sorted
+        assert_eq!(
+            roots,
+            vec!["cleanup", "devenv:lint", "devenv:typecheck", "myapp:setup"]
+        );
+
+        // Verify we have roots from different namespaces at the same level
+        assert!(roots.iter().any(|t| t.starts_with("devenv:")));
+        assert!(roots.iter().any(|t| t.starts_with("myapp:")));
+        assert!(roots.iter().any(|t| !t.contains(":")));
+
+        // Verify no namespace headers would be printed
+        // (the old code would print "devenv:", "myapp:", and "(standalone)" headers)
+        // The new code just prints all roots flat with full names
+        assert!(roots.iter().all(|t| {
+            // All roots should be top-level names, not namespace headers
+            !t.is_empty()
+        }));
+
+        // Verify dependencies are tracked correctly for tree structure
+        let child_deps = vec![
+            ("devenv:test", vec!["devenv:lint", "devenv:typecheck"]),
+            ("myapp:build", vec!["myapp:setup"]),
+            ("myapp:package", vec!["myapp:build"]),
+        ];
+
+        for (task_name, expected_deps) in child_deps {
+            let task = test_tasks.iter().find(|t| t.name == task_name).unwrap();
+            assert_eq!(task.after, expected_deps);
+        }
     }
 }

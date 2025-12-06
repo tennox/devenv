@@ -47,12 +47,11 @@
   };
 
   outputs =
-    {
-      self,
-      nixpkgs,
-      git-hooks,
-      nix,
-      ...
+    { self
+    , nixpkgs
+    , git-hooks
+    , nix
+    , ...
     }@inputs:
     let
       systems = [
@@ -85,7 +84,6 @@
           devenv-image = import ./containers/devenv/image.nix {
             inherit pkgs;
             inherit (self.packages.${system}) devenv;
-            nixInput = inputs.nix;
           };
         }
       );
@@ -106,8 +104,8 @@
             '';
           };
 
-          simple = {
-            path = ./templates/simple;
+          flake = {
+            path = ./templates/flake;
             description = "A direnv supported Nix flake with devenv integration.";
             welcomeText = ''
               # `.devenv` should be added to `.gitignore`
@@ -116,9 +114,7 @@
               ```
             '';
           };
-        in
-        {
-          inherit simple flake-parts;
+
           terraform = {
             path = ./templates/terraform;
             description = "A Terraform Nix flake with devenv integration.";
@@ -129,7 +125,11 @@
               ```
             '';
           };
-          default = simple;
+        in
+        {
+          inherit flake flake-parts terraform;
+          simple = flake; # Backwards compatibility
+          default = self.templates.flake;
         };
 
       flakeModule = self.flakeModules.default; # Backwards compatibility
@@ -150,43 +150,44 @@
       };
 
       lib = {
-        mkConfig =
-          args@{
-            pkgs,
-            inputs,
-            modules,
-          }:
-          (self.lib.mkEval args).config;
+        mkConfig = args: (self.lib.mkEval args).config;
+
         mkEval =
-          {
-            pkgs,
-            inputs,
-            modules,
+          args@{ pkgs
+          , inputs
+          , modules
+          , lib ? pkgs.lib
+          ,
           }:
           let
-            moduleInputs = {
-              inherit git-hooks;
-            }
-            // inputs;
-            project = inputs.nixpkgs.lib.evalModules {
-              specialArgs = moduleInputs // {
-                inputs = moduleInputs;
-              };
-              modules = [
-                { config._module.args.pkgs = inputs.nixpkgs.lib.mkDefault pkgs; }
-                (self.modules + /top-level.nix)
-                (
-                  { config, ... }:
-                  {
-                    devenv.warnOnNewVersion = false;
-                    devenv.flakesIntegration = true;
-                  }
-                )
-              ]
-              ++ modules;
+            # TODO: deprecate default git-hooks input
+            defaultInputs = { inherit git-hooks; };
+            finalInputs = defaultInputs // inputs;
+
+            specialArgs = finalInputs // {
+              inputs = finalInputs;
             };
+
+            modules = [
+              (self.modules + /top-level.nix)
+              (
+                { config, ... }:
+                {
+                  # Configure overlays
+                  _module.args.pkgs = pkgs.appendOverlays config.overlays;
+                  # Enable the flakes integration
+                  devenv.flakesIntegration = true;
+                  # Disable CLI version checks
+                  devenv.warnOnNewVersion = false;
+                }
+              )
+            ]
+            ++ args.modules;
+
+            project = lib.evalModules { inherit modules specialArgs; };
           in
           project;
+
         mkShell =
           args:
           let
@@ -194,8 +195,8 @@
           in
           config.shell
           // {
-            ci = config.ciDerivation;
             inherit config;
+            ci = config.ciDerivation;
           };
       };
 

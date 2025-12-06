@@ -10,9 +10,11 @@ default-run = "devenv"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+devenv-core.workspace = true
 devenv-eval-cache.workspace = true
 devenv-tasks.workspace = true
 devenv-cache-core.workspace = true
+devenv-snix-backend = { workspace = true, optional = true }
 http-client-tls.workspace = true
 nix-conf-parser.workspace = true
 
@@ -36,9 +38,11 @@ schematic.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
+ser_nix.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 tempfile.workspace = true
+termimad.workspace = true
 tokio.workspace = true
 tokio-shutdown.workspace = true
 tracing.workspace = true
@@ -55,6 +59,8 @@ shell-escape.workspace = true
 rmcp.workspace = true
 rmcp-macros.workspace = true
 async-trait.workspace = true
+blake3.workspace = true
+chrono.workspace = true
 secretspec.workspace = true
 secrecy.workspace = true
 
@@ -71,6 +77,7 @@ nix-compat-derive = { workspace = true, optional = true }
 default = []
 integration-tests = []
 snix = [
+  "dep:devenv-snix-backend",
   "dep:nix-compat",
   "dep:nix-compat-derive",
   "dep:snix-build",

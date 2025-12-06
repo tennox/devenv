@@ -8,6 +8,8 @@ use devenv_eval_cache::Output;
 use miette::Result;
 use std::path::{Path, PathBuf};
 
+use crate::nix_args::NixArgs;
+
 /// Common paths used by devenv backends
 #[derive(Debug, Clone)]
 pub struct DevenvPaths {
@@ -15,7 +17,6 @@ pub struct DevenvPaths {
     pub dotfile: PathBuf,
     pub dot_gc: PathBuf,
     pub home_gc: PathBuf,
-    pub cachix_trusted_keys: PathBuf,
 }
 
 /// Options for Nix operations
@@ -67,8 +68,10 @@ impl Default for Options {
 /// Trait defining the interface for Nix evaluation backends
 #[async_trait(?Send)]
 pub trait NixBackend: Send + Sync {
-    /// Initialize and assemble the backend (e.g., set up database connections)
-    async fn assemble(&self) -> Result<()>;
+    /// Initialize and assemble the backend
+    ///
+    /// The args parameter contains all context needed for backend-specific file generation
+    async fn assemble(&self, args: &NixArgs<'_>) -> Result<()>;
 
     /// Get the development environment
     async fn dev_env(&self, json: bool, gc_root: &Path) -> Result<Output>;
@@ -104,4 +107,7 @@ pub trait NixBackend: Send + Sync {
 
     /// Get the bash shell executable path
     async fn get_bash(&self, refresh_cached_output: bool) -> Result<String>;
+
+    /// Check if the current user is a trusted user of the Nix store
+    async fn is_trusted_user(&self) -> Result<bool>;
 }

@@ -1,13 +1,14 @@
-{
-  config,
-  lib,
-  pkgs,
-  ...
+{ config
+, lib
+, pkgs
+, ...
 }:
 
 {
   # Disable browserlist warnings that break git hooks
   env.BROWSERSLIST_IGNORE_OLD_DATA = "1";
+
+  packages = [ pkgs.cairo ];
 
   git-hooks.hooks = {
     generate-doc-css = {

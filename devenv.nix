@@ -1,10 +1,9 @@
-{
-  inputs,
-  pkgs,
-  lib,
-  config,
-  options,
-  ...
+{ inputs
+, pkgs
+, lib
+, config
+, options
+, ...
 }:
 {
   env = {
@@ -21,6 +20,25 @@
   # Configure Claude Code
   claude.code = {
     enable = true;
+    commands = {
+      release = ''
+        Release devenv version $ARGUMENTS
+
+        1. Update version in Cargo.toml to $ARGUMENTS using `cargo set-version`
+        2. Run `cargo check` to update Cargo.lock
+        3. Generate release notes:
+           - Find the latest git tag
+           - Get the diff between that tag and HEAD
+           - Summarize changes into release notes format
+        4. Ask user for access to nixpkgs repository to bump devenv there
+           - The package is at pkgs/by-name/de/devenv/package.nix
+           - Sync with ./package.nix from this repo and bump version
+        5. If this is a major version bump (X.Y.0, not X.Y.Z patch):
+           - Generate a blog post in docs/src/blog/posts/
+           - Follow the naming convention: devenv-vX.Y-short-description.md
+           - Use existing blog posts as reference for format and style
+      '';
+    };
     permissions = {
       WebFetch = {
         allow = [
@@ -43,7 +61,6 @@
 
   # Project dependencies
   packages = [
-    pkgs.cairo
     pkgs.git
     pkgs.xorg.libxcb
     pkgs.yaml2json
@@ -93,70 +110,7 @@
     '';
   };
 
-  scripts.devenv-test-cli = {
-    description = "Test devenv CLI.";
-    exec = ''
-      set -xe
-      set -o pipefail
-
-      tmp="$(mktemp -d)"
-      devenv init "$tmp"
-      pushd "$tmp"
-        devenv version
-        devenv --override-input devenv path:${config.devenv.root}?dir=src/modules test
-      popd
-      rm -rf "$tmp"
-
-      # Test devenv init with target path
-      tmp="$(mktemp -d)"
-      pushd "$tmp"
-        devenv init target
-        test -z "$(ls -A1 | grep -v target)"
-        pushd target
-          devenv --override-input devenv path:${config.devenv.root}?dir=src/modules test
-        popd
-      popd
-      rm -rf "$tmp"
-
-      # Test devenv integrated into bare Nix flake
-      tmp="$(mktemp -d)"
-      pushd "$tmp"
-        nix flake init --template ''${DEVENV_ROOT}#simple
-        nix flake update \
-          --override-input devenv ''${DEVENV_ROOT}
-        nix develop --accept-flake-config --no-pure-eval --command echo nix-develop started succesfully |& tee ./console
-        grep -F 'nix-develop started succesfully' <./console
-        grep -F "$(${lib.getExe pkgs.hello})" <./console
-
-        # Assert that nix-develop fails in pure mode.
-        if nix develop --command echo nix-develop started in pure mode |& tee ./console
-        then
-          echo "nix-develop was able to start in pure mode. This is explicitly not supported at the moment."
-          exit 1
-        fi
-        grep -F 'devenv was not able to determine the current directory.' <./console
-      popd
-      rm -rf "$tmp"
-
-      # Test devenv integrated into flake-parts Nix flake
-      tmp="$(mktemp -d)"
-      pushd "$tmp"
-        nix flake init --template ''${DEVENV_ROOT}#flake-parts
-        nix flake update \
-          --override-input devenv ''${DEVENV_ROOT}
-        nix develop --accept-flake-config --override-input devenv-root "file+file://"<(printf %s "$PWD") --command echo nix-develop started succesfully |& tee ./console
-        grep -F 'nix-develop started succesfully' <./console
-        grep -F "$(${lib.getExe pkgs.hello})" <./console
-        # Test that a container can be built
-        if [ "$(uname)" = "Linux" ]
-        then
-          nix build --override-input devenv-root "file+file://"<(printf %s "$PWD") --accept-flake-config --show-trace .#container-processes
-        fi
-      popd
-      rm -rf "$tmp"
-    '';
-  };
-
+  git-hooks.package = pkgs.prek;
   git-hooks.hooks = {
     nixpkgs-fmt.enable = true;
     rustfmt.enable = true;

@@ -1,8 +1,7 @@
-{
-  pkgs,
-  lib,
-  config,
-  ...
+{ pkgs
+, lib
+, config
+, ...
 }:
 let
   cfg = config.treefmt;
@@ -21,9 +20,10 @@ let
 
   treefmtSubmodule =
     if treefmt-nix != null then
-      treefmt-nix.lib.submoduleWith lib {
-        specialArgs = { inherit pkgs; };
-      }
+      treefmt-nix.lib.submoduleWith lib
+        {
+          specialArgs = { inherit pkgs; };
+        }
     else
       lib.types.attrs;
 
@@ -70,5 +70,7 @@ in
     # We automatically configure treefmt with the correct tree root for the project.
     # Set an empty default to detect when the user wants to use a custom root file.
     treefmt.config.projectRootFile = lib.mkDefault "";
+
+    tasks."devenv:treefmt:run".exec = "${treefmtWrapper}/bin/treefmt";
   };
 }

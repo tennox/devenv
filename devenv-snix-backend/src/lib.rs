@@ -3,9 +3,10 @@
 //! This module provides a Rust-native Nix evaluator backend using Snix
 //! as an alternative to the traditional C++ Nix binary.
 
-use crate::nix_backend::{DevenvPaths, NixBackend, Options};
-use crate::{cli, config};
 use async_trait::async_trait;
+use devenv_core::{
+    CachixManager, Config, DevenvPaths, GlobalOptions, NixArgs, NixBackend, Options,
+};
 use devenv_eval_cache::Output;
 use miette::{Result, bail};
 use snix_build::buildservice::{BuildService, DummyBuildService};
@@ -28,25 +29,31 @@ use tracing::{debug, info, warn};
 /// rather than storing them in shared state.
 pub struct SnixBackend {
     #[allow(dead_code)] // Will be used when more functionality is implemented
-    config: config::Config,
+    config: Config,
     #[allow(dead_code)] // Will be used when more functionality is implemented
-    global_options: cli::GlobalOptions,
+    global_options: GlobalOptions,
     #[allow(dead_code)] // Will be used when more functionality is implemented
     paths: DevenvPaths,
+    #[allow(dead_code)] // Will be used when cachix integration is implemented
+    cachix_manager: Arc<CachixManager>,
 }
 
 impl SnixBackend {
     pub async fn new(
-        config: config::Config,
-        global_options: cli::GlobalOptions,
+        config: Config,
+        global_options: GlobalOptions,
         paths: DevenvPaths,
+        cachix_manager: Arc<CachixManager>,
+        _pool: Option<Arc<tokio::sync::OnceCell<sqlx::SqlitePool>>>,
     ) -> Result<Self> {
         info!("Initializing Snix backend");
+        // Note: Snix backend doesn't use eval cache at the moment
 
         Ok(Self {
             config,
             global_options,
             paths,
+            cachix_manager,
         })
     }
 
@@ -115,8 +122,7 @@ impl SnixBackend {
 
 #[async_trait(?Send)]
 impl NixBackend for SnixBackend {
-    async fn assemble(&self) -> Result<()> {
-        // No shared state to initialize - evaluators are created per operation
+    async fn assemble(&self, _args: &NixArgs<'_>) -> Result<()> {
         Ok(())
     }
 
@@ -186,5 +192,10 @@ impl NixBackend for SnixBackend {
     async fn get_bash(&self, _refresh_cached_output: bool) -> Result<String> {
         // TODO: Implement bash shell acquisition for Snix backend
         bail!("get_bash is not yet implemented for Snix backend")
+    }
+
+    async fn is_trusted_user(&self) -> Result<bool> {
+        // TODO: Implement trusted user check for Snix backend
+        bail!("is_trusted_user is not yet implemented for Snix backend")
     }
 }

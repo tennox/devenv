@@ -3,9 +3,11 @@ resolver = "2"
 members = [
   "devenv",
   "devenv-cache-core",
+  "devenv-core",
   "devenv-eval-cache",
   "devenv-generate",
   "devenv-run-tests",
+  "devenv-snix-backend",
   "devenv-tasks",
   "http-client-tls",
   "nix-conf-parser",
@@ -14,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.10.1"
+version = "1.11.3"
 edition = "2024"
 license = "APACHE-2.0"
 homepage = "https://devenv.sh/"
@@ -22,8 +24,10 @@ repository = "https://github.com/cachix/devenv/"
 
 [workspace.dependencies]
 devenv = { path = "devenv" }
+devenv-core = { path = "devenv-core" }
 devenv-eval-cache = { path = "devenv-eval-cache" }
 devenv-run-tests = { path = "devenv-run-tests" }
+devenv-snix-backend = { path = "devenv-snix-backend" }
 devenv-tasks = { path = "devenv-tasks" }
 devenv-cache-core = { path = "devenv-cache-core" }
 http-client-tls = { path = "http-client-tls" }
@@ -36,6 +40,7 @@ astral-tokio-tar = "0.5.6"
 async-trait = "0.1"
 binaryornot = "1.0.0"
 blake3 = "1.8.2"
+chrono = "0.4"
 clap = { version = "4.5.48", features = ["derive", "cargo", "env"] }
 cli-table = "0.5.0"
 console = "0.16.1"
@@ -64,15 +69,17 @@ schematic = { version = "0.18.12", features = [
   "renderer_json_schema",
 ] }
 secrecy = "0.10"
-secretspec = "0.3.3"
+secretspec = "0.4.1"
 serde = { version = "1.0.226", features = ["derive"] }
 serde_json = "1.0.145"
 serde_repr = "0.1.20"
 serde_yaml = "0.9.34"
+ser_nix = { git = "https://github.com/cachix/ser_nix", branch = "support-paths" }
 similar = "2.7.0"
 sha2 = "0.10.9"
 sqlx = { version = "0.8.6", features = ["time", "sqlite", "runtime-tokio"] }
 tempfile = "3.23.0"
+termimad = "0.30.0"
 thiserror = "2.0.16"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
