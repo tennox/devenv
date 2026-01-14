@@ -29,17 +29,36 @@ in
       '';
       example = "1.5.0 or 1.6.2";
     };
+
+    lsp = {
+      enable = lib.mkEnableOption "Terraform Language Server" // { default = true; };
+
+      package = lib.mkOption {
+        type = lib.types.package;
+        default = pkgs.terraform-ls;
+        defaultText = lib.literalExpression "pkgs.terraform-ls";
+        description = "The Terraform language server package to use.";
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable {
-    languages.terraform.package = lib.mkMerge [
-      (lib.mkIf (cfg.version != null) (nixpkgs-terraform.packages.${pkgs.stdenv.system}.${cfg.version} or (throw "Unsupported Terraform version, update the nixpkgs-terraform input or go to https://github.com/stackbuilders/nixpkgs-terraform/blob/main/versions.json for the full list of supported versions.")))
-    ];
+    git-hooks.hooks = {
+      terraform-format.package = config.lib.mkOverrideDefault cfg.package;
+      terraform-validate.package = config.lib.mkOverrideDefault cfg.package;
+    };
 
-    packages = with pkgs; [
+    languages.terraform.package = lib.mkIf (cfg.version != null) (
+      let
+        terraform-pkgs = nixpkgs-terraform.packages.${pkgs.stdenv.system};
+      in
+        terraform-pkgs."terraform-${cfg.version}" or terraform-pkgs.${cfg.version}
+          or (throw "Unsupported Terraform version, update the nixpkgs-terraform input or go to https://github.com/stackbuilders/nixpkgs-terraform/blob/main/versions.json for the full list of supported versions.")
+    );
+
+    packages = [
       cfg.package
-      terraform-ls
-      tfsec
-    ];
+      pkgs.tfsec
+    ] ++ lib.optional cfg.lsp.enable cfg.lsp.package;
   };
 }

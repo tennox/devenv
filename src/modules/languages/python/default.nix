@@ -31,6 +31,27 @@ let
     follows = [ "nixpkgs" ];
   };
 
+  uv2nix = config.lib.getInput {
+    name = "uv2nix";
+    url = "github:pyproject-nix/uv2nix";
+    attribute = "languages.python.import";
+    follows = [ "nixpkgs" ];
+  };
+
+  pyproject-nix = config.lib.getInput {
+    name = "pyproject-nix";
+    url = "github:pyproject-nix/pyproject.nix";
+    attribute = "languages.python.import";
+    follows = [ "nixpkgs" ];
+  };
+
+  pyproject-build-systems = config.lib.getInput {
+    name = "pyproject-build-systems";
+    url = "github:pyproject-nix/build-system-pkgs";
+    attribute = "languages.python.import";
+    follows = [ "nixpkgs" ];
+  };
+
   initVenvScript = ''
     pushd "${cfg.directory}"
 
@@ -467,6 +488,16 @@ in
       };
     };
 
+    lsp = {
+      enable = lib.mkEnableOption "Python Language Server" // { default = true; };
+      package = lib.mkOption {
+        type = lib.types.package;
+        default = pkgs.pyright;
+        defaultText = lib.literalExpression "pkgs.pyright";
+        description = "The Python language server package to use.";
+      };
+    };
+
     poetry = {
       enable = lib.mkEnableOption "poetry";
       install = {
@@ -550,9 +581,67 @@ in
         description = "The Poetry package to use.";
       };
     };
+
+    import = lib.mkOption {
+      type = lib.types.functionTo (lib.types.functionTo lib.types.package);
+      description = ''
+        Import a Python project using uv2nix.
+
+        This function takes a path to a directory containing a pyproject.toml file
+        and returns a derivation that builds the Python project using uv2nix.
+
+        Example usage:
+        ```nix
+        let
+          mypackage = config.languages.python.import ./path/to/python/project {};
+        in {
+          languages.python.enable = true;
+          packages = [ mypackage ];
+        }
+        ```
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
+    languages.python.import = path: args:
+      let
+        # Load workspace using uv2nix
+        workspace = uv2nix.lib.workspace.loadWorkspace { workspaceRoot = path; };
+
+        # Create package overlay from workspace
+        overlay = workspace.mkPyprojectOverlay {
+          sourcePreference = "wheel";
+        };
+
+        # Try to infer package name from pyproject.toml or use directory name as fallback
+        packageName = args.packageName or (
+          let
+            pyprojectToml =
+              if builtins.pathExists (path + "/pyproject.toml")
+              then builtins.fromTOML (builtins.readFile (path + "/pyproject.toml"))
+              else { };
+          in
+            pyprojectToml.project.name or (builtins.baseNameOf (builtins.toString path))
+        );
+
+        # Use base Python package (not the wrapped buildEnv) for pyproject-nix
+        # pyproject-nix expects a Python with `version` attribute
+        basePython =
+          if cfg.version != null
+          then nixpkgs-python.packages.${pkgs.stdenv.system}.${cfg.version}
+          else pkgs.python3;
+
+        # Construct package set using pyproject-nix and apply overlays
+        pythonSet = (pkgs.callPackage pyproject-nix.build.packages {
+          python = basePython;
+        }).overrideScope (lib.composeManyExtensions [
+          pyproject-build-systems.overlays.default
+          overlay
+        ]);
+      in
+      pythonSet.mkVirtualEnv "${packageName}-env" workspace.deps.default;
+
     languages.python.poetry.install.enable = lib.mkIf cfg.poetry.enable (lib.mkDefault true);
     languages.python.poetry.install.arguments =
       lib.optional cfg.poetry.install.onlyInstallRootPackage "--only-root"
@@ -599,7 +688,8 @@ in
       cfg.package
     ]
     ++ (lib.optional cfg.poetry.enable cfg.poetry.package)
-    ++ (lib.optional cfg.uv.enable cfg.uv.package);
+    ++ (lib.optional cfg.uv.enable cfg.uv.package)
+    ++ lib.optional cfg.lsp.enable cfg.lsp.package;
 
     env =
       (lib.optionalAttrs cfg.uv.enable {

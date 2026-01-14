@@ -10,9 +10,6 @@
     # The path to the eval cache database (for migrations)
     DATABASE_URL = "sqlite:.devenv/nix-eval-cache.db";
 
-    # The Nix CLI for devenv to use when run with `cargo run`.
-    DEVENV_NIX = inputs.nix.packages.${pkgs.stdenv.system}.nix-cli;
-
     RUST_LOG = "devenv=debug";
     RUST_LOG_SPAN_EVENTS = "full";
   };
@@ -61,6 +58,7 @@
 
   # Project dependencies
   packages = [
+    inputs.nix.packages.${pkgs.stdenv.system}.nix # Required for integration tests
     pkgs.git
     pkgs.xorg.libxcb
     pkgs.yaml2json
@@ -72,8 +70,11 @@
     pkgs.cargo-outdated # Find outdated crates
     pkgs.cargo-machete # Find unused crates
     pkgs.cargo-edit # Adds the set-version command
+    pkgs.cargo-insta # Snapshot testing for Rust
+    pkgs.cargo-nextest # Test runner with process isolation
     pkgs.protobuf # snix
     pkgs.dbus # secretspec
+    pkgs.nixd # LSP for devenv lsp command
   ];
 
   languages = {

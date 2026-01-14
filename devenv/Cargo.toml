@@ -10,13 +10,17 @@ default-run = "devenv"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+devenv-activity.workspace = true
 devenv-core.workspace = true
 devenv-eval-cache.workspace = true
 devenv-tasks.workspace = true
+devenv-tui.workspace = true
 devenv-cache-core.workspace = true
 devenv-snix-backend = { workspace = true, optional = true }
-http-client-tls.workspace = true
+devenv-nix-backend.workspace = true
+rand.workspace = true
 nix-conf-parser.workspace = true
+tokio-shutdown.workspace = true
 
 clap.workspace = true
 cli-table.workspace = true
@@ -44,9 +48,10 @@ sqlx.workspace = true
 tempfile.workspace = true
 termimad.workspace = true
 tokio.workspace = true
-tokio-shutdown.workspace = true
+tokio-stream.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+json-subscriber.workspace = true
 tracing-indicatif.workspace = true
 indicatif.workspace = true
 which.workspace = true
@@ -58,11 +63,13 @@ pathdiff.workspace = true
 shell-escape.workspace = true
 rmcp.workspace = true
 rmcp-macros.workspace = true
+axum.workspace = true
 async-trait.workspace = true
 blake3.workspace = true
 chrono.workspace = true
 secretspec.workspace = true
 secrecy.workspace = true
+valuable.workspace = true
 
 # Optional snix dependencies
 snix-eval = { workspace = true, optional = true }
@@ -72,6 +79,9 @@ snix-store = { workspace = true, optional = true }
 snix-build = { workspace = true, optional = true }
 nix-compat = { workspace = true, optional = true }
 nix-compat-derive = { workspace = true, optional = true }
+
+[dev-dependencies]
+devenv-nix-backend-macros.workspace = true
 
 [features]
 default = []

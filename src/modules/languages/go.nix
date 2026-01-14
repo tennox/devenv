@@ -3,6 +3,15 @@
 let
   cfg = config.languages.go;
 
+  go-overlay = config.lib.getInput {
+    name = "go-overlay";
+    url = "github:purpleclay/go-overlay";
+    attribute = "languages.go.version";
+    follows = [ "nixpkgs" ];
+  };
+
+  go-bin = go-overlay.lib.mkGoBin pkgs;
+
   # Override the buildGoModule function to use the specified Go package.
   buildGoModule = pkgs.buildGoModule.override { go = cfg.package; };
   # A helper function to rebuild a package with the specific Go version.
@@ -35,14 +44,39 @@ in
       description = "The Go package to use.";
     };
 
+    version = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = ''
+        The Go version to use.
+        This automatically sets the `languages.go.package` using [go-overlay](https://github.com/purpleclay/go-overlay).
+      '';
+      example = "1.22.0";
+    };
+
     enableHardeningWorkaround = lib.mkOption {
       type = lib.types.bool;
       default = false;
       description = "Enable hardening workaround required for Delve debugger (https://github.com/go-delve/delve/issues/3085)";
     };
+
+    lsp = {
+      enable = lib.mkEnableOption "Go Language Server" // { default = true; };
+      package = lib.mkOption {
+        type = lib.types.package;
+        default = pkgs.gopls;
+        defaultText = lib.literalExpression "pkgs.gopls";
+        description = "The Go language server package to use.";
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable {
+    languages.go.package = lib.mkIf (cfg.version != null) (
+      go-bin.versions.${cfg.version}
+        or (throw "Unsupported Go version '${cfg.version}', see https://github.com/purpleclay/go-overlay for supported versions")
+    );
+
     packages = [
       cfg.package
 
@@ -54,12 +88,11 @@ in
       (buildWithSpecificGo pkgs.gomodifytags)
       (buildWithSpecificGo pkgs.impl)
       (buildWithSpecificGo pkgs.go-tools)
-      (buildWithSpecificGo pkgs.gopls)
       (buildWithSpecificGo pkgs.gotests)
 
       # Required by vim-go
       (buildWithSpecificGo pkgs.iferr)
-    ];
+    ] ++ lib.optional cfg.lsp.enable (buildWithSpecificGo cfg.lsp.package);
 
     hardeningDisable = lib.optional (cfg.enableHardeningWorkaround) "fortify";
 

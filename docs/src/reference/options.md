@@ -127,7 +127,7 @@ package
 
 
 The version of the Android build tools to install.
-By default, version 30.0.3 is installed or \[ “33.0.2” “30.0.3” ] if flutter is enabled.
+By default, version 30.0.3 is installed or \[ “35.0.0” “33.0.2” “30.0.3” ] if flutter is enabled.
 
 
 
@@ -225,7 +225,8 @@ boolean
 
 
 The version of the Android Emulator to install.
-By default, version 34.1.9 is installed.
+Available versions depend on the nixpkgs version.
+To see available versions, try building with an invalid version; the error message will list all available options.
 
 
 
@@ -235,7 +236,7 @@ string
 
 
 *Default:*
-` "34.1.9" `
+Latest version in nixpkgs
 
 *Declared by:*
  - [https://github.com/cachix/devenv/blob/main/src/modules/integrations/android.nix](https://github.com/cachix/devenv/blob/main/src/modules/integrations/android.nix)
@@ -416,7 +417,7 @@ boolean
 
 
 The version of the Android NDK (Native Development Kit) to install.
-By default, version 26.1.10909125 is installed.
+By default, version 26.1.10909125 is installed or for flutter version 28.2.13676358.
 
 
 
@@ -443,7 +444,8 @@ list of string
 
 
 The version of the Android platform tools to install.
-By default, version 34.0.5 is installed or 34.0.5 if flutter is enabled.
+Available versions depend on the nixpkgs version.
+To see available versions, try building with an invalid version; the error message will list all available options.
 
 
 
@@ -453,7 +455,7 @@ string
 
 
 *Default:*
-` "34.0.5" `
+Latest version in nixpkgs
 
 *Declared by:*
  - [https://github.com/cachix/devenv/blob/main/src/modules/integrations/android.nix](https://github.com/cachix/devenv/blob/main/src/modules/integrations/android.nix)
@@ -465,7 +467,7 @@ string
 
 
 The Android platform versions to install.
-By default, versions 32 and 34 are installed.
+By default, versions 32, 34 and 36 are installed.
 
 
 
@@ -480,6 +482,7 @@ list of string
 [
   "32"
   "34"
+  "36"
 ]
 ```
 
@@ -989,6 +992,32 @@ null or string
 
 
 
+## certFile
+
+
+
+Custom certificate file name, uses mkcert default if unset
+
+
+
+*Type:*
+null or string
+
+
+
+*Default:*
+` null `
+
+
+
+*Example:*
+` "mycert.pem" `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/integrations/mkcert.nix](https://github.com/cachix/devenv/blob/main/src/modules/integrations/mkcert.nix)
+
+
+
 ## certificates
 
 
@@ -1176,7 +1205,9 @@ attribute set of (submodule)
   code-reviewer = {
     description = "Expert code review specialist that checks for quality, security, and best practices";
     proactive = true;
+    model = "opus";
     tools = [ "Read" "Grep" "TodoWrite" ];
+    permissionMode = "plan";
     prompt = ''
       You are an expert code reviewer. When reviewing code, check for:
       - Code readability and maintainability
@@ -1184,11 +1215,11 @@ attribute set of (submodule)
       - Security vulnerabilities
       - Performance issues
       - Adherence to project conventions
-      
+
       Provide constructive feedback with specific suggestions for improvement.
     '';
   };
-  
+
   test-writer = {
     description = "Specialized in writing comprehensive test suites";
     proactive = false;
@@ -1220,6 +1251,48 @@ What the sub-agent does
 
 *Type:*
 string
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/integrations/claude.nix](https://github.com/cachix/devenv/blob/main/src/modules/integrations/claude.nix)
+
+
+
+## claude.code.agents.\<name>.model
+
+
+
+Override the model for this agent.
+
+
+
+*Type:*
+null or one of “opus”, “sonnet”, “haiku”
+
+
+
+*Default:*
+` null `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/integrations/claude.nix](https://github.com/cachix/devenv/blob/main/src/modules/integrations/claude.nix)
+
+
+
+## claude.code.agents.\<name>.permissionMode
+
+
+
+Permission mode for this specific sub-agent.
+
+
+
+*Type:*
+null or one of “default”, “acceptEdits”, “plan”, “bypassPermissions”
+
+
+
+*Default:*
+` null `
 
 *Declared by:*
  - [https://github.com/cachix/devenv/blob/main/src/modules/integrations/claude.nix](https://github.com/cachix/devenv/blob/main/src/modules/integrations/claude.nix)
@@ -1537,14 +1610,21 @@ The type of hook:
 
  - PreToolUse: Runs before tool calls (can block them)
  - PostToolUse: Runs after tool calls complete
+ - PostToolUseFailure: Runs after a tool call fails
  - Notification: Runs when Claude Code sends notifications
+ - UserPromptSubmit: Runs when user submits a prompt
+ - SessionStart: Runs when a Claude Code session starts
+ - SessionEnd: Runs when a Claude Code session ends
  - Stop: Runs when Claude Code finishes responding
+ - SubagentStart: Runs when a subagent task starts
  - SubagentStop: Runs when subagent tasks complete
+ - PreCompact: Runs before message compaction
+ - PermissionRequest: Runs when a permission is requested
 
 
 
 *Type:*
-one of “PreToolUse”, “PostToolUse”, “Notification”, “Stop”, “SubagentStop”
+one of “PreToolUse”, “PostToolUse”, “PostToolUseFailure”, “Notification”, “UserPromptSubmit”, “SessionStart”, “SessionEnd”, “Stop”, “SubagentStart”, “SubagentStop”, “PreCompact”, “PermissionRequest”
 
 
 
@@ -1608,7 +1688,15 @@ attribute set of (submodule)
 
 
 *Default:*
-` { } `
+
+```
+{
+  "mcp.devenv.sh" = {
+    type = "http";
+    url = "https://mcp.devenv.sh";
+  };
+}
+```
 
 
 
@@ -1621,6 +1709,13 @@ attribute set of (submodule)
     command = lib.getExe pkgs.awslabs-iam-mcp-server;
     args = [ ];
     env = { };
+  };
+  github = {
+    type = "http";
+    url = "https://api.githubcopilot.com/mcp/";
+    headers = {
+      Authorization = "Bearer GITHUB_PAT";
+    };
   };
   linear = {
     type = "http";
@@ -1706,6 +1801,27 @@ attribute set of string
 
 
 
+## claude.code.mcpServers.\<name>.headers
+
+
+
+HTTP headers for HTTP MCP servers (e.g., for authentication).
+
+
+
+*Type:*
+attribute set of string
+
+
+
+*Default:*
+` { } `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/integrations/claude.nix](https://github.com/cachix/devenv/blob/main/src/modules/integrations/claude.nix)
+
+
+
 ## claude.code.mcpServers.\<name>.type
 
 
@@ -1774,12 +1890,13 @@ null or string
 
 
 Fine-grained permissions for tool usage.
-Can specify allow/deny rules for different tools.
+Supports global settings and per-tool allow/ask/deny rules.
+Tool rules can be placed under ` rules ` or directly (backward compatible).
 
 
 
 *Type:*
-attribute set of (submodule)
+open submodule of attribute set of (submodule)
 
 
 
@@ -1792,11 +1909,18 @@ attribute set of (submodule)
 
 ```
 {
-  Edit = {
-    deny = [ "*.secret" "*.env" ];
-  };
-  Bash = {
-    deny = [ "rm -rf" ];
+  defaultMode = "acceptEdits";
+  disableBypassPermissionsMode = true;
+  additionalDirectories = [ "/shared/libs" ];
+  rules = {
+    Edit = {
+      deny = [ "*.secret" "*.env" ];
+    };
+    Bash = {
+      allow = [ "ls:*" "cat:*" ];
+      ask = [ "git:*" "npm:*" ];
+      deny = [ "rm -rf:*" "sudo:*" ];
+    };
   };
 }
 
@@ -1811,7 +1935,171 @@ attribute set of (submodule)
 
 
 
-List of allowed tools or patterns.
+List of allowed patterns.
+
+
+
+*Type:*
+list of string
+
+
+
+*Default:*
+` [ ] `
+
+
+
+## claude.code.permissions.\<name>.ask
+
+
+
+List of patterns that require user approval.
+
+
+
+*Type:*
+list of string
+
+
+
+*Default:*
+` [ ] `
+
+
+
+## claude.code.permissions.\<name>.deny
+
+
+
+List of denied patterns.
+
+
+
+*Type:*
+list of string
+
+
+
+*Default:*
+` [ ] `
+
+
+
+## claude.code.permissions.additionalDirectories
+
+
+
+Allow Claude Code to access directories outside the project root.
+
+
+
+*Type:*
+list of string
+
+
+
+*Default:*
+` [ ] `
+
+
+
+*Example:*
+
+```
+[
+  "/shared/libs"
+  "/common/configs"
+]
+```
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/integrations/claude.nix](https://github.com/cachix/devenv/blob/main/src/modules/integrations/claude.nix)
+
+
+
+## claude.code.permissions.defaultMode
+
+
+
+Global permission mode for Claude Code.
+
+ - default: Prompts on first use of each tool
+ - acceptEdits: Auto-accepts file edits
+ - plan: Read-only mode
+ - bypassPermissions: Skips all permission prompts
+
+
+
+*Type:*
+null or one of “default”, “acceptEdits”, “plan”, “bypassPermissions”
+
+
+
+*Default:*
+` null `
+
+
+
+*Example:*
+` "acceptEdits" `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/integrations/claude.nix](https://github.com/cachix/devenv/blob/main/src/modules/integrations/claude.nix)
+
+
+
+## claude.code.permissions.disableBypassPermissionsMode
+
+
+
+Security option to prevent the dangerous bypassPermissions mode.
+
+
+
+*Type:*
+null or boolean
+
+
+
+*Default:*
+` null `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/integrations/claude.nix](https://github.com/cachix/devenv/blob/main/src/modules/integrations/claude.nix)
+
+
+
+## claude.code.permissions.rules
+
+
+
+Per-tool permission rules. Preferred location for tool permissions.
+
+
+
+*Type:*
+attribute set of (submodule)
+
+
+
+*Default:*
+` { } `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/integrations/claude.nix](https://github.com/cachix/devenv/blob/main/src/modules/integrations/claude.nix)
+
+
+
+## claude.code.permissions.rules.\<name>.allow
+
+
+
+List of allowed patterns.
 
 
 
@@ -1828,11 +2116,32 @@ list of string
 
 
 
-## claude.code.permissions.\<name>.deny
+## claude.code.permissions.rules.\<name>.ask
 
 
 
-List of denied tools or patterns.
+List of patterns that require user approval.
+
+
+
+*Type:*
+list of string
+
+
+
+*Default:*
+` [ ] `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/integrations/claude.nix](https://github.com/cachix/devenv/blob/main/src/modules/integrations/claude.nix)
+
+
+
+## claude.code.permissions.rules.\<name>.deny
+
+
+
+List of denied patterns.
 
 
 
@@ -2161,8 +2470,6 @@ null or signed integer
 
 ## containers.\<name>.layers.\*.perms.\*.gname
 
-
-
 The group name to apply to all of the files matched by the ` regex `.
 
 
@@ -2395,10 +2702,14 @@ null or string
 
 Command to run in the container.
 
+Can be a string, a package, or a list of strings for individual arguments.
+Use a list when your entrypoint expects separate arguments, e.g.:
+` startupCommand = [ "-f" "/var/lib/haproxy/haproxy.cfg" ]; `
+
 
 
 *Type:*
-null or string or package
+null or string or package or list of string
 
 
 
@@ -2431,7 +2742,30 @@ null or string
 
 
 
+## containers.\<name>.workingDir
+
+
+
+Working directory of the container.
+
+
+
+*Type:*
+string
+
+
+
+*Default:*
+` "/env" `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/containers.nix](https://github.com/cachix/devenv/blob/main/src/modules/containers.nix)
+
+
+
 ## delta.enable
+
+
 
 Integrate delta into git: https://dandavison.github.io/delta/.
 
@@ -5078,8 +5412,6 @@ string
 
 ## git-hooks.hooks.cabal2nix
 
-
-
 cabal2nix hook
 
 
@@ -5330,6 +5662,8 @@ boolean
 
 
 ## git-hooks.hooks.cmake-format
+
+
 
 cmake-format hook
 
@@ -7141,8 +7475,6 @@ boolean
 
 ## git-hooks.hooks.hledger-fmt.description
 
-
-
 Description of the hook. Used for metadata purposes only.
 
 
@@ -7356,6 +7688,8 @@ submodule
 
 
 ## git-hooks.hooks.isort.enable
+
+
 
 Whether to enable this pre-commit hook.
 
@@ -13334,6 +13668,32 @@ list of package
 
 
 
+## keyFile
+
+
+
+Custom key file name, uses mkcert default if unset
+
+
+
+*Type:*
+null or string
+
+
+
+*Default:*
+` null `
+
+
+
+*Example:*
+` "mykey.pem" `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/integrations/mkcert.nix](https://github.com/cachix/devenv/blob/main/src/modules/integrations/mkcert.nix)
+
+
+
 ## languages.ansible.enable
 
 
@@ -13375,6 +13735,53 @@ package
 
 *Default:*
 ` pkgs.ansible `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/ansible.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/ansible.nix)
+
+
+
+## languages.ansible.lsp.enable
+
+
+
+Whether to enable Ansible Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` false `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/ansible.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/ansible.nix)
+
+
+
+## languages.ansible.lsp.package
+
+
+
+The Ansible language server package to use.
+
+
+
+*Type:*
+null or package
+
+
+
+*Default:*
+` pkgs.ansible-language-server `
 
 *Declared by:*
  - [https://github.com/cachix/devenv/blob/main/src/modules/languages/ansible.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/ansible.nix)
@@ -13429,6 +13836,53 @@ null or package
 
 
 
+## languages.c.lsp.enable
+
+
+
+Whether to enable C Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/c.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/c.nix)
+
+
+
+## languages.c.lsp.package
+
+
+
+The C language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.ccls `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/c.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/c.nix)
+
+
+
 ## languages.clojure.enable
 
 
@@ -13455,6 +13909,53 @@ boolean
 
 
 
+## languages.clojure.lsp.enable
+
+
+
+Whether to enable Clojure Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/clojure.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/clojure.nix)
+
+
+
+## languages.clojure.lsp.package
+
+
+
+The Clojure language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.clojure-lsp `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/clojure.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/clojure.nix)
+
+
+
 ## languages.cplusplus.enable
 
 
@@ -13475,6 +13976,53 @@ boolean
 
 *Example:*
 ` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/cplusplus.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/cplusplus.nix)
+
+
+
+## languages.cplusplus.lsp.enable
+
+
+
+Whether to enable C++ Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/cplusplus.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/cplusplus.nix)
+
+
+
+## languages.cplusplus.lsp.package
+
+
+
+The C++ language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.ccls `
 
 *Declared by:*
  - [https://github.com/cachix/devenv/blob/main/src/modules/languages/cplusplus.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/cplusplus.nix)
@@ -13522,6 +14070,53 @@ package
 
 *Default:*
 ` pkgs.crystal `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/crystal.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/crystal.nix)
+
+
+
+## languages.crystal.lsp.enable
+
+
+
+Whether to enable Crystal Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/crystal.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/crystal.nix)
+
+
+
+## languages.crystal.lsp.package
+
+
+
+The Crystal language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.crystalline `
 
 *Declared by:*
  - [https://github.com/cachix/devenv/blob/main/src/modules/languages/crystal.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/crystal.nix)
@@ -13611,6 +14206,53 @@ package
 
 *Default:*
 ` pkgs.cue `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/cue.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/cue.nix)
+
+
+
+## languages.cue.lsp.enable
+
+
+
+Whether to enable CUE Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/cue.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/cue.nix)
+
+
+
+## languages.cue.lsp.package
+
+
+
+The CUE language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.cuelsp `
 
 *Declared by:*
  - [https://github.com/cachix/devenv/blob/main/src/modules/languages/cue.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/cue.nix)
@@ -13758,6 +14400,53 @@ package
 
 
 
+## languages.dotnet.lsp.enable
+
+
+
+Whether to enable .NET Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true ` if csharp-ls is available on the host platform, ` false ` otherwise
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/dotnet.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/dotnet.nix)
+
+
+
+## languages.dotnet.lsp.package
+
+
+
+The .NET language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.csharp-ls `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/dotnet.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/dotnet.nix)
+
+
+
 ## languages.elixir.enable
 
 
@@ -13805,6 +14494,53 @@ package
 
 
 
+## languages.elixir.lsp.enable
+
+
+
+Whether to enable Elixir Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/elixir.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/elixir.nix)
+
+
+
+## languages.elixir.lsp.package
+
+
+
+The Elixir language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.elixir-ls `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/elixir.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/elixir.nix)
+
+
+
 ## languages.elm.enable
 
 
@@ -13825,6 +14561,53 @@ boolean
 
 *Example:*
 ` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/elm.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/elm.nix)
+
+
+
+## languages.elm.lsp.enable
+
+
+
+Whether to enable Elm Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/elm.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/elm.nix)
+
+
+
+## languages.elm.lsp.package
+
+
+
+The Elm language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.elmPackages.elm-language-server `
 
 *Declared by:*
  - [https://github.com/cachix/devenv/blob/main/src/modules/languages/elm.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/elm.nix)
@@ -13878,6 +14661,53 @@ package
 
 
 
+## languages.erlang.lsp.enable
+
+
+
+Whether to enable Erlang Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/erlang.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/erlang.nix)
+
+
+
+## languages.erlang.lsp.package
+
+
+
+The Erlang language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.erlang-language-platform `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/erlang.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/erlang.nix)
+
+
+
 ## languages.fortran.enable
 
 
@@ -13919,6 +14749,53 @@ package
 
 *Default:*
 ` pkgs.gfortran `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/fortran.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/fortran.nix)
+
+
+
+## languages.fortran.lsp.enable
+
+
+
+Whether to enable Fortran Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/fortran.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/fortran.nix)
+
+
+
+## languages.fortran.lsp.package
+
+
+
+The Fortran language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.fortls `
 
 *Declared by:*
  - [https://github.com/cachix/devenv/blob/main/src/modules/languages/fortran.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/fortran.nix)
@@ -14066,6 +14943,80 @@ package
 
 
 
+## languages.go.lsp.enable
+
+
+
+Whether to enable Go Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/go.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/go.nix)
+
+
+
+## languages.go.lsp.package
+
+
+
+The Go language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.gopls `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/go.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/go.nix)
+
+
+
+## languages.go.version
+
+
+
+The Go version to use.
+This automatically sets the ` languages.go.package ` using [go-overlay](https://github.com/purpleclay/go-overlay).
+
+
+
+*Type:*
+null or string
+
+
+
+*Default:*
+` null `
+
+
+
+*Example:*
+` "1.22.0" `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/go.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/go.nix)
+
+
+
 ## languages.haskell.enable
 
 
@@ -14155,16 +15106,42 @@ package
 
 
 
-## languages.haskell.languageServer
+## languages.haskell.lsp.enable
 
 
 
-Haskell language server to use.
+Whether to enable Haskell Language Server.
 
 
 
 *Type:*
-null or package
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/haskell.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/haskell.nix)
+
+
+
+## languages.haskell.lsp.package
+
+
+
+The Haskell language server package to use.
+
+
+
+*Type:*
+package
 
 
 
@@ -14287,11 +15264,11 @@ package
 
 
 
-## languages.helm.languageServer.enable
+## languages.helm.lsp.enable
 
 
 
-Whether to enable Helm language server.
+Whether to enable Helm Language Server.
 
 
 
@@ -14301,7 +15278,7 @@ boolean
 
 
 *Default:*
-` false `
+` true `
 
 
 
@@ -14313,11 +15290,11 @@ boolean
 
 
 
-## languages.helm.languageServer.package
+## languages.helm.lsp.package
 
 
 
-The Helm language server package to include.
+The Helm language server package to use.
 
 
 
@@ -14421,6 +15398,53 @@ package
 
 
 
+## languages.idris.lsp.enable
+
+
+
+Whether to enable Idris Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/idris.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/idris.nix)
+
+
+
+## languages.idris.lsp.package
+
+
+
+The Idris language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.idris2Packages.idris2Lsp `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/idris.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/idris.nix)
+
+
+
 ## languages.java.enable
 
 
@@ -14516,6 +15540,53 @@ package
 
 *Example:*
 ` pkgs.jdk8 `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/java.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/java.nix)
+
+
+
+## languages.java.lsp.enable
+
+
+
+Whether to enable Java Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/java.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/java.nix)
+
+
+
+## languages.java.lsp.package
+
+
+
+The Java language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.jdt-language-server `
 
 *Declared by:*
  - [https://github.com/cachix/devenv/blob/main/src/modules/languages/java.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/java.nix)
@@ -14737,6 +15808,53 @@ string
 
 *Example:*
 ` "./directory" `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/javascript.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/javascript.nix)
+
+
+
+## languages.javascript.lsp.enable
+
+
+
+Whether to enable TypeScript Language Server for JavaScript.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/javascript.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/javascript.nix)
+
+
+
+## languages.javascript.lsp.package
+
+
+
+The TypeScript/JavaScript language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.typescript-language-server `
 
 *Declared by:*
  - [https://github.com/cachix/devenv/blob/main/src/modules/languages/javascript.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/javascript.nix)
@@ -14988,6 +16106,53 @@ boolean
 
 
 
+## languages.jsonnet.lsp.enable
+
+
+
+Whether to enable Jsonnet Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/jsonnet.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/jsonnet.nix)
+
+
+
+## languages.jsonnet.lsp.package
+
+
+
+The Jsonnet language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.jsonnet-language-server `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/jsonnet.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/jsonnet.nix)
+
+
+
 ## languages.julia.enable
 
 
@@ -15055,6 +16220,53 @@ boolean
 
 *Example:*
 ` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/kotlin.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/kotlin.nix)
+
+
+
+## languages.kotlin.lsp.enable
+
+
+
+Whether to enable Kotlin Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/kotlin.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/kotlin.nix)
+
+
+
+## languages.kotlin.lsp.package
+
+
+
+The Kotlin language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.kotlin-language-server `
 
 *Declared by:*
  - [https://github.com/cachix/devenv/blob/main/src/modules/languages/kotlin.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/kotlin.nix)
@@ -15155,6 +16367,53 @@ package
 
 
 
+## languages.lua.lsp.enable
+
+
+
+Whether to enable Lua Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/lua.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/lua.nix)
+
+
+
+## languages.lua.lsp.package
+
+
+
+The Lua language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.lua-language-server `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/lua.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/lua.nix)
+
+
+
 ## languages.nim.enable
 
 
@@ -15202,6 +16461,53 @@ package
 
 
 
+## languages.nim.lsp.enable
+
+
+
+Whether to enable Nim Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/nim.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/nim.nix)
+
+
+
+## languages.nim.lsp.package
+
+
+
+The Nim language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.nimlangserver `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/nim.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/nim.nix)
+
+
+
 ## languages.nix.enable
 
 
@@ -15228,11 +16534,37 @@ boolean
 
 
 
+## languages.nix.lsp.enable
+
+
+
+Whether to enable Nix Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/nix.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/nix.nix)
+
+
+
 ## languages.nix.lsp.package
 
 
 
-The LSP package to use
+The Nix language server package to use.
 
 
 
@@ -15242,7 +16574,7 @@ package
 
 
 *Default:*
-` pkgs.nil `
+` pkgs.nixd `
 
 *Declared by:*
  - [https://github.com/cachix/devenv/blob/main/src/modules/languages/nix.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/nix.nix)
@@ -15290,6 +16622,53 @@ attribute set
 
 *Default:*
 ` pkgs.ocaml-ng.ocamlPackages_4_12 `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/ocaml.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/ocaml.nix)
+
+
+
+## languages.ocaml.lsp.enable
+
+
+
+Whether to enable OCaml Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/ocaml.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/ocaml.nix)
+
+
+
+## languages.ocaml.lsp.package
+
+
+
+The OCaml language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.ocamlPackages.ocaml-lsp `
 
 *Declared by:*
  - [https://github.com/cachix/devenv/blob/main/src/modules/languages/ocaml.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/ocaml.nix)
@@ -15365,6 +16744,53 @@ null or package
 
 
 
+## languages.odin.lsp.enable
+
+
+
+Whether to enable Odin Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/odin.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/odin.nix)
+
+
+
+## languages.odin.lsp.package
+
+
+
+The Odin language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.ols `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/odin.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/odin.nix)
+
+
+
 ## languages.opentofu.enable
 
 
@@ -15406,6 +16832,53 @@ package
 
 *Default:*
 ` pkgs.opentofu `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/opentofu.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/opentofu.nix)
+
+
+
+## languages.opentofu.lsp.enable
+
+
+
+Whether to enable OpenTofu Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/opentofu.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/opentofu.nix)
+
+
+
+## languages.opentofu.lsp.package
+
+
+
+The OpenTofu language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.terraform-ls `
 
 *Declared by:*
  - [https://github.com/cachix/devenv/blob/main/src/modules/languages/opentofu.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/opentofu.nix)
@@ -15515,6 +16988,53 @@ list of string
   "Mojolicious"
 ]
 ```
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/perl.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/perl.nix)
+
+
+
+## languages.perl.lsp.enable
+
+
+
+Whether to enable Perl Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/perl.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/perl.nix)
+
+
+
+## languages.perl.lsp.package
+
+
+
+The Perl language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.perlnavigator `
 
 *Declared by:*
  - [https://github.com/cachix/devenv/blob/main/src/modules/languages/perl.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/perl.nix)
@@ -16010,6 +17530,53 @@ null or strings concatenated with “\\n”
 
 
 
+## languages.php.lsp.enable
+
+
+
+Whether to enable PHP Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/php.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/php.nix)
+
+
+
+## languages.php.lsp.package
+
+
+
+The PHP language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.phpactor `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/php.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/php.nix)
+
+
+
 ## languages.php.version
 
 
@@ -16061,7 +17628,8 @@ boolean
 
 
 
-The PureScript package to use.
+The PureScript compiler package to use.
+Uses [purescript-overlay](https://github.com/thomashoneyman/purescript-overlay) by default.
 
 
 
@@ -16071,7 +17639,103 @@ package
 
 
 *Default:*
-` pkgs.purescript `
+` purescript-overlay.packages.${pkgs.stdenv.system}.purs `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/purescript.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/purescript.nix)
+
+
+
+## languages.purescript.lsp.enable
+
+
+
+Whether to enable PureScript Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/purescript.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/purescript.nix)
+
+
+
+## languages.purescript.lsp.package
+
+
+
+The PureScript language server package to use.
+Uses [purescript-overlay](https://github.com/thomashoneyman/purescript-overlay) by default.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` purescript-overlay.packages.${pkgs.stdenv.system}.purescript-language-server `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/purescript.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/purescript.nix)
+
+
+
+## languages.purescript.spago.enable
+
+
+
+Whether to enable Spago package manager.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/purescript.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/purescript.nix)
+
+
+
+## languages.purescript.spago.package
+
+
+
+The Spago package manager to use.
+Uses [purescript-overlay](https://github.com/thomashoneyman/purescript-overlay) by default.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` purescript-overlay.packages.${pkgs.stdenv.system}.spago `
 
 *Declared by:*
  - [https://github.com/cachix/devenv/blob/main/src/modules/languages/purescript.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/purescript.nix)
@@ -16152,6 +17816,36 @@ string
 
 
 
+## languages.python.import
+
+
+
+Import a Python project using uv2nix.
+
+This function takes a path to a directory containing a pyproject.toml file
+and returns a derivation that builds the Python project using uv2nix.
+
+Example usage:
+
+```nix
+let
+  mypackage = config.languages.python.import ./path/to/python/project {};
+in {
+  languages.python.enable = true;
+  packages = [ mypackage ];
+}
+```
+
+
+
+*Type:*
+function that evaluates to a(n) function that evaluates to a(n) package
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
+
+
+
 ## languages.python.libraries
 
 
@@ -16173,6 +17867,53 @@ list of absolute path
 [ "${config.devenv.dotfile}/profile" ]
 
 ```
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
+
+
+
+## languages.python.lsp.enable
+
+
+
+Whether to enable Python Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
+
+
+
+## languages.python.lsp.package
+
+
+
+The Python language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.pyright `
 
 *Declared by:*
  - [https://github.com/cachix/devenv/blob/main/src/modules/languages/python](https://github.com/cachix/devenv/blob/main/src/modules/languages/python)
@@ -16921,6 +18662,53 @@ package
 
 
 
+## languages.r.lsp.enable
+
+
+
+Whether to enable R Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/r.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/r.nix)
+
+
+
+## languages.r.lsp.package
+
+
+
+The R language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.rPackages.languageserver `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/r.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/r.nix)
+
+
+
 ## languages.r.radian.enable
 
 
@@ -17182,6 +18970,79 @@ package
 
 
 
+## languages.ruby.documentation.enable
+
+
+
+Whether to enable documentation support for Ruby packages.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` false `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/ruby.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/ruby.nix)
+
+
+
+## languages.ruby.lsp.enable
+
+
+
+Whether to enable Ruby Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/ruby.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/ruby.nix)
+
+
+
+## languages.ruby.lsp.package
+
+
+
+The Ruby language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.solargraph.override { ruby = cfg.package; } `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/ruby.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/ruby.nix)
+
+
+
 ## languages.ruby.version
 
 
@@ -17338,6 +19199,53 @@ packages = [ mypackage ];
 
 *Type:*
 function that evaluates to a(n) function that evaluates to a(n) package
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
+
+
+
+## languages.rust.lsp.enable
+
+
+
+Whether to enable Rust Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
+
+
+
+## languages.rust.lsp.package
+
+
+
+The Rust language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.rust-analyzer `
 
 *Declared by:*
  - [https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
@@ -17663,6 +19571,53 @@ package
 
 
 
+## languages.scala.lsp.enable
+
+
+
+Whether to enable Scala Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/scala.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/scala.nix)
+
+
+
+## languages.scala.lsp.package
+
+
+
+The Scala language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.metals `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/scala.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/scala.nix)
+
+
+
 ## languages.scala.mill.enable
 
 
@@ -17782,6 +19737,53 @@ boolean
 
 *Example:*
 ` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/shell.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/shell.nix)
+
+
+
+## languages.shell.lsp.enable
+
+
+
+Whether to enable Shell Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/shell.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/shell.nix)
+
+
+
+## languages.shell.lsp.package
+
+
+
+The Shell language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.bash-language-server `
 
 *Declared by:*
  - [https://github.com/cachix/devenv/blob/main/src/modules/languages/shell.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/shell.nix)
@@ -17929,6 +19931,53 @@ package
 
 
 
+## languages.standardml.lsp.enable
+
+
+
+Whether to enable Standard ML Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/standardml.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/standardml.nix)
+
+
+
+## languages.standardml.lsp.package
+
+
+
+The Standard ML language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.millet `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/standardml.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/standardml.nix)
+
+
+
 ## languages.swift.enable
 
 
@@ -17976,6 +20025,53 @@ package
 
 
 
+## languages.swift.lsp.enable
+
+
+
+Whether to enable Swift Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/swift.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/swift.nix)
+
+
+
+## languages.swift.lsp.package
+
+
+
+The Swift language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.sourcekit-lsp `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/swift.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/swift.nix)
+
+
+
 ## languages.terraform.enable
 
 
@@ -18017,6 +20113,53 @@ package
 
 *Default:*
 ` pkgs.terraform `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/terraform.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/terraform.nix)
+
+
+
+## languages.terraform.lsp.enable
+
+
+
+Whether to enable Terraform Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/terraform.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/terraform.nix)
+
+
+
+## languages.terraform.lsp.package
+
+
+
+The Terraform language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.terraform-ls `
 
 *Declared by:*
  - [https://github.com/cachix/devenv/blob/main/src/modules/languages/terraform.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/terraform.nix)
@@ -18134,6 +20277,53 @@ unspecified value
 
 
 
+## languages.texlive.lsp.enable
+
+
+
+Whether to enable TeX Live Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/texlive.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/texlive.nix)
+
+
+
+## languages.texlive.lsp.package
+
+
+
+The TeX Live language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.texlab `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/texlive.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/texlive.nix)
+
+
+
 ## languages.typescript.enable
 
 
@@ -18154,6 +20344,53 @@ boolean
 
 *Example:*
 ` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/typescript.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/typescript.nix)
+
+
+
+## languages.typescript.lsp.enable
+
+
+
+Whether to enable TypeScript Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/typescript.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/typescript.nix)
+
+
+
+## languages.typescript.lsp.package
+
+
+
+The TypeScript language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.typescript-language-server `
 
 *Declared by:*
  - [https://github.com/cachix/devenv/blob/main/src/modules/languages/typescript.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/typescript.nix)
@@ -18227,6 +20464,53 @@ list of string
 
 *Example:*
 ` [ "${pkgs.roboto}/share/fonts/truetype" ] `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/typst.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/typst.nix)
+
+
+
+## languages.typst.lsp.enable
+
+
+
+Whether to enable Typst Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/typst.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/typst.nix)
+
+
+
+## languages.typst.lsp.package
+
+
+
+The Typst language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.tinymist `
 
 *Declared by:*
  - [https://github.com/cachix/devenv/blob/main/src/modules/languages/typst.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/typst.nix)
@@ -18379,6 +20663,53 @@ package
 
 
 
+## languages.vala.lsp.enable
+
+
+
+Whether to enable Vala Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/vala.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/vala.nix)
+
+
+
+## languages.vala.lsp.package
+
+
+
+The Vala language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.vala-language-server `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/vala.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/vala.nix)
+
+
+
 ## languages.zig.enable
 
 
@@ -18426,12 +20757,59 @@ package
 
 
 
+## languages.zig.lsp.enable
+
+
+
+Whether to enable Zig Language Server.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` true `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/zig.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/zig.nix)
+
+
+
+## languages.zig.lsp.package
+
+
+
+The Zig language server package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.zls `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/languages/zig.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/zig.nix)
+
+
+
 ## languages.zig.version
 
 
 
 The Zig version to use.
-This automatically sets the ` languages.zig.package ` and ` languages.zig.zls.package ` using [zig-overlay](https://github.com/mitchellh/zig-overlay).
+This automatically sets the ` languages.zig.package ` and ` languages.zig.lsp.package ` using [zig-overlay](https://github.com/mitchellh/zig-overlay).
 
 
 
@@ -18447,27 +20825,6 @@ null or string
 
 *Example:*
 ` "0.15.1" `
-
-*Declared by:*
- - [https://github.com/cachix/devenv/blob/main/src/modules/languages/zig.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/zig.nix)
-
-
-
-## languages.zig.zls.package
-
-
-
-Which package of zls to use.
-
-
-
-*Type:*
-package
-
-
-
-*Default:*
-` pkgs.zls `
 
 *Declared by:*
  - [https://github.com/cachix/devenv/blob/main/src/modules/languages/zig.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/zig.nix)
@@ -20546,7 +22903,7 @@ unspecified value
 
 
 *Default:*
-` pkgs.cockroachdb-bin `
+` pkgs.cockroachdb `
 
 *Declared by:*
  - [https://github.com/cachix/devenv/blob/main/src/modules/services/cockroachdb.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/cockroachdb.nix)

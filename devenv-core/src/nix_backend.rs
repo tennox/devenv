@@ -30,10 +30,6 @@ pub struct Options {
     pub cache_output: bool,
     /// Force a refresh of the cached output.
     pub refresh_cached_output: bool,
-    /// Enable logging.
-    pub logging: bool,
-    /// Log the stdout of the command.
-    pub logging_stdout: bool,
     /// Extra flags to pass to nix commands.
     pub nix_flags: &'static [&'static str],
 }
@@ -45,8 +41,6 @@ impl Default for Options {
             bail_on_error: true,
             cache_output: false,
             refresh_cached_output: false,
-            logging: true,
-            logging_stdout: false,
             nix_flags: &[
                 "--show-trace",
                 "--extra-experimental-features",
@@ -100,7 +94,8 @@ pub trait NixBackend: Send + Sync {
     async fn search(&self, name: &str, options: Option<Options>) -> Result<Output>;
 
     /// Garbage collect the specified paths
-    async fn gc(&self, paths: Vec<PathBuf>) -> Result<()>;
+    /// Returns (paths_deleted, bytes_freed)
+    async fn gc(&self, paths: Vec<PathBuf>) -> Result<(u64, u64)>;
 
     /// Get the backend name (for debugging/logging)
     fn name(&self) -> &'static str;

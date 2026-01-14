@@ -9,12 +9,15 @@ snix = []
 
 [dependencies]
 devenv-eval-cache.workspace = true
+devenv-activity.workspace = true
 nix-conf-parser.workspace = true
 pathdiff.workspace = true
+regex.workspace = true
 
 async-trait.workspace = true
 clap.workspace = true
 miette.workspace = true
+thiserror.workspace = true
 once_cell.workspace = true
 schemars.workspace = true
 schematic.workspace = true
@@ -24,3 +27,6 @@ serde_yaml.workspace = true
 ser_nix.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

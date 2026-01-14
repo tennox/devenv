@@ -1,21 +1,77 @@
 //! CLI-related types and utilities for devenv
 
 use clap::Parser;
+use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::str::FromStr;
 use tracing::error;
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum LogFormat {
-    /// The default human-readable log format used in the CLI.
+pub enum TraceFormat {
+    /// A verbose structured log format used for debugging (default).
+    Full,
+    /// A JSON log format used for machine consumption.
+    #[default]
+    Json,
+    /// A pretty human-readable log format used for debugging.
+    Pretty,
+}
+
+/// Deprecated: use TraceFormat instead.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LegacyLogFormat {
     #[default]
     Cli,
-    /// A verbose structured log format used for debugging.
     TracingFull,
-    /// A pretty human-readable log format used for debugging.
     TracingPretty,
-    /// A JSON log format used for machine consumption.
     TracingJson,
+}
+
+impl TryFrom<LegacyLogFormat> for TraceFormat {
+    type Error = ();
+
+    fn try_from(format: LegacyLogFormat) -> Result<Self, Self::Error> {
+        match format {
+            LegacyLogFormat::TracingFull => Ok(TraceFormat::Full),
+            LegacyLogFormat::TracingJson => Ok(TraceFormat::Json),
+            LegacyLogFormat::TracingPretty => Ok(TraceFormat::Pretty),
+            LegacyLogFormat::Cli => Err(()),
+        }
+    }
+}
+
+/// Specifies where trace output should be written.
+///
+/// Accepts the following formats:
+/// - `stdout` - write to standard output
+/// - `stderr` - write to standard error
+/// - `file:/path/to/file` - write to the specified file path
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum TraceOutput {
+    #[default]
+    Stderr,
+    Stdout,
+    File(PathBuf),
+}
+
+impl FromStr for TraceOutput {
+    type Err = ParseTraceOutputError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "stderr" => Ok(TraceOutput::Stderr),
+            "stdout" => Ok(TraceOutput::Stdout),
+            s if s.starts_with("file:") => Ok(TraceOutput::File(PathBuf::from(&s[5..]))),
+            _ => Err(ParseTraceOutputError::UnsupportedFormat(s.to_string())),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ParseTraceOutputError {
+    #[error("unsupported trace output format '{0}', expected 'stdout', 'stderr', or 'file:<path>'")]
+    UnsupportedFormat(String),
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -44,20 +100,48 @@ pub struct GlobalOptions {
     #[arg(
         long,
         global = true,
-        help = "Configure the output format of the logs.",
-        default_value_t,
-        value_enum
+        env = "DEVENV_TUI",
+        help = "Enable the interactive terminal interface.",
+        default_value_t = true,
+        overrides_with = "no_tui"
     )]
-    pub log_format: LogFormat,
+    pub tui: bool,
 
     #[arg(
         long,
         global = true,
-        env = "DEVENV_TRACE_EXPORT_FILE",
-        help = "Path to export traces.",
+        help = "Disable the interactive terminal interface.",
+        overrides_with = "tui"
+    )]
+    pub no_tui: bool,
+
+    #[arg(
+        long,
+        global = true,
+        help = "Deprecated: use --trace-format instead.",
+        value_enum,
         hide = true
     )]
-    pub trace_export_file: Option<PathBuf>,
+    pub log_format: Option<LegacyLogFormat>,
+
+    #[arg(
+        long,
+        global = true,
+        env = "DEVENV_TRACE_FORMAT",
+        help = "Configure the output format of traces.",
+        default_value_t,
+        value_enum
+    )]
+    pub trace_format: TraceFormat,
+
+    #[arg(
+        long,
+        global = true,
+        env = "DEVENV_TRACE_OUTPUT",
+        help = "Where to export traces (stdout, stderr, or file path).",
+        hide = true
+    )]
+    pub trace_output: Option<TraceOutput>,
 
     #[arg(short = 'j', long,
         global = true,
@@ -181,6 +265,14 @@ pub struct GlobalOptions {
         long_help = "Activate one or more profiles defined in devenv.nix.\n\nProfiles allow you to define different configurations that can be merged with your base configuration.\n\nSee https://devenv.sh/profiles for more information.\n\nExamples:\n  --profile python-3.14\n  --profile backend --profile fast-startup"
     )]
     pub profile: Vec<String>,
+
+    #[arg(
+        long,
+        global = true,
+        help = "Source for devenv.nix (flake input reference or path)",
+        long_help = "Source for devenv.nix.\n\nCan be either a filesystem path or a flake input reference.\n\nExamples:\n  --from myinput\n  --from myinput/subdir\n  --from /absolute/path/to/project"
+    )]
+    pub from: Option<String>,
 }
 
 impl Default for GlobalOptions {
@@ -190,8 +282,11 @@ impl Default for GlobalOptions {
             version: false,
             verbose: false,
             quiet: false,
-            log_format: LogFormat::default(),
-            trace_export_file: None,
+            tui: true,
+            no_tui: false,
+            log_format: None,
+            trace_format: TraceFormat::default(),
+            trace_output: None,
             max_jobs: defaults.max_jobs,
             cores: defaults.cores,
             system: default_system(),
@@ -206,6 +301,7 @@ impl Default for GlobalOptions {
             override_input: vec![],
             option: vec![],
             profile: vec![],
+            from: None,
         }
     }
 }
@@ -217,6 +313,51 @@ impl GlobalOptions {
         if self.no_eval_cache {
             self.eval_cache = false;
         }
+
+        if self.no_tui {
+            self.tui = false;
+        }
+
+        // Disable TUI in CI environments or when not running in a TTY
+        if self.tui {
+            let is_ci = std::env::var("CI")
+                .map(|s| s == "true" || s == "1")
+                .unwrap_or(false);
+            let is_tty = std::io::stdin().is_terminal()
+                && std::io::stdout().is_terminal()
+                && std::io::stderr().is_terminal();
+            if is_ci || !is_tty {
+                self.tui = false;
+            }
+        }
+
+        // Handle deprecated --log-format (except Cli which is handled separately)
+        if let Some(format) = self.log_format {
+            eprintln!("Warning: --log-format is deprecated, use --trace-format instead");
+            if let Ok(trace_format) = format.try_into() {
+                self.trace_format = trace_format;
+            }
+        }
+    }
+
+    /// Returns true if tracing-only mode should be used.
+    ///
+    /// Tracing mode is used when trace_output is Stdout or Stderr,
+    /// as these would conflict with TUI or legacy CLI output.
+    pub fn use_tracing_mode(&self) -> bool {
+        matches!(
+            self.trace_output,
+            Some(TraceOutput::Stdout) | Some(TraceOutput::Stderr)
+        )
+    }
+
+    /// Returns true if legacy CLI mode should be used (instead of TUI).
+    ///
+    /// Legacy CLI mode is used when:
+    /// - `--no-tui` is passed
+    /// - `--log-format cli` is passed (deprecated)
+    pub fn use_legacy_cli(&self) -> bool {
+        !self.tui || self.log_format == Some(LegacyLogFormat::Cli)
     }
 }
 

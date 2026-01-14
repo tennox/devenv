@@ -1,7 +1,7 @@
 use clap::{Parser, crate_version};
 use devenv::{
     default_system,
-    log::{self, LogFormat},
+    tracing::{self as devenv_tracing, TraceFormat},
 };
 use miette::{IntoDiagnostic, Result, bail};
 use similar::{ChangeTag, TextDiff};
@@ -58,11 +58,11 @@ struct Cli {
     #[arg(
         long,
         global = true,
-        help = "Configure the output format of the logs.",
+        help = "Configure the output format of traces.",
         default_value_t,
         value_enum
     )]
-    pub log_format: LogFormat,
+    pub trace_format: TraceFormat,
 }
 
 #[derive(serde::Deserialize)]
@@ -81,15 +81,14 @@ async fn main() -> Result<()> {
     }
 
     let level = if cli.verbose {
-        log::Level::Debug
+        devenv_tracing::Level::Debug
     } else if cli.quiet {
-        log::Level::Silent
+        devenv_tracing::Level::Silent
     } else {
-        log::Level::default()
+        devenv_tracing::Level::default()
     };
 
-    let shutdown = tokio_shutdown::Shutdown::new();
-    log::init_tracing(level, cli.log_format, None, shutdown);
+    devenv_tracing::init_tracing(level, cli.trace_format, None);
 
     let description = if !cli.description.is_empty() {
         Some(cli.description.join(" "))
@@ -97,11 +96,7 @@ async fn main() -> Result<()> {
         None
     };
 
-    let client = reqwest::Client::builder()
-        .use_preconfigured_tls(http_client_tls::tls_config())
-        .build()
-        .expect("Failed to create reqwest client");
-    let mut request = client
+    let mut request = reqwest::Client::new()
         .post(&cli.host)
         .query(&[("disable_telemetry", cli.disable_telemetry)])
         .header(reqwest::header::USER_AGENT, crate_version!());

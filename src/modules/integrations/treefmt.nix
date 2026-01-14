@@ -60,8 +60,7 @@ in
 
   config = lib.mkIf cfg.enable {
     # Use the same wrapper for git-hooks.
-    # Use a priority 1 lower than `mkDefault` to avoid conflicts.
-    git-hooks.hooks.treefmt.package = lib.mkOverride 999 treefmtWrapper;
+    git-hooks.hooks.treefmt.package = config.lib.mkOverrideDefault treefmtWrapper;
 
     packages = [
       treefmtWrapper
@@ -71,6 +70,9 @@ in
     # Set an empty default to detect when the user wants to use a custom root file.
     treefmt.config.projectRootFile = lib.mkDefault "";
 
-    tasks."devenv:treefmt:run".exec = "${treefmtWrapper}/bin/treefmt";
+    tasks."devenv:treefmt:run" = {
+      before = [ "devenv:enterShell" ];
+      exec = "${treefmtWrapper}/bin/treefmt";
+    };
   };
 }

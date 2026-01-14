@@ -1,62 +1,257 @@
 use clap::crate_version;
 use devenv::{
-    Config, Devenv,
+    Devenv, RunMode,
     cli::{Cli, Commands, ContainerCommand, InputsCommand, ProcessesCommand, TasksCommand},
-    log,
+    tracing as devenv_tracing,
 };
-use devenv_core::config;
+use devenv_activity::ActivityLevel;
+use devenv_core::config::{self, Config};
 use miette::{IntoDiagnostic, Result, WrapErr, bail};
-use std::{env, os::unix::process::CommandExt, process::Command, sync::Arc};
+use std::{process::Command, sync::Arc};
 use tempfile::TempDir;
 use tokio_shutdown::Shutdown;
-use tracing::{info, warn};
+use tracing::info;
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let shutdown = Shutdown::new();
-    shutdown.install_signals().await;
+/// Create a tokio runtime with worker threads registered with Boehm GC.
+///
+/// Nix uses Boehm GC with parallel marking. During stop-the-world collection,
+/// only registered threads are paused. This ensures all tokio worker threads
+/// are properly registered to avoid race conditions.
+fn build_gc_runtime() -> tokio::runtime::Runtime {
+    devenv_nix_backend::nix_init();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .on_thread_start(|| {
+            let _ = devenv_nix_backend::gc_register_current_thread();
+        })
+        .build()
+        .expect("Failed to create tokio runtime")
+}
 
-    tokio::select! {
-        result = run_devenv(shutdown.clone()) => result,
-        _ = shutdown.wait_for_shutdown() => Ok(()),
+/// Result of a CLI command execution.
+/// This is a CLI concern - the library returns domain types.
+#[derive(Debug)]
+enum CommandResult {
+    /// Command completed normally
+    Done,
+    /// Print this string after UI cleanup
+    Print(String),
+    /// Exec into this command after cleanup (TUI shutdown, terminal restore)
+    Exec(Command),
+    /// Prompt for missing secrets after TUI cleanup
+    PromptSecrets {
+        provider: Option<String>,
+        profile: Option<String>,
+    },
+}
+
+impl CommandResult {
+    /// Execute the pending action.
+    /// - Done: returns Ok(())
+    /// - Print: prints to stdout and returns Ok(())
+    /// - Exec: replaces the current process (never returns on success)
+    /// - PromptSecrets: prompts for missing secrets interactively
+    fn exec(self) -> Result<()> {
+        match self {
+            CommandResult::Done => Ok(()),
+            CommandResult::Print(output) => {
+                print!("{output}");
+                Ok(())
+            }
+            CommandResult::Exec(mut cmd) => {
+                use std::os::unix::process::CommandExt;
+                let err = cmd.exec();
+                miette::bail!("Failed to exec: {}", err);
+            }
+            CommandResult::PromptSecrets { provider, profile } => {
+                // Load secretspec and prompt for missing secrets
+                let mut secrets = secretspec::Secrets::load()
+                    .map_err(|e| miette::miette!("Failed to load secretspec: {}", e))?;
+
+                if let Some(ref p) = provider {
+                    secrets.set_provider(p);
+                }
+                if let Some(ref p) = profile {
+                    secrets.set_profile(p);
+                }
+
+                secrets
+                    .ensure_secrets(provider, profile, true)
+                    .map_err(|e| miette::miette!("Failed to set secrets: {}", e))?;
+
+                eprintln!("\nSecrets have been set. Please re-run your command.");
+                Ok(())
+            }
+        }
     }
 }
 
-async fn run_devenv(shutdown: Arc<Shutdown>) -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse_and_resolve_options();
 
-    let print_version = || {
-        println!(
-            "devenv {} ({})",
-            crate_version!(),
-            cli.global_options.system
-        );
-        Ok(())
-    };
-
-    let command = match cli.command {
-        None | Some(Commands::Version) => return print_version(),
+    // Handle commands that don't need a runtime
+    match &cli.command {
+        None | Some(Commands::Version) => {
+            println!(
+                "devenv {} ({})",
+                crate_version!(),
+                cli.global_options.system
+            );
+            return Ok(());
+        }
         Some(Commands::Direnvrc) => {
             print!("{}", *devenv::DIRENVRC);
             return Ok(());
         }
-        Some(cmd) => cmd,
-    };
+        _ => {}
+    }
 
-    let level = if cli.global_options.verbose {
-        log::Level::Debug
-    } else if cli.global_options.quiet {
-        log::Level::Silent
-    } else {
-        log::Level::default()
-    };
-
-    log::init_tracing(
-        level,
-        cli.global_options.log_format,
-        cli.global_options.trace_export_file.as_deref(),
-        shutdown.clone(),
+    // Determine which mode to run in:
+    // - TUI mode: interactive terminal UI (default)
+    // - Legacy CLI mode: spinners and progress indicators (--no-tui or --log-format cli)
+    // - Tracing mode: when --trace-output is stdout/stderr (conflicts with TUI/CLI output)
+    //
+    // Some commands require specific modes regardless of user options:
+    // - MCP stdio mode uses legacy CLI (stdout is JSON-RPC, progress goes to stderr)
+    // - MCP HTTP mode can use TUI
+    let force_legacy_cli = matches!(
+        &cli.command,
+        Some(Commands::Mcp { http: None }) // stdio mode needs legacy CLI (stderr output)
+            | Some(Commands::Lsp { .. }) // LSP needs direct stdout for protocol/config output
     );
+
+    if cli.global_options.use_tracing_mode() {
+        run_with_tracing(cli)
+    } else if force_legacy_cli || cli.global_options.use_legacy_cli() {
+        run_with_legacy_cli(cli)
+    } else {
+        run_with_tui(cli)
+    }
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn run_with_tui(cli: Cli) -> Result<()> {
+    // Initialize activity channel and register it
+    let (activity_rx, activity_handle) = devenv_activity::init();
+    activity_handle.install();
+
+    // Initialize tracing
+    let level = cli.get_log_level();
+    devenv_tracing::init_tracing(
+        level,
+        cli.global_options.trace_format,
+        cli.global_options.trace_output.as_ref(),
+    );
+
+    // Determine TUI filter level based on verbose flag
+    let filter_level = if cli.global_options.verbose {
+        ActivityLevel::Debug
+    } else {
+        ActivityLevel::Info
+    };
+
+    // Shutdown coordination
+    // Signal handlers catch external signals (SIGINT from `kill`, SIGTERM, etc.)
+    // TUI also handles Ctrl+C as keyboard event and sets last_signal manually
+    let shutdown = Shutdown::new();
+    shutdown.install_signals().await;
+
+    // Channel to signal TUI when backend is fully done (including cleanup)
+    let (backend_done_tx, backend_done_rx) = tokio::sync::oneshot::channel();
+
+    // Devenv on background thread (own runtime with GC-registered workers)
+    let shutdown_clone = shutdown.clone();
+    let devenv_thread = std::thread::spawn(move || {
+        build_gc_runtime().block_on(async {
+            let result = tokio::select! {
+                result = run_devenv(cli, shutdown_clone.clone()) => result,
+                _ = shutdown_clone.wait_for_shutdown() => Ok(CommandResult::Done),
+            };
+
+            // Wait for cleanup to complete (e.g., Nix interrupt, cachix finalization)
+            shutdown_clone.wait_for_shutdown_complete().await;
+
+            // Signal TUI that backend is fully done
+            let _ = backend_done_tx.send(());
+
+            result
+        })
+    });
+
+    // TUI on main thread (owns terminal)
+    // Runs until backend signals completion, then drains remaining events
+    let _ = devenv_tui::TuiApp::new(activity_rx, shutdown)
+        .filter_level(filter_level)
+        .run(backend_done_rx)
+        .await;
+
+    // Restore terminal to normal state (disable raw mode, show cursor)
+    devenv_tui::app::restore_terminal();
+
+    let Ok(devenv_result) = devenv_thread.join() else {
+        bail!("devenv thread panicked");
+    };
+
+    let result = match devenv_result {
+        Ok(cmd_result) => cmd_result,
+        Err(err) => {
+            // Check if secrets need prompting (special case: TUI stopped for password entry)
+            if let Some(secrets_err) = err.downcast_ref::<devenv::SecretsNeedPrompting>() {
+                CommandResult::PromptSecrets {
+                    provider: secrets_err.provider.clone(),
+                    profile: secrets_err.profile.clone(),
+                }
+            } else {
+                return Err(err);
+            }
+        }
+    };
+
+    // Execute any pending command (e.g., shell exec) now that TUI is cleaned up
+    result.exec()
+}
+
+fn run_with_legacy_cli(cli: Cli) -> Result<()> {
+    build_gc_runtime().block_on(async {
+        let shutdown = Shutdown::new();
+        shutdown.install_signals().await;
+
+        let level = cli.get_log_level();
+        devenv_tracing::init_cli_tracing(level, cli.global_options.trace_output.as_ref());
+
+        let result = tokio::select! {
+            result = run_devenv(cli, shutdown.clone()) => result,
+            _ = shutdown.wait_for_shutdown() => Ok(CommandResult::Done),
+        }?;
+
+        result.exec()
+    })
+}
+
+fn run_with_tracing(cli: Cli) -> Result<()> {
+    build_gc_runtime().block_on(async {
+        let shutdown = Shutdown::new();
+        shutdown.install_signals().await;
+
+        let level = cli.get_log_level();
+        devenv_tracing::init_tracing(
+            level,
+            cli.global_options.trace_format,
+            cli.global_options.trace_output.as_ref(),
+        );
+
+        let result = tokio::select! {
+            result = run_devenv(cli, shutdown.clone()) => result,
+            _ = shutdown.wait_for_shutdown() => Ok(CommandResult::Done),
+        }?;
+
+        result.exec()
+    })
+}
+
+async fn run_devenv(cli: Cli, shutdown: Arc<Shutdown>) -> Result<CommandResult> {
+    // Command is guaranteed to exist (Version/Direnvrc handled in main)
+    let command = cli.command.expect("Command should exist");
 
     let mut config = Config::load()?;
     for input in cli.global_options.override_input.chunks_exact(2) {
@@ -68,6 +263,30 @@ async fn run_devenv(shutdown: Arc<Shutdown>) -> Result<()> {
                     &input[0], &input[1]
                 )
             })?;
+    }
+
+    // If --from is provided, create a new input and add it to imports
+    if let Some(ref from) = cli.global_options.from {
+        // Convert to absolute path if it's a local filesystem path
+        let url = if std::path::Path::new(from).exists() {
+            // It's a local path - prefix with "path:" and make it absolute
+            let abs_path =
+                std::fs::canonicalize(from).unwrap_or_else(|_| std::path::PathBuf::from(from));
+            format!("path:{}", abs_path.display())
+        } else {
+            // It's a flake input reference (e.g., "nixpkgs", "github:org/repo")
+            from.clone()
+        };
+
+        let from_input = devenv_core::config::Input {
+            url: Some(url),
+            flake: true,
+            follows: None,
+            inputs: std::collections::BTreeMap::new(),
+            overlays: Vec::new(),
+        };
+        config.inputs.insert("from".to_string(), from_input);
+        config.imports.push("from".to_string());
     }
 
     let mut options = devenv::DevenvOptions {
@@ -108,83 +327,47 @@ async fn run_devenv(shutdown: Arc<Shutdown>) -> Result<()> {
 
     let mut devenv = Devenv::new(options).await;
 
-    match command {
-        Commands::Shell { cmd, ref args } => match cmd {
-            Some(cmd) => devenv.exec_in_shell(Some(cmd), args).await,
-            None => devenv.shell().await,
-        },
-        Commands::Test { .. } => devenv.test().await,
-        Commands::Container {
-            registry,
-            copy,
-            docker_run,
-            copy_args,
-            name,
-            command,
-        } => {
-            // Backwards compatibility for the legacy container flags:
-            //   `devenv container <name> --copy` is now `devenv container copy <name>`
-            //   `devenv container <name> --docker-run` is now `devenv container run <name>`
-            //   `devenv container <name>` is now `devenv container build <name>`
-            let command = if let Some(name) = name {
-                if copy {
-                    warn!(
-                        devenv.is_user_message = true,
-                        "The --copy flag is deprecated. Use `devenv container copy` instead."
-                    );
-                    ContainerCommand::Copy { name }
-                } else if docker_run {
-                    warn!(
-                        devenv.is_user_message = true,
-                        "The --docker-run flag is deprecated. Use `devenv container run` instead."
-                    );
-                    ContainerCommand::Run { name }
-                } else {
-                    warn!(
-                        devenv.is_user_message = true,
-                        "Calling `devenv container` without a subcommand is deprecated. Use `devenv container build {name}` instead."
-                    );
-                    ContainerCommand::Build { name }
-                }
-            } else {
-                // Error out if we don't have a subcommand at this point.
-                if let Some(cmd) = command {
-                    cmd
-                } else {
-                    // Impossible. This handled by clap, but if we have no subcommand at this point, error out.
-                    bail!(
-                        "No container subcommand provided. Use `devenv container build` or specify a command."
-                    )
-                }
+    let result = match command {
+        Commands::Shell { cmd, ref args } => {
+            let shell_config = match cmd {
+                Some(cmd) => devenv.prepare_exec(Some(cmd), args).await?,
+                None => devenv.shell().await?,
             };
-
-            match command {
-                ContainerCommand::Build { name } => {
-                    let path = devenv.container_build(&name).await?;
-                    // Print the path to the built container to stdout
-                    println!("{path}");
-                }
-                ContainerCommand::Copy { name } => {
-                    devenv
-                        .container_copy(&name, &copy_args, registry.as_deref())
-                        .await?;
-                }
-                ContainerCommand::Run { name } => {
-                    devenv
-                        .container_run(&name, &copy_args, registry.as_deref())
-                        .await?;
-                }
-            }
-
-            Ok(())
+            CommandResult::Exec(shell_config.command)
         }
-        Commands::Init { target } => devenv.init(&target),
+        Commands::Test { .. } => {
+            devenv.test().await?;
+            CommandResult::Done
+        }
+        Commands::Container { command } => match command {
+            ContainerCommand::Build { name } => {
+                let path = devenv.container_build(&name).await?;
+                CommandResult::Print(format!("{path}\n"))
+            }
+            ContainerCommand::Copy {
+                name,
+                copy_args,
+                registry,
+            } => {
+                devenv
+                    .container_copy(&name, &copy_args, registry.as_deref())
+                    .await?;
+                CommandResult::Done
+            }
+            ContainerCommand::Run { name, copy_args } => {
+                let shell_config = devenv.container_run(&name, &copy_args).await?;
+                CommandResult::Exec(shell_config.command)
+            }
+        },
+        Commands::Init { target } => {
+            devenv.init(&target)?;
+            CommandResult::Done
+        }
         Commands::Generate { .. } => match which::which("devenv-generate") {
             Ok(devenv_generate) => {
-                let error = Command::new(devenv_generate)
-                    .args(std::env::args().skip(1).filter(|arg| arg != "generate"))
-                    .exec();
-                miette::bail!("failed to execute devenv-generate {error}");
+                let mut cmd = Command::new(devenv_generate);
+                cmd.args(std::env::args().skip(1).filter(|arg| arg != "generate"));
+                CommandResult::Exec(cmd)
             }
             Err(_) => {
                 miette::bail!(indoc::formatdoc! {"
@@ -196,12 +379,44 @@ async fn run_devenv(shutdown: Arc<Shutdown>) -> Result<()> {
                 "})
             }
         },
-        Commands::Search { name } => devenv.search(&name).await,
-        Commands::Gc {} => devenv.gc().await,
-        Commands::Info {} => devenv.info().await,
-        Commands::Repl {} => devenv.repl().await,
-        Commands::Build { attributes } => devenv.build(&attributes).await,
-        Commands::Update { name } => devenv.update(&name).await,
+        Commands::Search { name } => {
+            devenv.search(&name).await?;
+            CommandResult::Done
+        }
+        Commands::Gc {} => {
+            let (paths_deleted, bytes_freed) = devenv.gc().await?;
+            let mb_freed = bytes_freed / (1024 * 1024);
+            CommandResult::Print(format!(
+                "Done. Deleted {} store paths, freed {} MB.\n",
+                paths_deleted, mb_freed
+            ))
+        }
+        Commands::Info {} => {
+            let output = devenv.info().await?;
+            CommandResult::Print(format!("{output}\n"))
+        }
+        Commands::Repl {} => {
+            devenv.repl().await?;
+            CommandResult::Done
+        }
+        Commands::Build { attributes } => {
+            let results = devenv.build(&attributes).await?;
+            let json_map: serde_json::Map<String, serde_json::Value> = results
+                .into_iter()
+                .map(|(attr, path)| (attr, serde_json::Value::String(path.display().to_string())))
+                .collect();
+            let json = serde_json::to_string_pretty(&json_map)
+                .map_err(|e| miette::miette!("Failed to serialize JSON: {}", e))?;
+            CommandResult::Print(format!("{json}\n"))
+        }
+        Commands::Eval { attributes } => {
+            let json = devenv.eval(&attributes).await?;
+            CommandResult::Print(format!("{json}\n"))
+        }
+        Commands::Update { name } => {
+            devenv.update(&name).await?;
+            CommandResult::Done
+        }
         Commands::Up { processes, detach }
         | Commands::Processes {
             command: ProcessesCommand::Up { processes, detach },
@@ -211,40 +426,69 @@ async fn run_devenv(shutdown: Arc<Shutdown>) -> Result<()> {
                 log_to_file: detach,
                 ..Default::default()
             };
-            devenv.up(processes, &options).await
+            match devenv.up(processes, &options).await? {
+                RunMode::Detached => CommandResult::Done,
+                RunMode::Foreground(shell_command) => CommandResult::Exec(shell_command.command),
+            }
         }
         Commands::Processes {
             command: ProcessesCommand::Down {},
-        } => devenv.down().await,
+        } => {
+            devenv.down().await?;
+            CommandResult::Done
+        }
         Commands::Tasks { command } => match command {
             TasksCommand::Run {
                 tasks,
                 mode,
                 show_output,
-            } => devenv.tasks_run(tasks, mode, show_output).await,
-            TasksCommand::List {} => devenv.tasks_list().await,
+            } => {
+                let output = devenv.tasks_run(tasks, mode, show_output).await?;
+                CommandResult::Print(format!("{output}\n"))
+            }
+            TasksCommand::List {} => {
+                let output = devenv.tasks_list().await?;
+                CommandResult::Print(format!("{output}\n"))
+            }
         },
         Commands::Inputs { command } => match command {
             InputsCommand::Add { name, url, follows } => {
-                devenv.inputs_add(&name, &url, &follows).await
+                devenv.inputs_add(&name, &url, &follows).await?;
+                CommandResult::Done
             }
         },
-        Commands::Changelogs {} => devenv.changelogs().await,
+        Commands::Changelogs {} => {
+            devenv.changelogs().await?;
+            CommandResult::Done
+        }
 
         // hidden
-        Commands::Assemble => devenv.assemble(false).await,
-        Commands::PrintDevEnv { json } => devenv.print_dev_env(json).await,
+        Commands::Assemble => {
+            devenv.assemble(false).await?;
+            CommandResult::Done
+        }
+        Commands::PrintDevEnv { json } => {
+            let output = devenv.print_dev_env(json).await?;
+            CommandResult::Print(output)
+        }
         Commands::GenerateJSONSchema => {
             config::write_json_schema()
                 .await
                 .wrap_err("Failed to generate JSON schema")?;
-            Ok(())
+            CommandResult::Done
         }
-        Commands::Mcp {} => {
+        Commands::Mcp { http } => {
             let config = devenv.config.read().await.clone();
-            devenv::mcp::run_mcp_server(config).await
+            devenv::mcp::run_mcp_server(config, http.map(|p| p.unwrap_or(8080))).await?;
+            CommandResult::Done
+        }
+        Commands::Lsp { print_config } => {
+            devenv::lsp::run(&devenv, print_config).await?;
+            CommandResult::Done
         }
         Commands::Direnvrc => unreachable!(),
         Commands::Version => unreachable!(),
-    }
+    };
+
+    Ok(result)
 }

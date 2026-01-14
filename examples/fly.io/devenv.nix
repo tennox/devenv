@@ -9,12 +9,14 @@ in
   packages = [ pythonPackages.flask ]
     ++ lib.optionals (!config.container.isBuilding) [ pkgs.flyctl ];
 
-  processes.serve.exec = "flask --app hello run";
+  processes.serve.exec = "exec flask --app hello run";
 
-  containers.processes.name = "simple-python-app";
-  containers.processes.registry = "docker://registry.fly.io/";
-  containers.processes.defaultCopyArgs = [
-    "--dest-creds"
-    "x:\"$(${pkgs.flyctl}/bin/flyctl auth token)\""
-  ];
+  containers.processes = {
+    name = "simple-python-app";
+    registry = "docker://registry.fly.io/";
+    defaultCopyArgs = [
+      "--dest-creds"
+      ''x:"$(${lib.getExe pkgs.flyctl}l auth token)"''
+    ];
+  };
 }

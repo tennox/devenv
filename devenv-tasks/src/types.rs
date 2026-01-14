@@ -5,37 +5,29 @@ use tokio::time::{Duration, Instant};
 /// Task type: oneshot (run once) or process (long-running)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum TaskType {
     /// Task runs once and completes (default)
+    #[default]
     Oneshot,
     /// Task is a long-running process
     Process,
 }
 
-impl Default for TaskType {
-    fn default() -> Self {
-        TaskType::Oneshot
-    }
-}
-
 /// Dependency kind: wait for ready state or completion
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum DependencyKind {
     /// Wait for task to be ready/healthy (default)
     /// - For oneshot tasks: wait for successful completion
     /// - For process tasks: wait for ProcessReady state
+    #[default]
     Ready,
     /// Wait for task to complete/shutdown
     /// - For oneshot tasks: same as Ready (wait for completion)
     /// - For process tasks: wait for process to shut down
     Complete,
-}
-
-impl Default for DependencyKind {
-    fn default() -> Self {
-        DependencyKind::Ready
-    }
 }
 
 /// Dependency specification with optional suffix
@@ -127,43 +119,6 @@ impl TasksStatus {
     }
 }
 
-/// Configuration for a single task
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct TaskConfig {
-    pub name: String,
-    pub after: Vec<String>,
-    pub before: Vec<String>,
-    pub command: Option<String>,
-    pub status: Option<String>,
-    pub exec_if_modified: Vec<String>,
-    pub inputs: Option<serde_json::Value>,
-    #[serde(default)]
-    pub show_output: bool,
-}
-
-/// Execution mode determining which tasks to run
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, clap::ValueEnum,
-)]
-pub enum RunMode {
-    /// Run only the specified task without dependencies
-    Single,
-    /// Run the specified task and all tasks that depend on it (downstream tasks)
-    After,
-    /// Run all dependency tasks first, then the specified task (upstream tasks)
-    Before,
-    /// Run the complete dependency graph (upstream and downstream tasks)
-    All,
-}
-
-/// Configuration for a complete task execution run
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct Config {
-    pub tasks: Vec<TaskConfig>,
-    pub roots: Vec<String>,
-    pub run_mode: RunMode,
-}
-
 /// Output data from tasks
 pub type TaskOutputs = serde_json::Value;
 
@@ -245,17 +200,6 @@ impl TaskCompleted {
             self,
             TaskCompleted::Failed(_, _) | TaskCompleted::DependencyFailed
         )
-    }
-
-    // TODO: use this everywhere instead of ad-hoc strings
-    pub fn to_tracing_status(&self) -> &'static str {
-        match self {
-            TaskCompleted::Success(_, _) => "success",
-            TaskCompleted::Skipped(_) => "skipped",
-            TaskCompleted::Failed(_, _) => "failed",
-            TaskCompleted::DependencyFailed => "dependency_failed",
-            TaskCompleted::Cancelled(_) => "cancelled",
-        }
     }
 }
 

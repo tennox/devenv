@@ -123,7 +123,7 @@ in
 
         # Fall back to the current config path if state file doesn't exist or doesn't contain a path
         if [ -z "$configFile" ]; then
-          configFile='${config.devenv.root}/${cfg.configPath}'
+          configFile='${config.devenv.root}/${cfg.configPath or ".pre-commit-config.yaml"}'
         fi
 
         # Only remove if it's a symlink to the nix store
@@ -154,6 +154,7 @@ in
         };
         "devenv:git-hooks:run" = {
           exec = "${packageBin.meta.mainProgram} run -a";
+          after = [ "devenv:git-hooks:install" ];
           before = [ "devenv:enterTest" ];
         };
       };

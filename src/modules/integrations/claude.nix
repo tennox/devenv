@@ -7,6 +7,30 @@
 let
   cfg = config.claude.code;
 
+  # Tool permissions submodule (reused for both rules and backward compat)
+  toolPermissionsSubmodule = lib.types.submodule {
+    options = {
+      allow = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        description = "List of allowed patterns.";
+      };
+      ask = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        description = "List of patterns that require user approval.";
+      };
+      deny = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        description = "List of denied patterns.";
+      };
+    };
+  };
+
+  # Reserved keys that are not tool names (for backward compat detection)
+  reservedPermissionKeys = [ "defaultMode" "disableBypassPermissionsMode" "additionalDirectories" "rules" ];
+
   # Build hooks configuration
   buildHooks =
     hookType: hooks:
@@ -57,6 +81,39 @@ let
   # Add pre-commit hook if git-hooks are enabled
   postToolUseHooks = (groupedHooks.PostToolUse or [ ]) ++ preCommitHook;
 
+  # Build permissions configuration
+  # Transforms per-tool permissions to Claude Code's flat format: Tool(pattern)
+  buildPermissions =
+    let
+      perms = cfg.permissions;
+      # Get direct tool attrs (backward compat: permissions.Bash instead of permissions.rules.Bash)
+      directToolAttrs = lib.filterAttrs (n: v: !builtins.elem n reservedPermissionKeys && builtins.isAttrs v) perms;
+      # Merge rules with direct tool attrs (rules take precedence)
+      toolPerms = directToolAttrs // perms.rules;
+      flattenTier = tier:
+        lib.flatten (
+          lib.mapAttrsToList
+            (tool: toolPerms:
+              map (pattern: "${tool}(${pattern})") (toolPerms.${tier} or [ ])
+            )
+            toolPerms
+        );
+      allowList = flattenTier "allow";
+      askList = flattenTier "ask";
+      denyList = flattenTier "deny";
+    in
+    if toolPerms == { } && perms.defaultMode == null && perms.disableBypassPermissionsMode == null && perms.additionalDirectories == [ ] then
+      null
+    else
+      lib.filterAttrs (n: v: v != null && v != [ ]) {
+        defaultMode = perms.defaultMode;
+        disableBypassPermissionsMode = perms.disableBypassPermissionsMode;
+        additionalDirectories = if perms.additionalDirectories == [ ] then null else perms.additionalDirectories;
+        allow = if allowList == [ ] then null else allowList;
+        ask = if askList == [ ] then null else askList;
+        deny = if denyList == [ ] then null else denyList;
+      };
+
   # Build MCP servers configuration
   mcpServers = lib.mapAttrs
     (name: server:
@@ -77,6 +134,8 @@ let
         else {
           type = "http";
           url = server.url;
+        } // lib.optionalAttrs (server.headers != { }) {
+          headers = server.headers;
         }
       else throw "Invalid MCP server type: ${server.type}"
     )
@@ -87,9 +146,16 @@ let
     hooks = lib.filterAttrs (n: v: v != null) {
       PreToolUse = buildHooks "PreToolUse" (groupedHooks.PreToolUse or [ ]);
       PostToolUse = buildHooks "PostToolUse" postToolUseHooks;
+      PostToolUseFailure = buildHooks "PostToolUseFailure" (groupedHooks.PostToolUseFailure or [ ]);
       Notification = buildHooks "Notification" (groupedHooks.Notification or [ ]);
+      UserPromptSubmit = buildHooks "UserPromptSubmit" (groupedHooks.UserPromptSubmit or [ ]);
+      SessionStart = buildHooks "SessionStart" (groupedHooks.SessionStart or [ ]);
+      SessionEnd = buildHooks "SessionEnd" (groupedHooks.SessionEnd or [ ]);
       Stop = buildHooks "Stop" (groupedHooks.Stop or [ ]);
+      SubagentStart = buildHooks "SubagentStart" (groupedHooks.SubagentStart or [ ]);
       SubagentStop = buildHooks "SubagentStop" (groupedHooks.SubagentStop or [ ]);
+      PreCompact = buildHooks "PreCompact" (groupedHooks.PreCompact or [ ]);
+      PermissionRequest = buildHooks "PermissionRequest" (groupedHooks.PermissionRequest or [ ]);
     };
     inherit (cfg)
       apiKeyHelper
@@ -98,7 +164,7 @@ let
       cleanupPeriodDays
       ;
     env = if cfg.env == { } then null else cfg.env;
-    permissions = if cfg.permissions == { } then null else cfg.permissions;
+    permissions = buildPermissions;
   };
 
   # Generate the MCP configuration content
@@ -127,18 +193,32 @@ in
               type = lib.types.enum [
                 "PreToolUse"
                 "PostToolUse"
+                "PostToolUseFailure"
                 "Notification"
+                "UserPromptSubmit"
+                "SessionStart"
+                "SessionEnd"
                 "Stop"
+                "SubagentStart"
                 "SubagentStop"
+                "PreCompact"
+                "PermissionRequest"
               ];
               default = "PostToolUse";
               description = ''
                 The type of hook:
                 - PreToolUse: Runs before tool calls (can block them)
                 - PostToolUse: Runs after tool calls complete
+                - PostToolUseFailure: Runs after a tool call fails
                 - Notification: Runs when Claude Code sends notifications
+                - UserPromptSubmit: Runs when user submits a prompt
+                - SessionStart: Runs when a Claude Code session starts
+                - SessionEnd: Runs when a Claude Code session ends
                 - Stop: Runs when Claude Code finishes responding
+                - SubagentStart: Runs when a subagent task starts
                 - SubagentStop: Runs when subagent tasks complete
+                - PreCompact: Runs before message compaction
+                - PermissionRequest: Runs when a permission is requested
               '';
             };
             matcher = lib.mkOption {
@@ -233,9 +313,26 @@ in
               default = [ ];
               description = "List of allowed tools for this sub-agent";
             };
+            model = lib.mkOption {
+              type = lib.types.nullOr (lib.types.enum [ "opus" "sonnet" "haiku" ]);
+              default = null;
+              description = "Override the model for this agent.";
+            };
             prompt = lib.mkOption {
               type = lib.types.lines;
               description = "The system prompt for the sub-agent";
+            };
+            permissionMode = lib.mkOption {
+              type = lib.types.nullOr (
+                lib.types.enum [
+                  "default"
+                  "acceptEdits"
+                  "plan"
+                  "bypassPermissions"
+                ]
+              );
+              default = null;
+              description = "Permission mode for this specific sub-agent.";
             };
           };
         }
@@ -245,7 +342,7 @@ in
         Custom Claude Code sub-agents to create in the project.
         Sub-agents are specialized AI assistants that handle specific tasks
         with their own context window and can be invoked automatically or explicitly.
-        
+
         For more details, see: https://docs.anthropic.com/en/docs/claude-code/sub-agents
       '';
       example = lib.literalExpression ''
@@ -253,7 +350,9 @@ in
           code-reviewer = {
             description = "Expert code review specialist that checks for quality, security, and best practices";
             proactive = true;
+            model = "opus";
             tools = [ "Read" "Grep" "TodoWrite" ];
+            permissionMode = "plan";
             prompt = '''
               You are an expert code reviewer. When reviewing code, check for:
               - Code readability and maintainability
@@ -261,11 +360,11 @@ in
               - Security vulnerabilities
               - Performance issues
               - Adherence to project conventions
-              
+
               Provide constructive feedback with specific suggestions for improvement.
             ''';
           };
-          
+
           test-writer = {
             description = "Specialized in writing comprehensive test suites";
             proactive = false;
@@ -336,34 +435,73 @@ in
     };
 
     permissions = lib.mkOption {
-      type = lib.types.attrsOf (
-        lib.types.submodule {
-          options = {
-            allow = lib.mkOption {
-              type = lib.types.listOf lib.types.str;
-              default = [ ];
-              description = "List of allowed tools or patterns.";
-            };
-            deny = lib.mkOption {
-              type = lib.types.listOf lib.types.str;
-              default = [ ];
-              description = "List of denied tools or patterns.";
-            };
+      type = lib.types.submodule {
+        freeformType = lib.types.attrsOf toolPermissionsSubmodule;
+        options = {
+          defaultMode = lib.mkOption {
+            type = lib.types.nullOr (
+              lib.types.enum [
+                "default"
+                "acceptEdits"
+                "plan"
+                "bypassPermissions"
+              ]
+            );
+            default = null;
+            description = ''
+              Global permission mode for Claude Code.
+              - default: Prompts on first use of each tool
+              - acceptEdits: Auto-accepts file edits
+              - plan: Read-only mode
+              - bypassPermissions: Skips all permission prompts
+            '';
+            example = "acceptEdits";
           };
-        }
-      );
+          disableBypassPermissionsMode = lib.mkOption {
+            type = lib.types.nullOr lib.types.bool;
+            default = null;
+            description = ''
+              Security option to prevent the dangerous bypassPermissions mode.
+            '';
+            example = true;
+          };
+          additionalDirectories = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            default = [ ];
+            description = ''
+              Allow Claude Code to access directories outside the project root.
+            '';
+            example = [ "/shared/libs" "/common/configs" ];
+          };
+          rules = lib.mkOption {
+            type = lib.types.attrsOf toolPermissionsSubmodule;
+            default = { };
+            description = ''
+              Per-tool permission rules. Preferred location for tool permissions.
+            '';
+          };
+        };
+      };
       default = { };
       description = ''
         Fine-grained permissions for tool usage.
-        Can specify allow/deny rules for different tools.
+        Supports global settings and per-tool allow/ask/deny rules.
+        Tool rules can be placed under `rules` or directly (backward compatible).
       '';
       example = lib.literalExpression ''
         {
-          Edit = {
-            deny = [ "*.secret" "*.env" ];
-          };
-          Bash = {
-            deny = [ "rm -rf" ];
+          defaultMode = "acceptEdits";
+          disableBypassPermissionsMode = true;
+          additionalDirectories = [ "/shared/libs" ];
+          rules = {
+            Edit = {
+              deny = [ "*.secret" "*.env" ];
+            };
+            Bash = {
+              allow = [ "ls:*" "cat:*" ];
+              ask = [ "git:*" "npm:*" ];
+              deny = [ "rm -rf:*" "sudo:*" ];
+            };
           };
         }
       '';
@@ -397,10 +535,20 @@ in
               default = null;
               description = "URL for HTTP MCP servers.";
             };
+            headers = lib.mkOption {
+              type = lib.types.attrsOf lib.types.str;
+              default = { };
+              description = "HTTP headers for HTTP MCP servers (e.g., for authentication).";
+            };
           };
         }
       );
-      default = { };
+      default = {
+        "mcp.devenv.sh" = {
+          type = "http";
+          url = "https://mcp.devenv.sh";
+        };
+      };
       description = ''
         MCP (Model Context Protocol) servers to configure.
         These servers provide additional capabilities and context to Claude Code.
@@ -412,6 +560,13 @@ in
             command = lib.getExe pkgs.awslabs-iam-mcp-server;
             args = [ ];
             env = { };
+          };
+          github = {
+            type = "http";
+            url = "https://api.githubcopilot.com/mcp/";
+            headers = {
+              Authorization = "Bearer GITHUB_PAT";
+            };
           };
           linear = {
             type = "http";
@@ -469,6 +624,8 @@ in
               description: ${agent.description}
               proactive: ${lib.boolToString agent.proactive}
               ${lib.optionalString (agent.tools != []) "tools:\n${lib.concatMapStringsSep "\n" (tool: "  - ${tool}") agent.tools}"}
+              ${lib.optionalString (agent.model != null) "model: ${agent.model}"}
+              ${lib.optionalString (agent.permissionMode != null) "permissionMode: ${agent.permissionMode}"}
               ---
 
               ${agent.prompt}

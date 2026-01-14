@@ -1,3 +1,4 @@
+use crate::tracing as devenv_tracing;
 use clap::{Parser, Subcommand, crate_version};
 use devenv_core::GlobalOptions;
 use devenv_tasks::RunMode;
@@ -26,6 +27,16 @@ impl Cli {
         let mut cli = Self::parse();
         cli.global_options.resolve_overrides();
         cli
+    }
+
+    pub fn get_log_level(&self) -> devenv_tracing::Level {
+        if self.global_options.verbose {
+            devenv_tracing::Level::Debug
+        } else if self.global_options.quiet {
+            devenv_tracing::Level::Silent
+        } else {
+            devenv_tracing::Level::default()
+        }
     }
 }
 
@@ -102,23 +113,8 @@ pub enum Commands {
     },
 
     Container {
-        #[arg(short, long)]
-        registry: Option<String>,
-
-        #[arg(long, hide = true)]
-        copy: bool,
-
-        #[arg(long, hide = true)]
-        docker_run: bool,
-
-        #[arg(long)]
-        copy_args: Vec<String>,
-
-        #[arg(hide = true)]
-        name: Option<String>,
-
         #[command(subcommand)]
-        command: Option<ContainerCommand>,
+        command: ContainerCommand,
     },
 
     Inputs {
@@ -139,6 +135,12 @@ pub enum Commands {
 
     #[command(about = "Build any attribute in devenv.nix.")]
     Build {
+        #[arg(num_args=1..)]
+        attributes: Vec<String>,
+    },
+
+    #[command(about = "Evaluate any attribute in devenv.nix and return JSON.")]
+    Eval {
         #[arg(num_args=1..)]
         attributes: Vec<String>,
     },
@@ -165,7 +167,21 @@ pub enum Commands {
     GenerateJSONSchema,
 
     #[command(about = "Launch Model Context Protocol server for AI assistants")]
-    Mcp {},
+    Mcp {
+        #[arg(
+            long,
+            help = "Run as HTTP server instead of stdio. Optionally specify port (default: 8080)"
+        )]
+        http: Option<Option<u16>>,
+    },
+
+    #[command(
+        about = "Start the nixd language server for devenv.nix. https://devenv.sh/editor-support/"
+    )]
+    Lsp {
+        #[arg(long, help = "Print nixd configuration and exit")]
+        print_config: bool,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -220,10 +236,23 @@ pub enum ContainerCommand {
     Build { name: String },
 
     #[command(about = "Copy a container to registry.")]
-    Copy { name: String },
+    Copy {
+        name: String,
+
+        #[arg(long)]
+        copy_args: Vec<String>,
+
+        #[arg(short, long)]
+        registry: Option<String>,
+    },
 
     #[command(about = "Run a container.")]
-    Run { name: String },
+    Run {
+        name: String,
+
+        #[arg(long)]
+        copy_args: Vec<String>,
+    },
 }
 
 #[derive(Subcommand, Clone)]

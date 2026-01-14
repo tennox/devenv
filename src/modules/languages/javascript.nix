@@ -169,7 +169,7 @@ let
         then
           echo "$ACTUAL_BUN_CHECKSUM" > "$BUN_CHECKSUM_FILE"
 
-          if -f "${cfg.directory}/yarn.lock"
+          if [ -f "${cfg.directory}/yarn.lock" ]
           then
             echo "yarn.lock is no longer needed when using bun."
             echo "Starting with Bun 1.2, bun uses its own lockfile (bun.lock)."
@@ -305,6 +305,16 @@ in
       };
       install.enable = lib.mkEnableOption "bun install during devenv initialisation";
     };
+
+    lsp = {
+      enable = lib.mkEnableOption "TypeScript Language Server for JavaScript" // { default = true; };
+      package = lib.mkOption {
+        type = lib.types.package;
+        default = pkgs.typescript-language-server;
+        defaultText = lib.literalExpression "pkgs.typescript-language-server";
+        description = "The TypeScript/JavaScript language server package to use.";
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -321,7 +331,8 @@ in
           mkdir -p $out/bin
           ${cfg.package}/bin/corepack enable --install-directory $out/bin
         ''
-      );
+      )
+      ++ lib.optional cfg.lsp.enable cfg.lsp.package;
 
     enterShell = lib.concatStringsSep "\n" (
       (lib.optional cfg.npm.install.enable ''

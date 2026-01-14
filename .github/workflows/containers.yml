@@ -45,7 +45,7 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
+          username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract metadata (tags, labels) for Docker
@@ -112,7 +112,7 @@ jobs:
 
       - name: Log in to the Container registry
         run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | nix run nixpkgs#skopeo -- login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+          echo "${{ secrets.GITHUB_TOKEN }}" | nix run nixpkgs#skopeo -- login ${{ env.REGISTRY }} -u ${{ github.repository_owner }} --password-stdin
 
       - name: Push image by digest
         id: push
@@ -121,7 +121,7 @@ jobs:
           IMAGE_NAME="${{ env.REGISTRY }}/${{ env.REPOSITORY }}/devenv"
 
           # Get the digest from the tarball
-          DIGEST=$(nix run nixpkgs#skopeo -- inspect "tarball:${IMAGE_PATH}" --format '{{.Digest}}')
+          DIGEST=$(nix run nixpkgs#skopeo -- inspect "docker-archive:${IMAGE_PATH}" --format '{{.Digest}}')
           echo "Image digest: $DIGEST"
 
           # Save digest for manifest creation
@@ -129,7 +129,7 @@ jobs:
           echo "$DIGEST" > "/tmp/digests/${{ matrix.arch }}.digest"
 
           # Push directly to digest reference without creating any tags
-          nix run nixpkgs#skopeo -- copy --preserve-digests "tarball:${IMAGE_PATH}" "docker://${IMAGE_NAME}@${DIGEST}"
+          nix run nixpkgs#skopeo -- copy --preserve-digests "docker-archive:${IMAGE_PATH}" "docker://${IMAGE_NAME}@${DIGEST}"
 
           echo "Pushed image to ${IMAGE_NAME}@${DIGEST}"
           echo "digest=$DIGEST" >> $GITHUB_OUTPUT
@@ -158,7 +158,7 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
+          username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx

@@ -210,21 +210,30 @@ in
         description = "Runs when entering the shell";
         exec = ''
           mkdir -p "$DEVENV_DOTFILE" || { echo "Failed to create $DEVENV_DOTFILE"; exit 1; }
-          echo "$DEVENV_TASK_ENV" | install -m 755 /dev/stdin "$DEVENV_DOTFILE/load-exports"
+          # Remove first in case file is owned by another user (chmod would fail otherwise)
+          rm -f "$DEVENV_DOTFILE/load-exports" 2>/dev/null || true
+          echo "$DEVENV_TASK_ENV" > "$DEVENV_DOTFILE/load-exports"
+          chmod +x "$DEVENV_DOTFILE/load-exports"
         '';
       };
       "devenv:enterTest" = {
         description = "Runs when entering the test environment";
+        after = [ "devenv:enterShell" ];
       };
     };
     enterShell = ''
-      ${config.task.package}/bin/devenv-tasks run devenv:enterShell --mode all || exit $?
+      if [ -z "''${DEVENV_SKIP_TASKS:-}" ]; then
+        ${config.task.package}/bin/devenv-tasks run devenv:enterShell --mode all || exit $?
+        if [ -f "$DEVENV_DOTFILE/load-exports" ]; then
+          source "$DEVENV_DOTFILE/load-exports"
+        fi
+      fi
+    '';
+    enterTest = lib.mkBefore ''
+      ${config.task.package}/bin/devenv-tasks run devenv:enterTest --mode all || exit $?
       if [ -f "$DEVENV_DOTFILE/load-exports" ]; then
         source "$DEVENV_DOTFILE/load-exports"
       fi
-    '';
-    enterTest = ''
-      ${config.task.package}/bin/devenv-tasks run devenv:enterTest --mode all || exit $?
     '';
   };
 }
