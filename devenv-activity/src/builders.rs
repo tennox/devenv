@@ -7,7 +7,8 @@ use tracing::{Level, Span, span};
 use crate::Timestamp;
 use crate::activity::{Activity, ActivityType};
 use crate::events::{
-    ActivityEvent, ActivityLevel, Build, Command, Evaluate, Fetch, FetchKind, Operation, Task,
+    ActivityEvent, ActivityLevel, Build, Command, Evaluate, Fetch, FetchKind, Operation, Process,
+    Task,
 };
 use crate::stack::{current_activity_id, current_activity_level, send_activity_event};
 
@@ -15,7 +16,7 @@ static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Generate a new activity ID.
 /// Uses high bit to distinguish from Nix-generated IDs.
-fn next_id() -> u64 {
+pub fn next_id() -> u64 {
     ID_COUNTER.fetch_add(1, Ordering::Relaxed) | (1 << 63)
 }
 
@@ -241,50 +242,20 @@ impl EvaluateBuilder {
 
 /// Builder for Task activities
 pub struct TaskBuilder {
-    name: String,
-    detail: Option<String>,
-    show_output: bool,
-    is_process: bool,
     id: Option<u64>,
-    parent: Option<Option<u64>>,
     level: Option<ActivityLevel>,
 }
 
 impl TaskBuilder {
-    pub(crate) fn new(name: impl Into<String>) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            name: name.into(),
-            detail: None,
-            show_output: false,
-            is_process: false,
             id: None,
-            parent: None,
             level: None,
         }
     }
 
-    pub fn detail(mut self, detail: impl Into<String>) -> Self {
-        self.detail = Some(detail.into());
-        self
-    }
-
-    pub fn show_output(mut self, show_output: bool) -> Self {
-        self.show_output = show_output;
-        self
-    }
-
-    pub fn is_process(mut self, is_process: bool) -> Self {
-        self.is_process = is_process;
-        self
-    }
-
     pub fn id(mut self, id: u64) -> Self {
         self.id = Some(id);
-        self
-    }
-
-    pub fn parent(mut self, parent: Option<u64>) -> Self {
-        self.parent = Some(parent);
         self
     }
 
@@ -295,7 +266,6 @@ impl TaskBuilder {
 
     pub fn start(self) -> Activity {
         let id = self.id.unwrap_or_else(next_id);
-        let parent = self.parent.unwrap_or_else(current_activity_id);
         // Inherit level from parent if not explicitly set
         let level = self
             .level
@@ -306,11 +276,6 @@ impl TaskBuilder {
 
         send_activity_event(ActivityEvent::Task(Task::Start {
             id,
-            name: self.name.clone(),
-            parent,
-            detail: self.detail,
-            show_output: self.show_output,
-            is_process: self.is_process,
             timestamp: Timestamp::now(),
         }));
 
@@ -378,6 +343,81 @@ impl CommandBuilder {
         }));
 
         Activity::new(span, id, ActivityType::Command, level)
+    }
+}
+
+/// Builder for Process activities (long-running managed processes)
+pub struct ProcessBuilder {
+    name: String,
+    command: Option<String>,
+    ports: Vec<String>,
+    ready_probe: Option<String>,
+    id: Option<u64>,
+    parent: Option<Option<u64>>,
+    level: ActivityLevel,
+}
+
+impl ProcessBuilder {
+    pub(crate) fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            command: None,
+            ports: Vec::new(),
+            ready_probe: None,
+            id: None,
+            parent: None,
+            level: ActivityLevel::default(),
+        }
+    }
+
+    pub fn command(mut self, cmd: impl Into<String>) -> Self {
+        self.command = Some(cmd.into());
+        self
+    }
+
+    pub fn ports(mut self, ports: Vec<String>) -> Self {
+        self.ports = ports;
+        self
+    }
+
+    pub fn ready_probe(mut self, probe: impl Into<String>) -> Self {
+        self.ready_probe = Some(probe.into());
+        self
+    }
+
+    pub fn id(mut self, id: u64) -> Self {
+        self.id = Some(id);
+        self
+    }
+
+    pub fn parent(mut self, parent: Option<u64>) -> Self {
+        self.parent = Some(parent);
+        self
+    }
+
+    pub fn level(mut self, level: ActivityLevel) -> Self {
+        self.level = level;
+        self
+    }
+
+    pub fn start(self) -> Activity {
+        let id = self.id.unwrap_or_else(next_id);
+        let parent = self.parent.unwrap_or_else(current_activity_id);
+
+        let span = create_span(id, self.level);
+
+        send_activity_event(ActivityEvent::Process(Process::Start {
+            id,
+            name: self.name.clone(),
+            parent,
+            command: self.command,
+            ports: self.ports,
+            ready_probe: self.ready_probe,
+            level: self.level,
+            timestamp: Timestamp::now(),
+        }));
+
+        Activity::new(span, id, ActivityType::Process, self.level)
     }
 }
 

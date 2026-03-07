@@ -4,11 +4,33 @@
 //! such as the traditional C++ Nix binary or alternative implementations like Snix.
 
 use async_trait::async_trait;
-use devenv_eval_cache::Output;
 use miette::Result;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::config::Input;
 use crate::nix_args::NixArgs;
+
+/// Output of dev_env evaluation.
+#[derive(Debug, Clone, Default)]
+pub struct DevEnvOutput {
+    /// The bash environment script.
+    pub bash_env: Vec<u8>,
+    /// File paths that the evaluation depends on (for direnv to watch).
+    pub inputs: Vec<PathBuf>,
+}
+
+/// Package search result from nixpkgs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackageSearchResult {
+    pub pname: String,
+    pub version: String,
+    pub description: String,
+}
+
+/// Result type for package search operations.
+pub type SearchResults = BTreeMap<String, PackageSearchResult>;
 
 /// Common paths used by devenv backends
 #[derive(Debug, Clone)]
@@ -30,6 +52,8 @@ pub struct Options {
     pub cache_output: bool,
     /// Force a refresh of the cached output.
     pub refresh_cached_output: bool,
+    /// Maximum number of results to return (for search). None means unlimited.
+    pub max_results: Option<usize>,
     /// Extra flags to pass to nix commands.
     pub nix_flags: &'static [&'static str],
 }
@@ -41,6 +65,7 @@ impl Default for Options {
             bail_on_error: true,
             cache_output: false,
             refresh_cached_output: false,
+            max_results: Some(100),
             nix_flags: &[
                 "--show-trace",
                 "--extra-experimental-features",
@@ -62,13 +87,23 @@ impl Default for Options {
 /// Trait defining the interface for Nix evaluation backends
 #[async_trait(?Send)]
 pub trait NixBackend: Send + Sync {
+    /// Compute a content fingerprint from the lock file's inputs' narHashes.
+    ///
+    /// This is used for eval-cache invalidation when local inputs change.
+    /// Unlike the serialized lock file, this includes narHashes for path inputs
+    /// which are normally stripped when writing to disk.
+    ///
+    /// Returns a hex-encoded BLAKE3 hash of the combined narHashes.
+    /// Must be called before `assemble()` to include in NixArgs.
+    async fn lock_fingerprint(&self) -> Result<String>;
+
     /// Initialize and assemble the backend
     ///
     /// The args parameter contains all context needed for backend-specific file generation
     async fn assemble(&self, args: &NixArgs<'_>) -> Result<()>;
 
     /// Get the development environment
-    async fn dev_env(&self, json: bool, gc_root: &Path) -> Result<Output>;
+    async fn dev_env(&self, json: bool, gc_root: &Path) -> Result<DevEnvOutput>;
 
     /// Open a Nix REPL
     async fn repl(&self) -> Result<()>;
@@ -85,13 +120,21 @@ pub trait NixBackend: Send + Sync {
     async fn eval(&self, attributes: &[&str]) -> Result<String>;
 
     /// Update flake inputs
-    async fn update(&self, input_name: &Option<String>) -> Result<()>;
+    ///
+    /// `override_inputs` contains name/URL pairs (alternating elements) that override
+    /// specific inputs during locking, even if the lock file is otherwise up-to-date.
+    async fn update(
+        &self,
+        input_name: &Option<String>,
+        inputs: &BTreeMap<String, Input>,
+        override_inputs: &[String],
+    ) -> Result<()>;
 
     /// Get flake metadata
     async fn metadata(&self) -> Result<String>;
 
     /// Search for packages
-    async fn search(&self, name: &str, options: Option<Options>) -> Result<Output>;
+    async fn search(&self, name: &str, options: Option<Options>) -> Result<SearchResults>;
 
     /// Garbage collect the specified paths
     /// Returns (paths_deleted, bytes_freed)
@@ -105,4 +148,10 @@ pub trait NixBackend: Send + Sync {
 
     /// Check if the current user is a trusted user of the Nix store
     async fn is_trusted_user(&self) -> Result<bool>;
+
+    /// Invalidate cached state for hot-reload.
+    ///
+    /// This clears any cached evaluation state to force re-evaluation on the next operation.
+    /// Used by hot-reload to ensure file changes are picked up.
+    fn invalidate(&self);
 }

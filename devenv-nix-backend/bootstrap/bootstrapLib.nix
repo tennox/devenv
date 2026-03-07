@@ -23,6 +23,7 @@ rec {
   # This is the full-featured version used by default.nix
   mkDevenvForSystem =
     { version
+    , is_development_version ? false
     , system
     , devenv_root
     , git_root ? null
@@ -30,6 +31,7 @@ rec {
     , devenv_dotfile_path
     , devenv_tmpdir
     , devenv_runtime
+    , devenv_state ? null
     , devenv_istesting ? false
     , devenv_direnvrc_latest_version
     , container_name ? null
@@ -39,45 +41,52 @@ rec {
     , cli_options ? [ ]
     , skip_local_src ? false
     , secretspec ? null
-    , devenv_config ? { }
+    , devenv_inputs ? { }
+    , devenv_imports ? [ ]
+    , impure ? false
     , nixpkgs_config ? { }
+    , lock_fingerprint ? null
+    , primops ? { }
     }:
     let
       inherit (inputs) nixpkgs;
       lib = nixpkgs.lib;
       targetSystem = system;
 
-      # devenv configuration is passed from the Rust backend
-      overlays = lib.flatten (lib.mapAttrsToList getOverlays (devenv_config.inputs or { }));
+      overlays = lib.flatten (lib.mapAttrsToList getOverlays devenv_inputs);
 
       # Helper to create pkgs for a given system with nixpkgs_config
-      mkPkgsForSystem = evalSystem: import nixpkgs {
-        system = evalSystem;
-        config = nixpkgs_config // {
-          allowUnfreePredicate =
-            if nixpkgs_config.allowUnfree or false then
-              (_: true)
-            else if (nixpkgs_config.permittedUnfreePackages or [ ]) != [ ] then
-              (pkg: builtins.elem (lib.getName pkg) (nixpkgs_config.permittedUnfreePackages or [ ]))
-            else
-              (_: false);
+      mkPkgsForSystem =
+        evalSystem:
+        import nixpkgs {
+          system = evalSystem;
+          config = nixpkgs_config // {
+            allowUnfreePredicate =
+              if nixpkgs_config.allowUnfree or false then
+                (_: true)
+              else if (nixpkgs_config.permittedUnfreePackages or [ ]) != [ ] then
+                (pkg: builtins.elem (lib.getName pkg) (nixpkgs_config.permittedUnfreePackages or [ ]))
+              else
+                (_: false);
+          };
+          inherit overlays;
         };
-        inherit overlays;
-      };
 
       pkgsBootstrap = mkPkgsForSystem targetSystem;
 
       # Helper to import a path, trying .nix first then /devenv.nix
+      # Returns a list of modules, including devenv.local.nix when present
       tryImport =
         resolvedPath: basePath:
         if lib.hasSuffix ".nix" basePath then
-          import resolvedPath
+          [ (import resolvedPath) ]
         else
           let
             devenvpath = resolvedPath + "/devenv.nix";
+            localpath = resolvedPath + "/devenv.local.nix";
           in
           if builtins.pathExists devenvpath then
-            import devenvpath
+            [ (import devenvpath) ] ++ lib.optional (builtins.pathExists localpath) (import localpath)
           else
             throw (basePath + "/devenv.nix file does not exist");
 
@@ -112,70 +121,86 @@ rec {
           tryImport devenvpath path;
 
       # Common modules shared between main evaluation and cross-system evaluation
-      mkCommonModules = evalPkgs: [
-        (
-          { config, ... }:
-          {
-            _module.args.pkgs = evalPkgs.appendOverlays (config.overlays or [ ]);
-          }
-        )
-        (inputs.devenv.modules + /top-level.nix)
-        (
-          { options, ... }:
-          {
-            config.devenv = lib.mkMerge [
-              {
-                cliVersion = version;
-                root = devenv_root;
-                dotfile = devenv_dotfile;
-              }
-              (lib.optionalAttrs (builtins.hasAttr "tmpdir" options.devenv) {
-                tmpdir = devenv_tmpdir;
-              })
-              (lib.optionalAttrs (builtins.hasAttr "isTesting" options.devenv) {
-                isTesting = devenv_istesting;
-              })
-              (lib.optionalAttrs (builtins.hasAttr "runtime" options.devenv) {
-                runtime = devenv_runtime;
-              })
-              (lib.optionalAttrs (builtins.hasAttr "direnvrcLatestVersion" options.devenv) {
-                direnvrcLatestVersion = devenv_direnvrc_latest_version;
-              })
-            ];
-          }
-        )
-        (
-          { options, ... }:
-          {
-            config = lib.mkMerge [
-              (lib.optionalAttrs (builtins.hasAttr "git" options) {
-                git.root = git_root;
-              })
-            ];
-          }
-        )
-        (lib.optionalAttrs (container_name != null) {
-          container.isBuilding = lib.mkForce true;
-          containers.${container_name}.isBuilding = true;
-        })
-      ]
-      ++ (map importModule (devenv_config.imports or [ ]))
-      ++ (if !skip_local_src then [
-        (importModule (devenv_root + "/devenv.nix"))
-      ] else [ ])
-      ++ [
-        (devenv_config.devenv or { })
-        (
-          let localPath = devenv_root + "/devenv.local.nix"; in
-          if builtins.pathExists localPath then import localPath else { }
-        )
-        cli_options
-      ];
+      mkCommonModules =
+        evalPkgs:
+        [
+          (
+            { config, ... }:
+            {
+              _module.args.pkgs = evalPkgs.appendOverlays (config.overlays or [ ]);
+              _module.args.secretspec = secretspec;
+              _module.args.devenvPrimops = primops;
+            }
+          )
+          (inputs.devenv.modules + /top-level.nix)
+          (
+            { options, ... }:
+            {
+              config.devenv = lib.mkMerge [
+                {
+                  root = devenv_root;
+                  dotfile = devenv_dotfile;
+                }
+                (
+                  if builtins.hasAttr "cli" options.devenv then
+                    {
+                      cli.version = version;
+                      cli.isDevelopment = is_development_version;
+                    }
+                  else
+                    {
+                      cliVersion = version;
+                    }
+                )
+                (lib.optionalAttrs (builtins.hasAttr "tmpdir" options.devenv) {
+                  tmpdir = devenv_tmpdir;
+                })
+                (lib.optionalAttrs (builtins.hasAttr "isTesting" options.devenv) {
+                  isTesting = devenv_istesting;
+                })
+                (lib.optionalAttrs (builtins.hasAttr "runtime" options.devenv) {
+                  runtime = devenv_runtime;
+                })
+                (lib.optionalAttrs (builtins.hasAttr "state" options.devenv && devenv_state != null) {
+                  state = lib.mkForce devenv_state;
+                })
+                (lib.optionalAttrs (builtins.hasAttr "direnvrcLatestVersion" options.devenv) {
+                  direnvrcLatestVersion = devenv_direnvrc_latest_version;
+                })
+              ];
+            }
+          )
+          (
+            { options, ... }:
+            {
+              config = lib.mkMerge [
+                (lib.optionalAttrs (builtins.hasAttr "git" options) {
+                  git.root = git_root;
+                })
+              ];
+            }
+          )
+          (lib.optionalAttrs (container_name != null) {
+            container.isBuilding = lib.mkForce true;
+            containers.${container_name}.isBuilding = true;
+          })
+        ]
+        ++ (lib.flatten (map importModule devenv_imports))
+        ++ (if !skip_local_src then (importModule (devenv_root + "/devenv.nix")) else [ ])
+        ++ [
+          (
+            let
+              localPath = devenv_root + "/devenv.local.nix";
+            in
+            if builtins.pathExists localPath then import localPath else { }
+          )
+          cli_options
+        ];
 
       # Phase 1: Base evaluation to extract profile definitions
       baseProject = lib.evalModules {
         specialArgs = inputs // {
-          inherit inputs secretspec;
+          inherit inputs secretspec primops;
         };
         modules = mkCommonModules pkgsBootstrap;
       };
@@ -427,17 +452,20 @@ rec {
           options;
 
       # Helper to evaluate devenv for a specific system (for cross-compilation, e.g. macOS building Linux containers)
-      evalForSystem = evalSystem:
+      evalForSystem =
+        evalSystem:
         let
           evalPkgs = mkPkgsForSystem evalSystem;
           evalProject = lib.evalModules {
             specialArgs = inputs // {
-              inherit inputs secretspec;
+              inherit inputs secretspec primops;
             };
             modules = mkCommonModules evalPkgs;
           };
         in
-        { config = evalProject.config; };
+        {
+          config = evalProject.config;
+        };
 
       # All supported systems for cross-compilation (lazily evaluated)
       allSystems = [
@@ -448,10 +476,8 @@ rec {
       ];
 
       # Generate perSystem entries for all systems (only evaluated when accessed)
-      perSystemConfigs = lib.genAttrs allSystems (perSystem:
-        if perSystem == targetSystem
-        then { config = config; }
-        else evalForSystem perSystem
+      perSystemConfigs = lib.genAttrs allSystems (
+        perSystem: if perSystem == targetSystem then { config = config; } else evalForSystem perSystem
       );
     in
     {
@@ -516,9 +542,12 @@ rec {
             secretspec = null;
           };
           modules = [
-            ({ config, ... }: {
-              _module.args.pkgs = pkgs.appendOverlays (config.overlays or [ ]);
-            })
+            (
+              { config, ... }:
+              {
+                _module.args.pkgs = pkgs.appendOverlays (config.overlays or [ ]);
+              }
+            )
             (devenv.outPath + "/src/modules/top-level.nix")
             (import devenvPath)
           ];

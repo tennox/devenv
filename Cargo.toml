@@ -7,10 +7,13 @@ members = [
   "devenv-cache-core",
   "devenv-core",
   "devenv-eval-cache",
-  "devenv-generate",
+  "devenv-event-sources",
   "devenv-nix-backend",
   "devenv-nix-backend-macros",
+  "devenv-processes",
+  "devenv-reload",
   "devenv-run-tests",
+  "devenv-shell",
   "devenv-snix-backend",
   "devenv-tasks",
   "devenv-tui",
@@ -20,7 +23,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2.0.0"
+version = "2.0.3"
 edition = "2024"
 license = "APACHE-2.0"
 homepage = "https://devenv.sh/"
@@ -32,12 +35,16 @@ devenv-activity = { path = "devenv-activity" }
 devenv-activity-macros = { path = "devenv-activity-macros" }
 devenv-core = { path = "devenv-core" }
 devenv-eval-cache = { path = "devenv-eval-cache" }
+devenv-event-sources = { path = "devenv-event-sources" }
+devenv-processes = { path = "devenv-processes" }
 devenv-run-tests = { path = "devenv-run-tests" }
 devenv-snix-backend = { path = "devenv-snix-backend" }
 devenv-nix-backend = { path = "devenv-nix-backend" }
 devenv-nix-backend-macros = { path = "devenv-nix-backend-macros" }
 devenv-tasks = { path = "devenv-tasks" }
 devenv-tui = { path = "devenv-tui" }
+devenv-reload = { path = "devenv-reload" }
+devenv-shell = { path = "devenv-shell" }
 devenv-cache-core = { path = "devenv-cache-core" }
 nix-conf-parser = { path = "nix-conf-parser" }
 tokio-shutdown = { path = "tokio-shutdown" }
@@ -51,14 +58,21 @@ nix-bindings-fetchers = { git = "https://github.com/cachix/nix-bindings-rust.git
 nix-cmd = { git = "https://github.com/cachix/nix-bindings-rust.git", branch = "for-upstream" }
 nix-bindings-bindgen-raw = { git = "https://github.com/cachix/nix-bindings-rust.git", branch = "for-upstream" }
 
+avt = "0.17"
+base64 = "0.22"
 anyhow = "1.0.92"
 ansiterm = "0.12.2"
 astral-tokio-tar = "0.5.6"
+async-priority-channel = "0.2.0"
 async-trait = "0.1"
 binaryornot = "1.0.0"
 blake3 = "1.8.2"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5.48", features = ["derive", "cargo", "env"] }
+clap_complete = { version = "4.5.58", features = ["unstable-dynamic"] }
+clap_mangen = "0.2.29"
+cstr = "0.2"
+daemonize = "0.5"
 cli-table = "0.5.0"
 console = "0.16.1"
 dotlock = "0.5.0"
@@ -74,34 +88,38 @@ indoc = "2.0.6"
 lazy_static = "1.5.0"
 pathdiff = "0.2.3"
 miette = { version = "7.6.0", features = ["fancy"] }
-nix = { version = "0.30.1", features = ["signal", "process"] }
+nix = { version = "0.31", features = ["fs", "process", "signal"] }
 num_enum = "0.7"
 once_cell = "1.21.3"
 petgraph = "0.8.2"
 pretty_assertions = { version = "1.4.1", features = ["unstable"] }
-rand = "0.8.5"
+netstat2 = "0.11"
+rand = "0.10"
 regex = "1.11.3"
 schemars = "1.0.4"
-schematic = { version = "0.18.12", features = [
+schematic = { version = "0.19", features = [
   "schema",
   "yaml",
   "renderer_template",
   "renderer_json_schema",
 ] }
 secrecy = "0.10"
-secretspec = { git = "https://github.com/cachix/secretspec", tag = "v0.5.0" }
+# https://github.com/mikaelmello/inquire/pull/330
+secretspec = { git = "https://github.com/cachix/secretspec", tag = "v0.7.2" }
 serde = { version = "1.0.226", features = ["derive"] }
 serde_json = "1.0.145"
 serde_repr = "0.1.20"
 serde_with = "3"
 serde_yaml = "0.9.34"
-ser_nix = { git = "https://github.com/cachix/ser_nix", branch = "support-paths" }
+ser_nix = "0.2.2"
 similar = "2.7.0"
 sha2 = "0.10.9"
+shell-escape = "0.1.5"
 sqlx = { version = "0.8.6", features = ["time", "sqlite", "runtime-tokio"] }
-strum = { version = "0.27", features = ["derive"] }
+strum = { version = "0.28", features = ["derive"] }
 tempfile = "3.23.0"
-termimad = "0.30.0"
+termimad = "0.34"
+tokio-test = "0.4"
 thiserror = "2.0.16"
 tracing = { version = "0.1.41", features = ["valuable"] }
 tracing-subscriber = { version = "0.3.20", features = [
@@ -111,8 +129,6 @@ tracing-subscriber = { version = "0.3.20", features = [
 ] }
 valuable = { version = "0.1", features = ["derive"] }
 json-subscriber = { version = "0.2.6" }
-tracing-indicatif = "=0.3.9"
-indicatif = "0.17.11"
 tokio = { version = "1.47.1", features = [
   "process",
   "fs",
@@ -126,20 +142,39 @@ tokio-util = { version = "0.7.16", features = ["io"] }
 tokio-stream = "0.1"
 uuid = { version = "1.18", features = ["v4"] }
 which = "8.0.0"
-whoami = "1.6.1"
+whoami = "2.1.1"
 xdg = "3.0.0"
 walkdir = "2.5"
 url = "2"
+human-repr = "1.1"
+insta = { version = "1.40", features = ["filters", "json"] }
+watchexec = "8.2"
+watchexec-filterer-globset = "8.0"
+watchexec-supervisor = "5.1"
+signal-hook = "0.4"
+signal-hook-tokio = { version = "0.4", features = ["futures-v0_3"] }
+socket2 = "0.6"
+ctrlc = "3.4"
+process-wrap = { version = "9.0", features = ["tokio1"] }
+portable-pty = "0.9.0"
+vergen-gitcl = "9.0"
+ignore = "0.4.23"
+proptest = "1.8"
+libc = "0.2"
+proc-macro2 = "1.0"
+quote = "1.0"
+syn = { version = "2.0", features = ["full", "parsing", "extra-traits"] }
 
 reqwest = { version = "0.13", features = ["json", "query", "stream"] }
-shell-escape = "0.1.5"
-rmcp = { version = "0.7", features = [
+axum = "0.8"
+caps = "0.5"
+rmcp = { version = "1.1", features = [
   "server",
   "transport-io",
   "transport-streamable-http-server",
 ] }
-axum = "0.8"
-rmcp-macros = "0.7"
+rmcp-macros = "1.1"
+sd-notify = "0.4"
 
 # Optional snix dependencies
 snix-eval = { git = "https://github.com/cachix/snix", rev = "50b41ae7e05b423a7525b4dda53d372a71931506" }
@@ -150,17 +185,34 @@ snix-build = { git = "https://github.com/cachix/snix", rev = "50b41ae7e05b423a75
 nix-compat = { git = "https://github.com/cachix/snix", rev = "50b41ae7e05b423a7525b4dda53d372a71931506" }
 nix-compat-derive = { git = "https://github.com/cachix/snix", rev = "50b41ae7e05b423a7525b4dda53d372a71931506" }
 
+# Ensure crossterm versions match between these
+iocraft = "0.7.18"
+crossterm = "0.28.1"
+
+[patch.crates-io]
+# Patched TUI dependencies to supported rendering to stderr
+# https://github.com/ccbrown/iocraft/pull/157
+iocraft = { git = "https://github.com/cachix/iocraft", branch = "cachix" }
+# https://github.com/crossterm-rs/crossterm/pull/1026
+crossterm = { git = "https://github.com/sandydoo/crossterm", branch = "0.28-cachix" }
+
+# Improve performance of test runs
+[profile.dev.package]
+insta.opt-level = 3
+similar.opt-level = 3
+
+# A release build with full link-time optimization (slow)
 [profile.release]
 strip = "symbols"
 lto = "fat"
 
-# Fast release build without LTO
+# A fast release build without LTO
 # TODO: using underscores because of a normalization bug in buildRustPackage
 [profile.release_fast]
 inherits = "release"
 lto = false
 
-# Retain debug symbols in release builds for better backtraces
+# A fast release build that retains debug symbols for better backtraces
 [profile.release_with_debug]
 inherits = "release_fast"
 debug = true

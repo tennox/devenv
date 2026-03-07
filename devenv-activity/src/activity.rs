@@ -1,20 +1,21 @@
 //! Activity guard that tracks an activity's lifecycle.
 
 use std::cell::RefCell;
-use std::future::Future;
 use std::ops::Deref;
+use std::sync::Arc;
 
 use tracing::Span;
 
 use crate::Timestamp;
 use crate::builders::{
-    BuildBuilder, CommandBuilder, EvaluateBuilder, FetchBuilder, OperationBuilder, TaskBuilder,
+    BuildBuilder, CommandBuilder, EvaluateBuilder, FetchBuilder, OperationBuilder, ProcessBuilder,
+    TaskBuilder,
 };
 use crate::events::{
     ActivityEvent, ActivityLevel, ActivityOutcome, Build, Command, Evaluate, Fetch, FetchKind,
-    Operation, Task,
+    Operation, Process, ProcessStatus, Task,
 };
-use crate::stack::{ACTIVITY_STACK, get_current_stack, send_activity_event};
+use crate::stack::{ACTIVITY_SENDER, ACTIVITY_STACK, get_current_stack, send_activity_event};
 
 /// Activity type for tracking which kind of activity this is
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +25,7 @@ pub enum ActivityType {
     Evaluate,
     Task,
     Command,
+    Process,
     Operation,
 }
 
@@ -35,7 +37,7 @@ pub struct Activity {
     id: u64,
     activity_type: ActivityType,
     level: ActivityLevel,
-    outcome: std::sync::Mutex<ActivityOutcome>,
+    outcome: Arc<std::sync::Mutex<ActivityOutcome>>,
 }
 
 impl Activity {
@@ -51,7 +53,7 @@ impl Activity {
             id,
             activity_type,
             level,
-            outcome: std::sync::Mutex::new(ActivityOutcome::Success),
+            outcome: Arc::new(std::sync::Mutex::new(ActivityOutcome::Success)),
         }
     }
 
@@ -71,13 +73,23 @@ impl Activity {
     }
 
     /// Create a builder for a Task activity
-    pub fn task(name: impl Into<String>) -> TaskBuilder {
-        TaskBuilder::new(name)
+    pub fn task() -> TaskBuilder {
+        TaskBuilder::new()
+    }
+
+    /// Create and start a Task activity with a pre-assigned ID.
+    pub fn task_with_id(id: u64) -> Activity {
+        Activity::task().id(id).start()
     }
 
     /// Create a builder for a Command activity
     pub fn command(name: impl Into<String>) -> CommandBuilder {
         CommandBuilder::new(name)
+    }
+
+    /// Create a builder for a Process activity (long-running managed process)
+    pub fn process(name: impl Into<String>) -> ProcessBuilder {
+        ProcessBuilder::new(name)
     }
 
     /// Create a builder for an Operation activity
@@ -100,46 +112,62 @@ impl Activity {
         self.span.clone()
     }
 
-    /// Run a future with this activity's context propagated.
-    /// Nested activities created within the future will see this activity as their parent
-    /// and inherit this activity's level by default.
-    ///
-    /// # Example
-    /// ```ignore
-    /// let activity = Activity::task("parent").start();
-    /// activity.scope(async {
-    ///     // This child will have `activity` as its parent and inherit its level
-    ///     let child = Activity::task("child").start();
-    /// }).await;
-    /// ```
-    pub async fn scope<F, T>(&self, f: F) -> T
-    where
-        F: Future<Output = T>,
-    {
-        let mut stack = get_current_stack();
-        stack.push((self.id, self.level));
-        ACTIVITY_STACK.scope(RefCell::new(stack), f).await
-    }
-
-    /// Run a closure with this activity's context propagated.
+    /// Run a closure with this activity's context propagated, creating a new task-local scope.
     /// Nested activities created within the closure will see this activity as their parent
     /// and inherit this activity's level by default.
     ///
     /// # Example
     /// ```ignore
-    /// let activity = Activity::task("parent").start();
-    /// activity.scope_sync(|| {
+    /// let activity = Activity::task().start();
+    /// activity.with_new_scope_sync(|| {
     ///     // This child will have `activity` as its parent and inherit its level
-    ///     let child = Activity::task("child").start();
+    ///     let child = Activity::task().start();
     /// });
     /// ```
-    pub fn scope_sync<F, T>(&self, f: F) -> T
+    pub fn with_new_scope_sync<F, T>(&self, f: F) -> T
     where
         F: FnOnce() -> T,
     {
         let mut stack = get_current_stack();
         stack.push((self.id, self.level));
         ACTIVITY_STACK.sync_scope(RefCell::new(stack), f)
+    }
+
+    /// Run a synchronous closure within this activity's scope.
+    ///
+    /// While the closure runs, `current_activity_id()` will return this activity's ID.
+    /// Use this for synchronous code like FFI calls. For async code, use `in_activity()`.
+    ///
+    /// Unlike `with_new_scope_sync`, this modifies the existing task-local stack in-place.
+    /// If no task-local stack exists, the closure runs without activity tracking.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let activity = Activity::evaluate("Building shell").start();
+    /// let result = activity.in_scope(|| {
+    ///     // FFI calls here will see this activity as current
+    ///     ffi_operation()
+    /// });
+    /// ```
+    pub fn in_scope<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        ACTIVITY_STACK
+            .try_with(|stack| {
+                stack.borrow_mut().push((self.id, self.level));
+            })
+            .ok();
+
+        let result = f();
+
+        ACTIVITY_STACK
+            .try_with(|stack| {
+                stack.borrow_mut().pop();
+            })
+            .ok();
+
+        result
     }
 
     /// Mark as failed
@@ -177,8 +205,18 @@ impl Activity {
         }
     }
 
-    /// Update progress (for Build and Task activities)
-    pub fn progress(&self, done: u64, expected: u64) {
+    /// Reset outcome to success (for restarting failed processes)
+    pub fn reset(&self) {
+        if let Ok(mut outcome) = self.outcome.lock() {
+            *outcome = ActivityOutcome::Success;
+        }
+    }
+
+    /// Update progress (for Build, Task, and Operation activities)
+    ///
+    /// For Operation activities, an optional detail string can be provided to show
+    /// what is currently being processed (e.g., the current file or path name).
+    pub fn progress(&self, done: u64, expected: u64, detail: Option<&str>) {
         let _guard = self.span.enter();
         let event = match self.activity_type {
             ActivityType::Build => ActivityEvent::Build(Build::Progress {
@@ -197,6 +235,13 @@ impl Activity {
                 // For fetch, use progress_bytes instead
                 return;
             }
+            ActivityType::Operation => ActivityEvent::Operation(Operation::Progress {
+                id: self.id,
+                done,
+                expected,
+                detail: detail.map(String::from),
+                timestamp: Timestamp::now(),
+            }),
             _ => return,
         };
         send_activity_event(event);
@@ -245,6 +290,14 @@ impl Activity {
     pub fn log(&self, line: impl Into<String>) {
         let _guard = self.span.enter();
         let line_str = line.into();
+        if ACTIVITY_SENDER
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .is_none()
+        {
+            tracing::info!("{}", line_str);
+        }
         let event = match self.activity_type {
             ActivityType::Build => ActivityEvent::Build(Build::Log {
                 id: self.id,
@@ -269,6 +322,18 @@ impl Activity {
                 is_error: false,
                 timestamp: Timestamp::now(),
             }),
+            ActivityType::Process => ActivityEvent::Process(Process::Log {
+                id: self.id,
+                line: line_str,
+                is_error: false,
+                timestamp: Timestamp::now(),
+            }),
+            ActivityType::Operation => ActivityEvent::Operation(Operation::Log {
+                id: self.id,
+                line: line_str,
+                is_error: false,
+                timestamp: Timestamp::now(),
+            }),
             _ => return,
         };
         send_activity_event(event);
@@ -278,6 +343,14 @@ impl Activity {
     pub fn error(&self, line: impl Into<String>) {
         let _guard = self.span.enter();
         let line_str = line.into();
+        if ACTIVITY_SENDER
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .is_none()
+        {
+            tracing::warn!("{}", line_str);
+        }
         let event = match self.activity_type {
             ActivityType::Build => ActivityEvent::Build(Build::Log {
                 id: self.id,
@@ -297,9 +370,143 @@ impl Activity {
                 is_error: true,
                 timestamp: Timestamp::now(),
             }),
+            ActivityType::Process => ActivityEvent::Process(Process::Log {
+                id: self.id,
+                line: line_str,
+                is_error: true,
+                timestamp: Timestamp::now(),
+            }),
+            ActivityType::Operation => ActivityEvent::Operation(Operation::Log {
+                id: self.id,
+                line: line_str,
+                is_error: true,
+                timestamp: Timestamp::now(),
+            }),
             _ => return,
         };
         send_activity_event(event);
+    }
+
+    /// Set process status (for Process activities only)
+    pub fn set_status(&self, status: ProcessStatus) {
+        let _guard = self.span.enter();
+        if matches!(self.activity_type, ActivityType::Process) {
+            send_activity_event(ActivityEvent::Process(Process::Status {
+                id: self.id,
+                status,
+                timestamp: Timestamp::now(),
+            }));
+        }
+    }
+
+    /// Create a non-owning reference handle.
+    ///
+    /// The returned `ActivityRef` shares the outcome with this `Activity`
+    /// and can log, set status, and mutate the outcome, but does NOT send
+    /// a `Complete` event when dropped.
+    pub fn ref_handle(&self) -> ActivityRef {
+        ActivityRef {
+            span: self.span.clone(),
+            id: self.id,
+            activity_type: self.activity_type,
+            outcome: self.outcome.clone(),
+        }
+    }
+}
+
+/// Non-owning handle to an activity.
+///
+/// Can log, set status, and mutate the shared outcome, but does NOT send
+/// a `Complete` event on drop (unlike `Activity`).
+#[derive(Clone)]
+pub struct ActivityRef {
+    span: Span,
+    id: u64,
+    activity_type: ActivityType,
+    outcome: Arc<std::sync::Mutex<ActivityOutcome>>,
+}
+
+impl ActivityRef {
+    /// Log a line
+    pub fn log(&self, line: impl Into<String>) {
+        let _guard = self.span.enter();
+        let line_str = line.into();
+        if ACTIVITY_SENDER
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .is_none()
+        {
+            tracing::info!("{}", line_str);
+        }
+        let event = match self.activity_type {
+            ActivityType::Process => ActivityEvent::Process(Process::Log {
+                id: self.id,
+                line: line_str,
+                is_error: false,
+                timestamp: Timestamp::now(),
+            }),
+            _ => return,
+        };
+        send_activity_event(event);
+    }
+
+    /// Log an error
+    pub fn error(&self, line: impl Into<String>) {
+        let _guard = self.span.enter();
+        let line_str = line.into();
+        if ACTIVITY_SENDER
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .is_none()
+        {
+            tracing::warn!("{}", line_str);
+        }
+        let event = match self.activity_type {
+            ActivityType::Process => ActivityEvent::Process(Process::Log {
+                id: self.id,
+                line: line_str,
+                is_error: true,
+                timestamp: Timestamp::now(),
+            }),
+            _ => return,
+        };
+        send_activity_event(event);
+    }
+
+    /// Set process status (for Process activities only)
+    pub fn set_status(&self, status: ProcessStatus) {
+        let _guard = self.span.enter();
+        if matches!(self.activity_type, ActivityType::Process) {
+            send_activity_event(ActivityEvent::Process(Process::Status {
+                id: self.id,
+                status,
+                timestamp: Timestamp::now(),
+            }));
+        }
+    }
+
+    /// Mark as failed
+    pub fn fail(&self) {
+        if let Ok(mut outcome) = self.outcome.lock() {
+            *outcome = ActivityOutcome::Failed;
+        }
+    }
+
+    /// Reset outcome to success (for restarting failed processes)
+    pub fn reset(&self) {
+        if let Ok(mut outcome) = self.outcome.lock() {
+            *outcome = ActivityOutcome::Success;
+        }
+    }
+}
+
+impl Deref for ActivityRef {
+    type Target = Span;
+
+    fn deref(&self) -> &Self::Target {
+        &self.span
     }
 }
 
@@ -323,7 +530,7 @@ impl Clone for Activity {
             id: self.id,
             activity_type: self.activity_type,
             level: self.level,
-            outcome: std::sync::Mutex::new(outcome),
+            outcome: Arc::new(std::sync::Mutex::new(outcome)),
         }
     }
 }
@@ -359,6 +566,11 @@ impl Drop for Activity {
                 timestamp: Timestamp::now(),
             }),
             ActivityType::Command => ActivityEvent::Command(Command::Complete {
+                id: self.id,
+                outcome,
+                timestamp: Timestamp::now(),
+            }),
+            ActivityType::Process => ActivityEvent::Process(Process::Complete {
                 id: self.id,
                 outcome,
                 timestamp: Timestamp::now(),

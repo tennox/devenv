@@ -2,12 +2,16 @@ set -xe
 
 rm devenv.yaml || true
 devenv shell -- env | grep "DEVENV_CMDLINE"
+devenv shell -- env | grep "DEVENV_CLI_TEST_VAR=hello-from-task"
 devenv build languages.python.package
 devenv shell ls -- -la | grep ".test.sh"
 devenv shell ls ../ | grep "cli"
 devenv info | grep "python3-"
 devenv show | grep "python3-"
-devenv search ncdu |& grep -E "Found [0-9]+ packages and [0-9]+ options for 'ncdu'"
+devenv search ncdu 2>&1 | grep -E "Found [0-9]+ packages and [0-9]+ options for 'ncdu'"
+devenv --verbose --trace-output file:search-trace.log search '^ncdu$' 2>&1 | grep -E "Found [0-9]+ packages and [0-9]+ options"
+grep "Cache hit" search-trace.log | grep "optionsJSON"
+devenv search xyznonexistentpackagexyz 2>&1 | grep -E "Found 0 packages and 0 options"
 
 # there should be no processes
 devenv up && exit 1

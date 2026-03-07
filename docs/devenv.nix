@@ -42,17 +42,10 @@
     };
   };
 
-  # `devenv up` processes to run
   processes = {
-    # Serve the mkdocs documentation website with live reload
     docs = {
+      # Serve the mkdocs documentation website with live reload
       exec = "mkdocs serve";
-      cwd = config.git.root + "/docs";
-    };
-
-    # Watch files for changes to re-compile the Tailwind CSS
-    tailwind = {
-      exec = "watchexec -e html,css,js devenv-generate-doc-css";
       cwd = config.git.root + "/docs";
     };
   };
@@ -70,6 +63,9 @@
         "${config.git.root}/docs/requirements.in"
         "${config.git.root}/docs/requirements.txt"
       ];
+    };
+    "docs:generate-badge" = {
+      exec = "node ${config.git.root}/docs/src/assets/generate-badge.mjs";
     };
   };
 }

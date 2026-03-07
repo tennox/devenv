@@ -21,6 +21,8 @@ pub struct Shutdown {
     last_signal: AtomicI32,
     /// Optional receiver for cleanup completion signal
     cleanup_complete: Mutex<Option<oneshot::Receiver<()>>>,
+    /// Hook called before force-exiting (e.g., to restore terminal state)
+    pre_exit_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl std::fmt::Debug for Shutdown {
@@ -40,7 +42,16 @@ impl Shutdown {
             token: CancellationToken::new(),
             last_signal: AtomicI32::new(0),
             cleanup_complete: Mutex::new(None),
+            pre_exit_hook: Mutex::new(None),
         })
+    }
+
+    /// Set a hook to be called before force-exiting the process.
+    ///
+    /// This is called when `exit_process()` is triggered (e.g., on second Ctrl+C).
+    /// Use this to restore terminal state or perform other critical cleanup.
+    pub fn set_pre_exit_hook<F: Fn() + Send + Sync + 'static>(&self, hook: F) {
+        *self.pre_exit_hook.lock().unwrap() = Some(Box::new(hook));
     }
 
     /// Set the cleanup completion receiver.
@@ -135,18 +146,25 @@ impl Shutdown {
 
                 tokio::select! {
                     _ = sigint.recv() => {
-                        info!("Received SIGINT (Ctrl+C), shutting down gracefully...");
                         last_signal = Signal::SIGINT;
                     }
                     _ = sigterm.recv() => {
-                        info!("Received SIGTERM, shutting down gracefully...");
                         last_signal = Signal::SIGTERM;
                     }
                     _ = sighup.recv() => {
-                        info!("Received SIGHUP, shutting down gracefully...");
                         last_signal = Signal::SIGHUP;
                     }
                 }
+
+                // If a signal was already received (either from a previous real
+                // signal or set by the TUI keyboard handler), this is a repeated
+                // interrupt — force-exit immediately.
+                if shutdown.last_signal.load(Ordering::Relaxed) != 0 {
+                    info!("Received second signal, forcing exit...");
+                    shutdown.exit_process();
+                }
+
+                info!("Received {:?}, shutting down gracefully...", last_signal);
 
                 // Store the last signal received
                 shutdown
@@ -200,6 +218,18 @@ impl Shutdown {
         }
     }
 
+    /// Handle a user initiated interrupt (e.g., Ctrl+C from keyboard).
+    ///
+    /// On first call: records SIGINT and triggers graceful shutdown.
+    /// On second call (already shutting down): force exits the process.
+    pub fn handle_interrupt(&self) {
+        if self.is_cancelled() {
+            self.exit_process();
+        }
+        self.set_last_signal(Signal::SIGINT);
+        self.shutdown();
+    }
+
     /// Set the last signal manually.
     ///
     /// Used in TUI mode where Ctrl+C is received as a keyboard event rather than
@@ -211,6 +241,13 @@ impl Shutdown {
     /// Restore the default handler for the last received signal and re-raise the signal
     /// to terminate with the correct exit code.
     pub fn exit_process(&self) -> ! {
+        // Run pre-exit hook (e.g., restore terminal state) before killing the process
+        if let Ok(guard) = self.pre_exit_hook.lock()
+            && let Some(hook) = guard.as_ref()
+        {
+            hook();
+        }
+
         let signal = self.last_signal().unwrap_or(Signal::SIGTERM);
         let action = SigAction::new(NixSigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
         unsafe {
@@ -300,13 +337,27 @@ where
         self.join_set.join_next().await
     }
 
-    /// Wait for all tasks to complete, propagating panics
+    /// Wait for all tasks to complete, propagating panics.
+    /// If shutdown is triggered, abort remaining tasks and return.
     pub async fn wait_all(&mut self) {
-        while let Some(res) = self.join_next().await {
-            match res {
-                Ok(_) => {}
-                Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
-                Err(err) => panic!("{err}"),
+        let cancel = self.shutdown.cancellation_token();
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    self.join_set.abort_all();
+                    // Drain remaining tasks so they're fully cleaned up
+                    while self.join_set.join_next().await.is_some() {}
+                    break;
+                }
+                result = self.join_set.join_next() => {
+                    match result {
+                        Some(Ok(_)) => {}
+                        Some(Err(err)) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
+                        Some(Err(err)) => panic!("{err}"),
+                        None => break,
+                    }
+                }
             }
         }
     }

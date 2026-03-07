@@ -49,14 +49,11 @@ let
         })
         hooks;
 
-  # Check if git-hooks task is defined (indicates git-hooks are enabled)
-  anyGitHooksEnabled = (config.tasks."devenv:git-hooks:run".exec or null) == "pre-commit run -a";
-
-  # Auto-format hook using pre-commit if any git-hooks are enabled
-  preCommitHook = lib.optional anyGitHooksEnabled {
+  # Auto-format hook using git-hooks if enabled
+  preCommitHook = lib.optional config.git-hooks.enable {
     matcher = "^(Edit|MultiEdit|Write)$";
     command = ''
-      cd "$DEVENV_ROOT" && pre-commit run
+      cd "$DEVENV_ROOT" && ${config.git-hooks.package.meta.mainProgram} run
     '';
   };
 
@@ -156,6 +153,11 @@ let
       SubagentStop = buildHooks "SubagentStop" (groupedHooks.SubagentStop or [ ]);
       PreCompact = buildHooks "PreCompact" (groupedHooks.PreCompact or [ ]);
       PermissionRequest = buildHooks "PermissionRequest" (groupedHooks.PermissionRequest or [ ]);
+      WorktreeCreate = buildHooks "WorktreeCreate" (groupedHooks.WorktreeCreate or [ ]);
+      WorktreeRemove = buildHooks "WorktreeRemove" (groupedHooks.WorktreeRemove or [ ]);
+      TeammateIdle = buildHooks "TeammateIdle" (groupedHooks.TeammateIdle or [ ]);
+      TaskCompleted = buildHooks "TaskCompleted" (groupedHooks.TaskCompleted or [ ]);
+      ConfigChange = buildHooks "ConfigChange" (groupedHooks.ConfigChange or [ ]);
     };
     inherit (cfg)
       apiKeyHelper
@@ -203,6 +205,11 @@ in
                 "SubagentStop"
                 "PreCompact"
                 "PermissionRequest"
+                "WorktreeCreate"
+                "WorktreeRemove"
+                "TeammateIdle"
+                "TaskCompleted"
+                "ConfigChange"
               ];
               default = "PostToolUse";
               description = ''
@@ -219,6 +226,11 @@ in
                 - SubagentStop: Runs when subagent tasks complete
                 - PreCompact: Runs before message compaction
                 - PermissionRequest: Runs when a permission is requested
+                - WorktreeCreate: Runs when a new worktree is created
+                - WorktreeRemove: Runs when a worktree is removed
+                - TeammateIdle: Runs when a teammate agent becomes idle
+                - TaskCompleted: Runs when a task is completed
+                - ConfigChange: Runs when configuration changes
               '';
             };
             matcher = lib.mkOption {
@@ -596,7 +608,7 @@ in
 
   config = lib.mkIf cfg.enable {
     files = lib.mkMerge [
-      { ".claude/settings.json".json = settingsContent; }
+      { "${cfg.settingsPath}".json = settingsContent; }
 
       # MCP configuration file
       (lib.mkIf (cfg.mcpServers != { }) {
@@ -640,7 +652,7 @@ in
       ''
         Claude Code integration is enabled with automatic hooks and commands setup.
         Settings are configured at: ${cfg.settingsPath}
-        ${lib.optionalString anyGitHooksEnabled "- Auto-formatting: enabled via git-hooks (pre-commit)"}
+        ${lib.optionalString config.git-hooks.enable "- Auto-formatting: enabled via git-hooks (pre-commit)"}
         ${lib.optionalString (cfg.commands != { })
           "- Project commands: ${
             lib.concatStringsSep ", " (map (cmd: "/${cmd}") (lib.attrNames cfg.commands))

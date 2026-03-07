@@ -5,6 +5,80 @@ let
 
   stateDir = config.devenv.state + "/kafka";
 
+  # Port allocation helpers
+  # Parse listener string like "PLAINTEXT://localhost:9092" to extract port
+  parseListenerPort = listener:
+    let
+      # Remove protocol prefix (e.g., "PLAINTEXT://")
+      withoutProtocol = lib.last (lib.splitString "://" listener);
+      # Get the port part after ":"
+      parts = lib.splitString ":" withoutProtocol;
+    in
+    lib.toInt (lib.last parts);
+
+  # Parse listener to get host
+  parseListenerHost = listener:
+    let
+      withoutProtocol = lib.last (lib.splitString "://" listener);
+      parts = lib.splitString ":" withoutProtocol;
+    in
+    lib.head parts;
+
+  # Parse listener to get protocol
+  parseListenerProtocol = listener:
+    lib.head (lib.splitString "://" listener);
+
+  # Rebuild listener with new port
+  rebuildListener = listener: newPort:
+    let
+      protocol = parseListenerProtocol listener;
+      host = parseListenerHost listener;
+    in
+    "${protocol}://${host}:${toString newPort}";
+
+  # Find first PLAINTEXT listener port (for main port)
+  findPlaintextPort = listeners:
+    let
+      plaintext = lib.filter (l: lib.hasPrefix "PLAINTEXT://" l) listeners;
+    in
+    if plaintext == [ ] then 9092 else parseListenerPort (lib.head plaintext);
+
+  # Find CONTROLLER listener port
+  findControllerPort = listeners:
+    let
+      controller = lib.filter (l: lib.hasPrefix "CONTROLLER://" l) listeners;
+    in
+    if controller == [ ] then 9093 else parseListenerPort (lib.head controller);
+
+  # Base ports from configuration
+  basePort = findPlaintextPort cfg.settings."listeners";
+  baseControllerPort = findControllerPort cfg.settings."listeners";
+
+  # Allocated ports
+  allocatedPort = config.processes.kafka.ports.main.value;
+  allocatedControllerPort = config.processes.kafka.ports.controller.value;
+
+  # Rebuild listeners with allocated ports
+  rebuildListeners = listeners:
+    map
+      (l:
+        if lib.hasPrefix "PLAINTEXT://" l then rebuildListener l allocatedPort
+        else if lib.hasPrefix "CONTROLLER://" l then rebuildListener l allocatedControllerPort
+        else l
+      )
+      listeners;
+
+  # Parse controller.quorum.voters like "1@localhost:9093" and rebuild with allocated port
+  rebuildQuorumVoters = voters:
+    let
+      parts = lib.splitString "@" voters;
+      id = lib.head parts;
+      hostPort = lib.last parts;
+      hostParts = lib.splitString ":" hostPort;
+      host = lib.head hostParts;
+    in
+    "${id}@${host}:${toString allocatedControllerPort}";
+
   mkPropertyString =
     let
       render = {
@@ -219,20 +293,33 @@ in
       })
       (lib.mkIf cfg.enable {
         packages = [ cfg.package ];
-        services.kafka.configFiles.serverProperties = generator "server.properties" stringlySettings;
+        env.KAFKA_PORT = allocatedPort;
+        env.KAFKA_CONTROLLER_PORT = allocatedControllerPort;
+
+        # Overlay allocated ports at config file generation to avoid infinite
+        # recursion (#2494).  Writing back into cfg.settings would create a
+        # cycle because basePort/baseControllerPort read from the same attrs.
+        services.kafka.configFiles.serverProperties =
+          let
+            portOverrides = {
+              "listeners" = mkPropertyString (rebuildListeners cfg.settings."listeners");
+            } // lib.optionalAttrs (cfg.settings ? "advertised.listeners") {
+              "advertised.listeners" = mkPropertyString (rebuildListeners cfg.settings."advertised.listeners");
+            } // lib.optionalAttrs (cfg.settings ? "controller.quorum.voters") {
+              "controller.quorum.voters" = mkPropertyString (rebuildQuorumVoters cfg.settings."controller.quorum.voters");
+            };
+          in
+          generator "server.properties" (stringlySettings // portOverrides);
 
         processes.kafka = {
+          ports.main.allocate = basePort;
+          ports.controller.allocate = baseControllerPort;
           exec = "${startKafka}/bin/start-kafka";
 
-          process-compose = {
-            readiness_probe = {
-              exec.command = "${cfg.package}/bin/kafka-topics.sh --list --bootstrap-server localhost:9092";
-              initial_delay_seconds = 5;
-              period_seconds = 10;
-              timeout_seconds = 5;
-              success_threshold = 1;
-              failure_threshold = 3;
-            };
+          ready = {
+            exec = "${cfg.package}/bin/kafka-topics.sh --list --bootstrap-server localhost:${toString allocatedPort}";
+            initial_delay = 5;
+            probe_timeout = 5;
           };
         };
       })

@@ -3,7 +3,7 @@ site_description: "Fast, Declarative, Reproducible, and Composable Developer Env
 site_url: "https://devenv.sh"
 repo_name: "cachix/devenv"
 repo_url: "https://github.com/cachix/devenv"
-edit_uri: "edit/main/docs"
+edit_uri: "edit/main/docs/src"
 docs_dir: "src"
 strict: true
 validation:
@@ -120,7 +120,7 @@ plugins:
         - extending.md
       Guides:
         - ad-hoc-developer-environments.md
-        - automatic-shell-activation.md
+        - integrations/direnv.md
         - examples.md
         - cloud.md
       Reference:

@@ -242,19 +242,24 @@ in
             hashedRoot = builtins.hashString "sha256" config.devenv.state;
             # same length as git's abbreviated commit hashes
             shortHash = builtins.substring 0 7 hashedRoot;
+            # XDG_RUNTIME_DIR is the correct location for runtime files like sockets
+            # per the XDG Base Directory Specification
+            xdg = builtins.getEnv "XDG_RUNTIME_DIR";
+            base = if xdg != "" then xdg else config.devenv.tmpdir;
           in
-          "${config.devenv.tmpdir}/devenv-${shortHash}";
+          "${base}/devenv-${shortHash}";
       };
 
       tmpdir = lib.mkOption {
         type = types.str;
         internal = true;
+        # Used for TMPDIR override - should NOT use XDG_RUNTIME_DIR as that's
+        # a small tmpfs meant for runtime files (sockets), not build artifacts
         default =
           let
-            xdg = builtins.getEnv "XDG_RUNTIME_DIR";
             tmp = builtins.getEnv "TMPDIR";
           in
-          if xdg != "" then xdg else if tmp != "" then tmp else "/tmp";
+          if tmp != "" then tmp else "/tmp";
       };
 
       profile = lib.mkOption {
@@ -300,14 +305,14 @@ in
         '';
       }
       {
-        assertion = config.devenv.flakesIntegration || config.overlays == [ ] || lib.versionAtLeast config.devenv.cliVersion "1.4.2";
+        assertion = config.devenv.flakesIntegration || config.overlays == [ ] || (config.devenv.cli.version != null && lib.versionAtLeast config.devenv.cli.version "1.4.2");
         message = ''
-          Using overlays requires devenv 1.4.2 or higher, while your current version is ${config.devenv.cliVersion}.
+          Using overlays requires devenv 1.4.2 or higher, while your current version is ${toString config.devenv.cli.version}.
         '';
       }
     ];
     # use builtins.toPath to normalize path if root is "/" (container)
-    devenv.state = builtins.toPath (config.devenv.dotfile + "/state");
+    devenv.state = lib.mkDefault (builtins.toPath (config.devenv.dotfile + "/state"));
     devenv.dotfile = lib.mkDefault (builtins.toPath (config.devenv.root + "/.devenv"));
     devenv.profile = profile;
 

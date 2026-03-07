@@ -156,12 +156,18 @@ boolean
 
 
 *Default:*
-` false `
+
+```nix
+false
+```
 
 
 
 *Example:*
-` true `
+
+```nix
+true
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
@@ -180,7 +186,10 @@ one of “nixpkgs”, “stable”, “beta”, “nightly”
 
 
 *Default:*
-` "nixpkgs" `
+
+```nix
+"nixpkgs"
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
@@ -202,7 +211,10 @@ list of string
 
 
 *Default:*
-` [ "rustc" "cargo" "clippy" "rustfmt" "rust-analyzer" ] `
+
+```nix
+[ "rustc" "cargo" "clippy" "rustfmt" "rust-analyzer" ]
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
@@ -253,12 +265,18 @@ boolean
 
 
 *Default:*
-` true `
+
+```nix
+true
+```
 
 
 
 *Example:*
-` true `
+
+```nix
+true
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
@@ -279,7 +297,11 @@ package
 
 
 *Default:*
-` pkgs.rust-analyzer `
+Depends on the configured toolchain:
+
+ - ` nixpkgs ` channel: ` pkgs.rust-analyzer `\.
+ - non-nixpkgs channel: the ` rust-analyzer ` component from the rust-overlay toolchain, with a fallback to ` pkgs.rust-analyzer ` if not present in the manifest\.
+ - ` toolchainFile `: the aggregated toolchain package derived from the file\.
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
@@ -303,7 +325,10 @@ boolean
 
 
 *Default:*
-` false `
+
+```nix
+false
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
@@ -324,7 +349,10 @@ string
 
 
 *Default:*
-` "" `
+
+```nix
+""
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
@@ -346,7 +374,10 @@ list of string
 
 
 *Default:*
-` [ ] `
+
+```nix
+[ ]
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
@@ -367,7 +398,10 @@ open submodule of attribute set of package
 
 
 *Default:*
-` nixpkgs `
+
+```nix
+nixpkgs
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
@@ -388,7 +422,10 @@ null or package
 
 
 *Default:*
-` pkgs.cargo `
+
+```nix
+pkgs.cargo
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
@@ -409,7 +446,10 @@ null or package
 
 
 *Default:*
-` pkgs.clippy `
+
+```nix
+pkgs.clippy
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
@@ -430,7 +470,10 @@ null or package
 
 
 *Default:*
-` pkgs.rust-analyzer `
+
+```nix
+pkgs.rust-analyzer
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
@@ -451,7 +494,10 @@ null or package
 
 
 *Default:*
-` pkgs.rustc `
+
+```nix
+pkgs.rustc
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
@@ -472,7 +518,10 @@ null or package
 
 
 *Default:*
-` pkgs.rustfmt `
+
+```nix
+pkgs.rustfmt
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
@@ -507,12 +556,18 @@ null or absolute path
 
 
 *Default:*
-` null `
+
+```nix
+null
+```
 
 
 
 *Example:*
-` ./rust-toolchain.toml `
+
+```nix
+./rust-toolchain.toml
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
@@ -551,7 +606,10 @@ string
 
 
 *Default:*
-` "latest" `
+
+```nix
+"latest"
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)

@@ -4,10 +4,11 @@
 //! as an alternative to the traditional C++ Nix binary.
 
 use async_trait::async_trait;
+use devenv_core::config::Input;
 use devenv_core::{
-    CachixManager, Config, DevenvPaths, GlobalOptions, NixArgs, NixBackend, Options,
+    CacheSettings, CachixManager, DevEnvOutput, DevenvPaths, NixArgs, NixBackend, NixSettings,
+    Options, SearchResults,
 };
-use devenv_eval_cache::Output;
 use miette::{Result, bail};
 use snix_build::buildservice::{BuildService, DummyBuildService};
 use snix_castore::blobservice::from_addr as blob_from_addr;
@@ -16,6 +17,7 @@ use snix_glue::snix_io::SnixIO;
 use snix_glue::snix_store_io::SnixStoreIO;
 use snix_store::nar::{NarCalculationService, SimpleRenderer};
 use snix_store::pathinfoservice::from_addr as pathinfo_from_addr;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -28,30 +30,29 @@ use tracing::{debug, info, warn};
 /// multi-threaded sharing. This backend creates fresh evaluator instances per operation
 /// rather than storing them in shared state.
 pub struct SnixBackend {
-    #[allow(dead_code)] // Will be used when more functionality is implemented
-    config: Config,
-    #[allow(dead_code)] // Will be used when more functionality is implemented
-    global_options: GlobalOptions,
-    #[allow(dead_code)] // Will be used when more functionality is implemented
+    #[allow(dead_code)]
+    nix_settings: NixSettings,
+    #[allow(dead_code)]
+    cache_settings: CacheSettings,
+    #[allow(dead_code)]
     paths: DevenvPaths,
-    #[allow(dead_code)] // Will be used when cachix integration is implemented
+    #[allow(dead_code)]
     cachix_manager: Arc<CachixManager>,
 }
 
 impl SnixBackend {
     pub async fn new(
-        config: Config,
-        global_options: GlobalOptions,
+        nix_settings: NixSettings,
+        cache_settings: CacheSettings,
         paths: DevenvPaths,
         cachix_manager: Arc<CachixManager>,
         _pool: Option<Arc<tokio::sync::OnceCell<sqlx::SqlitePool>>>,
     ) -> Result<Self> {
         info!("Initializing Snix backend");
-        // Note: Snix backend doesn't use eval cache at the moment
 
         Ok(Self {
-            config,
-            global_options,
+            nix_settings,
+            cache_settings,
             paths,
             cachix_manager,
         })
@@ -122,11 +123,16 @@ impl SnixBackend {
 
 #[async_trait(?Send)]
 impl NixBackend for SnixBackend {
+    async fn lock_fingerprint(&self) -> Result<String> {
+        // Return empty fingerprint for now - snix backend is not yet fully implemented
+        Ok(String::new())
+    }
+
     async fn assemble(&self, _args: &NixArgs<'_>) -> Result<()> {
         Ok(())
     }
 
-    async fn dev_env(&self, _json: bool, _gc_root: &Path) -> Result<Output> {
+    async fn dev_env(&self, _json: bool, _gc_root: &Path) -> Result<DevEnvOutput> {
         // TODO: This is a complex operation that requires implementing the equivalent
         // of `nix print-dev-env`. For now, we'll return a placeholder error.
         bail!(
@@ -164,8 +170,12 @@ impl NixBackend for SnixBackend {
         bail!("eval() is not yet fully implemented for SnixBackend")
     }
 
-    async fn update(&self, _input_name: &Option<String>) -> Result<()> {
-        // TODO: Implement flake update functionality
+    async fn update(
+        &self,
+        _input_name: &Option<String>,
+        _inputs: &BTreeMap<String, Input>,
+        _override_inputs: &[String],
+    ) -> Result<()> {
         bail!("Flake update is not yet implemented for Snix backend")
     }
 
@@ -174,7 +184,7 @@ impl NixBackend for SnixBackend {
         bail!("Flake metadata is not yet implemented for Snix backend")
     }
 
-    async fn search(&self, _name: &str, _options: Option<Options>) -> Result<Output> {
+    async fn search(&self, _name: &str, _options: Option<Options>) -> Result<SearchResults> {
         // TODO: Implement package search functionality
         bail!("Package search is not yet implemented for Snix backend")
     }
@@ -197,5 +207,9 @@ impl NixBackend for SnixBackend {
     async fn is_trusted_user(&self) -> Result<bool> {
         // TODO: Implement trusted user check for Snix backend
         bail!("is_trusted_user is not yet implemented for Snix backend")
+    }
+
+    fn invalidate(&self) {
+        // No-op: Snix backend doesn't have caching yet
     }
 }

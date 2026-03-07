@@ -1,8 +1,8 @@
 # Processes
 
-Devenv uses [process-compose](https://github.com/F1bonacc1/process-compose) to manage and orchestrate processes in your development environment. Process-compose provides process supervision, dependency management, health checks, and a TUI interface for monitoring your processes.
+Devenv provides built-in process management with supervision, socket activation, file watching, and dependency management.
 
-## Basic example
+## Basic Example
 
 ```nix title="devenv.nix"
 { pkgs, ... }:
@@ -11,7 +11,6 @@ Devenv uses [process-compose](https://github.com/F1bonacc1/process-compose) to m
   processes = {
     silly-example.exec = "while true; do echo hello && sleep 1; done";
     ping.exec = "ping localhost";
-    # Process that runs in a specific directory
     server = {
       exec = "python -m http.server";
       cwd = "./public";
@@ -20,55 +19,234 @@ Devenv uses [process-compose](https://github.com/F1bonacc1/process-compose) to m
 }
 ```
 
-To start the processes in the foreground, run:
+To start the processes, run:
 
 ```shell-session
-
 $ devenv up
-Starting processes ...
-
-20:37:44 system          | ping.1 started (pid=4094686)
-20:37:44 system          | silly-example.1 started (pid=4094688)
-20:37:44 silly-example.1 | hello
-20:37:44 ping.1          | PING localhost (127.0.0.1) 56 bytes of data.
-20:37:44 ping.1          | 64 bytes from 127.0.0.1: icmp_seq=0 ttl=64 time=0.127 ms
-20:37:45 silly-example.1 | hello
-20:37:45 ping.1          | 64 bytes from 127.0.0.1: icmp_seq=1 ttl=64 time=0.257 ms
-20:37:46 silly-example.1 | hello
-20:37:46 ping.1          | 64 bytes from 127.0.0.1: icmp_seq=2 ttl=64 time=0.242 ms
-20:37:47 silly-example.1 | hello
-20:37:47 ping.1          | 64 bytes from 127.0.0.1: icmp_seq=3 ttl=64 time=0.249 ms
-...
 ```
 
-## How process-compose works
+## Dependencies
 
-When you run `devenv up`, devenv generates a process-compose configuration file that:
+Processes can depend on other processes and tasks using `after` and `before`:
 
-1. **Spawns and supervises processes**: Each process defined in `devenv.nix` becomes a managed process that process-compose monitors and can restart if needed
-2. **Provides a TUI interface**: You can interact with processes, view logs, restart individual processes, and navigate between them
-3. **Handles dependencies**: Processes can depend on each other and start in the correct order
-4. **Manages health checks**: Processes can define health checks to ensure they're ready before dependent processes start
-5. **Logs output**: All process output is captured and available in the TUI and in log files at `$DEVENV_STATE/process-compose/`
+```nix title="devenv.nix"
+{
+  processes = {
+    database.exec = "postgres";
 
-## Using pre-built services
+    api = {
+      exec = "myapi";
+      after = [ "devenv:processes:database" ];  # wait for database to be ready
+    };
+  };
+}
+```
 
-Devenv provides many pre-configured services that are already set up with proper process management. See the [Services documentation](services/index.md) for a complete list of available services like:
+Dependency suffixes control when a dependency is considered satisfied.
+
+For **process** dependencies:
+
+- `@started` — wait for the process to begin execution
+- `@ready` (default) — wait for the readiness probe to pass
+- `@completed` — wait for the process to finish, regardless of exit code (soft dependency, does not propagate failure)
+
+For **task** dependencies:
+
+- `@started` — wait for the task to begin execution
+- `@succeeded` (default) — wait for the task to exit with code 0
+- `@completed` — wait for the task to finish, regardless of exit code (soft dependency, does not propagate failure)
+
+## Using Pre-built Services
+
+Devenv provides many pre-configured services with proper process management. See the [Services documentation](services/index.md) for available services like:
 
 - [PostgreSQL](services/postgres.md)
 - [Redis](services/redis.md)
 - [MySQL](services/mysql.md)
 - [MongoDB](services/mongodb.md)
 - [Elasticsearch](services/elasticsearch.md)
-- And many more...
 
 These services come with sensible defaults, health checks, and proper initialization scripts.
 
+## Restart Policies
+
+!!! tip "New in devenv 2.0"
+
+Control how processes restart when they exit:
+
+- `on_failure` (default) - restart only on non-zero exit
+- `always` - restart on any exit
+- `never` - never restart
+
+```nix title="devenv.nix"
+{
+  processes.worker = {
+    exec = "worker --queue jobs";
+    restart = {
+      on = "always";
+      max = 10;  # null for unlimited (default: 5)
+    };
+  };
+}
+```
+
+## Ready Probes
+
+!!! tip "New in devenv 2.0"
+
+Ready probes let the process manager detect when a process is ready to serve. This is used by `after` dependencies to know when a dependency is available.
+
+### Exec probe
+
+Run a shell command to check readiness. Exit code 0 means ready:
+
+```nix title="devenv.nix"
+{
+  processes.database = {
+    exec = "postgres -D $PGDATA";
+    ready = {
+      exec = "pg_isready -d template1";
+    };
+  };
+}
+```
+
+### HTTP probe
+
+Poll an HTTP endpoint for readiness:
+
+```nix title="devenv.nix"
+{
+  processes.api = {
+    exec = "myserver";
+    ready = {
+      http.get = {
+        port = 8080;
+        path = "/health";
+        # host = "127.0.0.1";  # default
+        # scheme = "http";     # default
+      };
+    };
+  };
+}
+```
+
+### Notify probe
+
+Use systemd-style readiness notification. Your process should send `READY=1` to the socket path in `$NOTIFY_SOCKET`:
+
+```nix title="devenv.nix"
+{
+  processes.database = {
+    exec = "postgres";
+    ready.notify = true;
+  };
+
+  processes.api = {
+    exec = "myapi";
+    after = [ "devenv:processes:database" ];  # waits for READY=1
+  };
+}
+```
+
+### Probe timing options
+
+All probe types support these timing options:
+
+```nix title="devenv.nix"
+{
+  processes.api = {
+    exec = "myserver";
+    ready = {
+      http.get = { port = 8080; path = "/health"; };
+      initial_delay = 2;    # seconds before first probe (default: 0)
+      period = 10;           # seconds between probes (default: 10)
+      timeout = 1;           # seconds before probe times out (default: 1)
+      success_threshold = 1; # consecutive successes needed (default: 1)
+      failure_threshold = 3; # consecutive failures before unhealthy (default: 3)
+    };
+  };
+}
+```
+
+When `listen` sockets or allocated `ports` are configured and no explicit probe is set, a TCP connectivity check is used automatically.
+
+## File Watching
+
+!!! tip "New in devenv 2.0"
+
+Automatically restart processes when files change:
+
+```nix title="devenv.nix"
+{
+  processes.backend = {
+    exec = "cargo run";
+    watch = {
+      paths = [ ./src ];
+      extensions = [ "rs" "toml" ];
+      ignore = [ "target" "*.log" ];
+    };
+  };
+}
+```
+
+## Socket Activation
+
+!!! tip "New in devenv 2.0"
+
+Socket activation allows the process manager to bind sockets before starting your process. This enables zero-downtime restarts and lazy process startup.
+
+```nix title="devenv.nix"
+{
+  processes.api = {
+    exec = "myserver";
+    listen = [
+      {
+        name = "http";
+        kind = "tcp";
+        address = "127.0.0.1:8080";
+      }
+      {
+        name = "admin";
+        kind = "unix_stream";
+        path = "$DEVENV_STATE/admin.sock";
+      }
+    ];
+  };
+}
+```
+
+Your process receives these environment variables:
+
+- `LISTEN_FDS` - number of passed file descriptors
+- `LISTEN_PID` - PID that should accept the sockets
+- `LISTEN_FDNAMES` - colon-separated socket names
+
+File descriptors start at 3 (after stdin, stdout, stderr). This is compatible with systemd socket activation.
+
+## Watchdog
+
+!!! tip "New in devenv 2.0"
+
+Enable systemd-compatible watchdog monitoring. Your process must periodically send `WATCHDOG=1` to the notify socket, or it will be killed and restarted:
+
+```nix title="devenv.nix"
+{
+  processes.api = {
+    exec = "myserver";
+    ready.notify = true;
+    watchdog = {
+      usec = 30000000;      # 30 seconds
+      require_ready = true;  # only enforce after READY=1 (default)
+    };
+  };
+}
+```
+
+
 ## Git Integration
 
-!!! tip "New in version 1.10"
-
-Processes can reference the git repository root path using `${config.git.root}`, which is particularly useful in monorepo environments:
+Processes can reference the git repository root path using `${config.git.root}`, useful in monorepo environments:
 
 ```nix title="devenv.nix"
 { config, ... }:
@@ -86,11 +264,66 @@ Processes can reference the git repository root path using `${config.git.root}`,
 }
 ```
 
-This allows processes to reference paths relative to the repository root regardless of where the `devenv.nix` file is located within the repository.
+Processes are automatically available as tasks, allowing you to define pre and post hooks. See the [Processes as tasks](tasks.md#processes-as-tasks) section for details.
 
-## Running tasks before/after the process
+## Automatic port allocation
 
-Processes are automatically available as tasks, allowing you to define pre and post hooks. See the [Processes as tasks](tasks.md#processes-as-tasks) section for details on how to run tasks before a process starts or after it stops.
+!!! tip "New in devenv 2.0"
 
-!!! note
-    Currently, tasks are spawned per process instance. This means if you have multiple instances of a process running, tasks will run for each instance separately. See [issue #2037](https://github.com/cachix/devenv/issues/2037) for planned improvements to this behavior.
+Devenv can automatically allocate free ports for your processes, preventing conflicts when a port is already in use or when running multiple devenv projects simultaneously.
+
+Define ports using `ports.<name>.allocate` with a base port number. Devenv will find a free port starting from that base, incrementing until one is available:
+
+```nix title="devenv.nix"
+{ config, ... }:
+
+{
+  processes.server = {
+    ports.http.allocate = 8080;
+    ports.admin.allocate = 9000;
+    exec = ''
+      echo "HTTP server on port ${toString config.processes.server.ports.http.value}"
+      echo "Admin panel on port ${toString config.processes.server.ports.admin.value}"
+      python -m http.server ${toString config.processes.server.ports.http.value}
+    '';
+  };
+}
+```
+
+The resolved port is available via `config.processes.<name>.ports.<port>.value`. If port 8080 is already in use, devenv will automatically try 8081, 8082, and so on until it finds an available port.
+
+Devenv holds the allocated ports during configuration evaluation to prevent race conditions, then releases them just before starting the processes so your application can bind to them.
+
+This is particularly useful for:
+
+- **Running multiple projects**: Each project gets its own ports without manual coordination
+- **CI environments**: Tests can run in parallel without port conflicts
+- **Shared development machines**: Multiple developers can run the same project simultaneously
+
+### Strict port mode
+
+If you want devenv to fail when a port is already in use instead of automatically finding the next available port, use the `--strict-ports` flag:
+
+```shell-session
+$ devenv up --strict-ports
+```
+
+This is useful when you need deterministic port assignments and want to be notified of conflicts rather than having them silently resolved. When a port conflict is detected in strict mode, devenv will show an error message including which process is currently using the port.
+
+## Alternative Process Managers
+
+By default, devenv uses its native process manager. You can switch to alternative implementations:
+
+- [process-compose](supported-process-managers/process-compose.md) - Feature-rich external process manager with TUI
+- [overmind](supported-process-managers/overmind.md) - Procfile-based with tmux integration
+- [honcho](supported-process-managers/honcho.md) - Python Foreman port
+- [hivemind](supported-process-managers/hivemind.md) - Simple Procfile manager
+- [mprocs](supported-process-managers/mprocs.md) - TUI process manager
+
+To switch:
+
+```nix title="devenv.nix"
+{
+  process.manager.implementation = "process-compose";
+}
+```

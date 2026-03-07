@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
-use devenv_core::config::Config;
+use devenv_core::config::Input;
 use nix_bindings_fetchers::FetchersSettings;
 use nix_bindings_flake::{
     FlakeInput, FlakeInputs, FlakeReference, FlakeReferenceParseFlags, FlakeSettings, LockFile,
 };
+use nix_bindings_store::store::Store;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Once;
 
@@ -76,6 +78,9 @@ pub mod logger;
 // Extension trait for anyhow::Result conversion
 pub mod anyhow_ext;
 
+// Pure Rust BuildEnvironment parsing (for cached -env JSON)
+pub mod build_environment;
+
 // Cachix daemon client for pushing store paths
 pub mod cachix_daemon;
 
@@ -84,11 +89,11 @@ pub mod cachix_daemon;
 /// # Arguments
 /// * `fetch_settings` - Fetcher configuration
 /// * `flake_settings` - Flake configuration
-/// * `config` - Devenv configuration
+/// * `inputs` - Input specifications from devenv.yaml
 pub fn create_flake_inputs(
     fetch_settings: &FetchersSettings,
     flake_settings: &FlakeSettings,
-    config: &Config,
+    inputs: &BTreeMap<String, Input>,
 ) -> Result<FlakeInputs> {
     let mut flake_inputs = FlakeInputs::new()?;
 
@@ -97,17 +102,28 @@ pub fn create_flake_inputs(
     parse_flags.set_preserve_relative_paths(true)?;
 
     // Convert each devenv input to a FlakeInput
-    for (name, input) in config.inputs.iter() {
-        // Skip inputs without a URL (e.g., those with only "follows")
-        let url = match &input.url {
-            Some(url) => url,
-            None => continue,
+    for (name, input) in inputs.iter() {
+        let mut flake_input = if let Some(url) = &input.url {
+            let (flake_ref, _fragment) = FlakeReference::parse_with_fragment(
+                fetch_settings,
+                flake_settings,
+                &parse_flags,
+                url,
+            )?;
+            FlakeInput::new(&flake_ref, input.flake)?
+        } else if let Some(follows_target) = &input.follows {
+            // Top-level input has only follows - use follows target as placeholder reference
+            // (the reference gets cleared internally by set_follows)
+            let (placeholder_ref, _) = FlakeReference::parse_with_fragment(
+                fetch_settings,
+                flake_settings,
+                &parse_flags,
+                follows_target,
+            )?;
+            FlakeInput::new(&placeholder_ref, true)?
+        } else {
+            continue;
         };
-
-        let (flake_ref, _fragment) =
-            FlakeReference::parse_with_fragment(fetch_settings, flake_settings, &parse_flags, url)?;
-
-        let mut flake_input = FlakeInput::new(&flake_ref, input.flake)?;
 
         // Set follows relationship before adding to collection
         // (C API does not support modifying inputs after they're added)
@@ -160,7 +176,7 @@ pub fn create_flake_inputs(
     }
 
     // Add nixpkgs as a default input if not already specified
-    if !config.inputs.contains_key("nixpkgs") {
+    if !inputs.contains_key("nixpkgs") {
         let nixpkgs_url = "github:cachix/devenv-nixpkgs/rolling";
         let (flake_ref, _fragment) = FlakeReference::parse_with_fragment(
             fetch_settings,
@@ -173,7 +189,7 @@ pub fn create_flake_inputs(
     }
 
     // Add devenv as a default input if not already specified
-    if !config.inputs.contains_key("devenv") {
+    if !inputs.contains_key("devenv") {
         let devenv_url = "github:cachix/devenv?dir=src/modules";
         let (flake_ref, _fragment) = FlakeReference::parse_with_fragment(
             fetch_settings,
@@ -205,10 +221,53 @@ pub fn load_lock_file(
     }
 }
 
-/// Write a lock file to disk
+/// Write a lock file to disk, only if content changed (to preserve mtime for direnv)
 pub fn write_lock_file(lock_file: &LockFile, output_path: &Path) -> Result<()> {
     let lock_json = lock_file.to_string()?;
-    std::fs::write(output_path, lock_json)
+    // Compare with existing content to avoid updating mtime unnecessarily.
+    // direnv watches devenv.lock and uses mtime to detect changes.
+    if let Ok(existing) = std::fs::read_to_string(output_path)
+        && existing == lock_json
+    {
+        return Ok(());
+    }
+    std::fs::write(output_path, &lock_json)
         .with_context(|| format!("Failed to write lock file to {}", output_path.display()))?;
     Ok(())
+}
+
+/// Compute a content fingerprint from all locked inputs' fingerprints.
+///
+/// This iterates over all locked nodes and combines their fingerprints into
+/// a single hash. The fingerprint for each input varies by type:
+/// - git/github/mercurial: the revision hash
+/// - tarball/path: the narHash in SRI format
+///
+/// Returns a hex-encoded BLAKE3 hash of the combined fingerprints.
+/// If no lock file exists or no inputs have fingerprints, returns the hash of an empty string.
+pub fn compute_lock_fingerprint(lock_file: Option<&LockFile>, store: &Store) -> Result<String> {
+    let mut parts: Vec<String> = Vec::new();
+
+    if let Some(lock) = lock_file {
+        let mut iter = lock.inputs_iterator()?;
+
+        // The iterator starts pointing at the first element
+        loop {
+            let attr_path = iter.attr_path()?;
+            if let Some(fingerprint) = iter.fingerprint(store)? {
+                tracing::debug!("attr_path: {}, fingerprint: {}", attr_path, fingerprint);
+                parts.push(format!("{}={}", attr_path, fingerprint));
+            }
+            if !iter.next() {
+                break;
+            }
+        }
+    }
+
+    // Sort for deterministic output
+    parts.sort();
+
+    let combined = parts.join(";");
+    let hash = blake3::hash(combined.as_bytes());
+    Ok(hash.to_hex().to_string())
 }

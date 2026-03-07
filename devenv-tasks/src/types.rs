@@ -14,20 +14,28 @@ pub enum TaskType {
     Process,
 }
 
-/// Dependency kind: wait for ready state or completion
+/// Dependency kind: controls when a dependency is considered satisfied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
 pub enum DependencyKind {
-    /// Wait for task to be ready/healthy (default)
+    /// Wait for task to begin execution (hard dependency).
+    /// Satisfied once the task is Running, ProcessReady, or Completed.
+    Started,
+    /// Wait for task to be ready/healthy (default, hard dependency).
     /// - For oneshot tasks: wait for successful completion
     /// - For process tasks: wait for ProcessReady state
+    ///
+    /// Propagates failure: if the dependency fails, this task fails too.
     #[default]
     Ready,
-    /// Wait for task to complete/shutdown
-    /// - For oneshot tasks: same as Ready (wait for completion)
-    /// - For process tasks: wait for process to shut down
-    Complete,
+    /// Wait for task to exit successfully (hard dependency).
+    /// Satisfied only when the task completes with exit code 0 (or is skipped).
+    Succeeded,
+    /// Wait for task to complete/shutdown (soft dependency).
+    /// Satisfied when the task finishes, regardless of exit code.
+    /// Does NOT propagate failure: if the dependency fails, this task still runs.
+    Completed,
 }
 
 /// Dependency specification with optional suffix
@@ -35,8 +43,9 @@ pub enum DependencyKind {
 pub struct DependencySpec {
     /// Task name without suffix
     pub name: String,
-    /// Dependency kind (Ready or Complete)
-    pub kind: DependencyKind,
+    /// Dependency kind, or None for default behavior.
+    /// Default: Ready for process tasks, Succeeded for oneshot tasks
+    pub kind: Option<DependencyKind>,
 }
 
 /// Verbosity levels for task execution
@@ -70,6 +79,10 @@ pub struct TasksStatus {
     pub skipped: usize,
     pub dependency_failed: usize,
     pub cancelled: usize,
+    /// Tasks that failed but are exclusively `@completed` (soft) dependencies
+    pub soft_failed: usize,
+    /// Tasks marked DependencyFailed whose root cause is exclusively a soft failure
+    pub soft_dependency_failed: usize,
 }
 
 impl Default for TasksStatus {
@@ -89,6 +102,8 @@ impl TasksStatus {
             skipped: 0,
             dependency_failed: 0,
             cancelled: 0,
+            soft_failed: 0,
+            soft_dependency_failed: 0,
         }
     }
 
@@ -97,9 +112,10 @@ impl TasksStatus {
         self.pending == 0 && self.running == 0
     }
 
-    /// Check if any tasks failed
+    /// Check if any tasks failed (excluding soft `@completed`-only failures)
     pub fn has_failures(&self) -> bool {
-        self.failed > 0 || self.dependency_failed > 0
+        (self.failed - self.soft_failed) > 0
+            || (self.dependency_failed - self.soft_dependency_failed) > 0
     }
 
     /// Get total number of tasks
@@ -207,7 +223,7 @@ impl TaskCompleted {
 pub enum TaskStatus {
     Pending,
     Running(Instant),
-    /// Process task is ready and healthy (not used yet, for future process support)
+    /// Process task is ready and healthy
     ProcessReady,
     Completed(TaskCompleted),
 }

@@ -1,25 +1,48 @@
 use crate::{
-    components::{LOG_VIEWPORT_COLLAPSED, format_elapsed_time, *},
+    components::{LOG_VIEWPORT_FAILED, LOG_VIEWPORT_SHOW_OUTPUT, *},
     model::{
-        Activity, ActivityModel, ActivitySummary, ActivityVariant, NixActivityState,
-        TaskDisplayStatus, TerminalSize, UiState,
+        Activity, ActivityModel, ActivitySummary, ActivityVariant, DisplayActivity,
+        NixActivityState, ProcessLifecycle, RenderContext, TaskDisplayStatus, TerminalSize,
+        UiState,
     },
 };
 use devenv_activity::ActivityLevel;
 use human_repr::{HumanCount, HumanDuration};
 use iocraft::Context;
 use iocraft::components::ContextProvider;
+use iocraft::hooks::UseComponentRect;
 use iocraft::prelude::*;
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Height reserved for the bottom summary bar (1 line content + 1 line margin_top).
+pub const SUMMARY_BAR_HEIGHT: u16 = 2;
+
+/// Map from activity_id to rendered height in lines.
+pub type ActivityHeights = Ref<HashMap<u64, i32>>;
+
+/// Pre-computed state passed from the app to avoid redundant computation in `view()`.
+pub struct ScrollState {
+    pub handle: Option<Ref<ScrollViewHandle>>,
+    pub display_activities: Vec<DisplayActivity>,
+}
+
 /// Main view function that creates the UI
-pub fn view(model: &ActivityModel, ui_state: &UiState) -> impl Into<AnyElement<'static>> {
-    let active_activities = model.get_display_activities();
+pub fn view(
+    model: &ActivityModel,
+    ui_state: &UiState,
+    render_context: RenderContext,
+    scroll: Option<ScrollState>,
+    shutting_down: bool,
+) -> impl Into<AnyElement<'static>> {
+    let (scroll_handle, active_activities) = match scroll {
+        Some(s) => (s.handle, s.display_activities),
+        None => (None, model.get_display_activities()),
+    };
 
     let summary = model.calculate_summary();
-    let has_selection = ui_state.selected_activity.is_some();
     let selected_id = ui_state.selected_activity;
     let terminal_size = ui_state.terminal_size;
 
@@ -27,15 +50,7 @@ pub fn view(model: &ActivityModel, ui_state: &UiState) -> impl Into<AnyElement<'
     let selected_activity = selected_id.and_then(|id| model.get_activity(id));
     let selected_logs = selected_activity
         .as_ref()
-        .filter(|a| {
-            matches!(a.variant, ActivityVariant::Build(_))
-                || matches!(a.variant, ActivityVariant::Evaluating(_))
-                || matches!(a.variant, ActivityVariant::Message(_))
-        })
         .and_then(|a| model.get_build_logs(a.id));
-
-    // Get standalone error messages for display
-    let error_messages = model.get_error_messages();
 
     // Show all activities (including the selected activity with inline logs)
     let activities_to_show: Vec<_> = active_activities.iter().collect();
@@ -50,7 +65,7 @@ pub fn view(model: &ActivityModel, ui_state: &UiState) -> impl Into<AnyElement<'
         // Pass logs for activities that should display them:
         // - Tasks with show_output=true or failed: show logs inline
         // - Messages with details: always show details inline
-        // - Selected build/eval activities: show logs when selected
+        // - Selected activities: show logs when selected
         let task_failed = matches!(
             (&activity.variant, &activity.state),
             (
@@ -58,18 +73,23 @@ pub fn view(model: &ActivityModel, ui_state: &UiState) -> impl Into<AnyElement<'
                 NixActivityState::Completed { success: false, .. }
             )
         );
-        let activity_logs = if let ActivityVariant::Task(ref task_data) = activity.variant
-            && (task_data.show_output || task_failed)
-        {
+        let devenv_failed = matches!(
+            (&activity.variant, &activity.state),
+            (
+                ActivityVariant::Devenv,
+                NixActivityState::Completed { success: false, .. }
+            )
+        );
+        let show_activity_logs = devenv_failed
+            || match &activity.variant {
+                ActivityVariant::Task(task_data) => task_data.show_output || task_failed,
+                ActivityVariant::Process(_) => true,
+                ActivityVariant::Message(msg_data) => msg_data.details.is_some(),
+                _ => false,
+            };
+        let activity_logs = if show_activity_logs {
             model.get_build_logs(activity.id).cloned()
-        } else if let ActivityVariant::Message(ref msg_data) = activity.variant
-            && msg_data.details.is_some()
-        {
-            model.get_build_logs(activity.id).cloned()
-        } else if is_selected
-            && (matches!(activity.variant, ActivityVariant::Build(_))
-                || matches!(activity.variant, ActivityVariant::Evaluating(_)))
-        {
+        } else if is_selected {
             selected_logs.cloned()
         } else {
             None
@@ -90,8 +110,11 @@ pub fn view(model: &ActivityModel, ui_state: &UiState) -> impl Into<AnyElement<'
                     depth: display_activity.depth,
                     is_selected,
                     logs: activity_logs,
+                    log_line_count: model.get_log_line_count(activity.id),
                     completed,
                     cached,
+                    render_context,
+                    shutting_down,
                 })) {
                     ActivityItem
                 }
@@ -112,10 +135,13 @@ pub fn view(model: &ActivityModel, ui_state: &UiState) -> impl Into<AnyElement<'
         (false, !selectable_ids.is_empty())
     };
 
+    // Show summary (nav bar) only in normal render context
+    let show_summary = render_context == RenderContext::Normal;
+
     let summary_view = element! {
         ContextProvider(value: Context::owned(SummaryViewContext {
             summary: summary.clone(),
-            has_selection,
+            selected: selected_activity.cloned(),
             showing_logs: selected_logs.is_some(),
             can_go_up,
             can_go_down,
@@ -125,125 +151,68 @@ pub fn view(model: &ActivityModel, ui_state: &UiState) -> impl Into<AnyElement<'
     }
     .into_any();
 
-    // Calculate dynamic height based on all activities (including inline logs)
-    let mut total_height = 0;
-    for display_activity in activities_to_show.iter() {
-        total_height += 1; // Base height for activity
-
-        let is_selected = selected_id.is_some_and(|id| {
-            display_activity.activity.id == id && display_activity.activity.id != 0
-        });
-
-        // Add extra line for downloads with progress
-        if let ActivityVariant::Download(ref download_data) = display_activity.activity.variant {
-            if download_data.size_current.is_some() && download_data.size_total.is_some() {
-                total_height += 1; // Extra line for progress bar
-            } else if let Some(progress) = &display_activity.activity.progress
-                && progress.total.unwrap_or(0) > 0
-            {
-                total_height += 1; // Extra line for progress bar
-            }
-        }
-
-        // Build and evaluation activities show logs when selected (collapsed preview)
-        if is_selected
-            && (matches!(display_activity.activity.variant, ActivityVariant::Build(_))
-                || matches!(
-                    display_activity.activity.variant,
-                    ActivityVariant::Evaluating(_)
-                ))
-            && let Some(logs) = selected_logs
-        {
-            let logs_component = ExpandedContentComponent::new(Some(logs));
-            total_height += logs_component.calculate_height();
-        }
-
-        // Message activities with details show limited lines (collapsed preview)
-        if let ActivityVariant::Message(ref msg_data) = display_activity.activity.variant
-            && msg_data.details.is_some()
-            && let Some(logs) = model.get_build_logs(display_activity.activity.id)
-        {
-            let visible_count = logs.len().min(LOG_VIEWPORT_COLLAPSED);
-            total_height += visible_count;
+    // Build the activity list element
+    let activity_list = element! {
+        View(flex_direction: FlexDirection::Column, width: 100pct) {
+            #(activity_elements)
         }
     }
-    let min_height = 3; // Minimum height to show at least a few items
-    let dynamic_height = total_height.max(min_height) as u32;
+    .into_any();
 
     let mut children = vec![];
 
-    // Task activities are now included in the regular activity list
-    // No separate task bar needed
-
-    // Activity list (with inline logs)
-    children.push(
-        element! {
-            View(flex_grow: 1.0, width: 100pct) {
-                View(flex_direction: FlexDirection::Column, width: 100pct) {
-                    #(activity_elements)
-                }
-            }
-        }
-        .into_any(),
-    );
-
-    // Error messages panel (if there are any standalone errors)
-    let error_panel_height = if !error_messages.is_empty() {
-        // Create error message elements
-        let error_elements: Vec<AnyElement<'static>> = error_messages
-            .iter()
-            .take(10) // Limit to 10 most recent errors
-            .map(|msg| {
-                element! {
-                    View(height: 1, flex_direction: FlexDirection::Row, padding_left: 1, padding_right: 1) {
-                        View(margin_right: 1, flex_shrink: 0.0) {
-                            Text(content: "✗", color: COLOR_FAILED)
-                        }
-                        View(flex_grow: 1.0, min_width: 0, overflow: Overflow::Hidden) {
-                            Text(content: msg.text.clone(), color: COLOR_FAILED)
-                        }
-                    }
-                }
-                .into_any()
-            })
-            .collect();
-
-        let error_count = error_elements.len();
+    // Activity list: wrap in ScrollView for Normal render with scroll_handle,
+    // use plain layout for Final render
+    if let Some(handle) = scroll_handle {
+        let scroll_height = terminal_size.height.saturating_sub(SUMMARY_BAR_HEIGHT) as u32;
         children.push(
             element! {
-                View(flex_direction: FlexDirection::Column, width: 100pct) {
-                    #(error_elements)
+                View(height: scroll_height) {
+                    ScrollView(auto_scroll: true, keyboard_scroll: false, handle: handle) {
+                        #(activity_list)
+                    }
                 }
             }
             .into_any(),
         );
-        error_count
     } else {
-        0
-    };
-
-    // Summary line at bottom
-    children.push(
-        element! {
-            View(
-                height: 1,
-                padding_left: 1,
-                padding_right: 1
-            ) {
-                #(summary_view)
+        children.push(
+            element! {
+                View(flex_grow: 1.0, width: 100pct) {
+                    #(activity_list)
+                }
             }
-        }
-        .into_any(),
-    );
+            .into_any(),
+        );
+    }
 
-    // Total height: activities (with inline logs) + error panel + summary line + buffer
-    // Constrain to terminal height to prevent overflow when logs are expanded
-    let calculated_height = dynamic_height + error_panel_height as u32 + 2; // +1 for summary, +1 buffer
-    let total_height = calculated_height.min(terminal_size.height as u32);
+    // Summary line at bottom (only in normal render context)
+    if show_summary {
+        children.push(
+            element! {
+                View(
+                    height: 1,
+                    flex_shrink: 0.0,
+                    margin_top: 1,
+                    padding_left: 1,
+                    padding_right: 1
+                ) {
+                    #(summary_view)
+                }
+            }
+            .into_any(),
+        );
+    }
 
     element! {
         ContextProvider(value: Context::owned(terminal_size)) {
-            View(flex_direction: FlexDirection::Column, height: total_height, width: 100pct) {
+            View(
+                flex_direction: FlexDirection::Column,
+                max_height: terminal_size.height as u32,
+                width: 100pct,
+                overflow: Overflow::Hidden,
+                justify_content: JustifyContent::FlexEnd,
+            ) {
                 #(children)
             }
         }
@@ -257,21 +226,31 @@ struct ActivityRenderContext {
     depth: usize,
     is_selected: bool,
     logs: Option<Arc<VecDeque<String>>>,
+    /// Total log line count (not affected by buffer rotation)
+    log_line_count: usize,
     /// Completion state: None = active, Some(true) = success, Some(false) = failed
     completed: Option<bool>,
     /// Whether this activity's result was cached
     cached: bool,
+    /// Whether this is the final render before exit
+    render_context: RenderContext,
+    /// Whether the application is shutting down (Ctrl-C pressed)
+    shutting_down: bool,
 }
 
 /// Helper to build activity prefix with hierarchy and status indicator.
 /// - Top-level (depth == 0): [StatusIndicator]
 /// - Nested (depth > 0): [HierarchyPrefix][StatusIndicator]
-fn build_activity_prefix(depth: usize, completed: Option<bool>) -> Vec<AnyElement<'static>> {
+fn build_activity_prefix(
+    depth: usize,
+    completed: Option<bool>,
+    show_spinner: bool,
+) -> Vec<AnyElement<'static>> {
     let mut prefix = HierarchyPrefixComponent::new(depth).render();
 
     prefix.push(
         element!(View(margin_right: 1) {
-            StatusIndicator(completed: completed, show_spinner: true)
+            StatusIndicator(completed: completed, show_spinner: show_spinner)
         })
         .into_any(),
     );
@@ -281,16 +260,29 @@ fn build_activity_prefix(depth: usize, completed: Option<bool>) -> Vec<AnyElemen
 
 /// Render a single activity (owned version)
 #[component]
-fn ActivityItem(hooks: Hooks) -> impl Into<AnyElement<'static>> {
+fn ActivityItem(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let terminal_width = hooks.use_context::<TerminalSize>().width;
     let ctx = hooks.use_context::<ActivityRenderContext>();
+
+    // Measure rendered height and report it to the shared heights map.
+    // Copy the iocraft Ref (which is Copy) out of the cell::Ref so we can call write().
+    let heights = hooks.try_use_context::<ActivityHeights>().map(|r| *r);
+    let rect = hooks.use_component_rect();
+    if let (Some(mut heights), Some(rect)) = (heights, rect) {
+        let height = rect.bottom.saturating_sub(rect.top);
+        heights.write().insert(ctx.activity.id, height);
+    }
+
     let ActivityRenderContext {
         activity,
         depth,
         is_selected,
         logs,
+        log_line_count,
         completed,
         cached,
+        render_context,
+        shutting_down,
     } = &*ctx;
 
     // Calculate elapsed time - use stored duration for completed activities, skip for queued
@@ -305,22 +297,32 @@ fn ActivityItem(hooks: Hooks) -> impl Into<AnyElement<'static>> {
         ActivityVariant::Build(build_data) => {
             let is_completed = completed.is_some();
 
-            // Completed builds: no suffix, just show the build name and duration
-            // Active/queued builds: show phase as suffix
+            // Show line count for completed builds, phase + line count for active builds
             let phase_suffix = if is_completed {
-                None
+                if *log_line_count > 0 {
+                    Some(format!("{} lines", log_line_count))
+                } else {
+                    None
+                }
+            } else if *log_line_count > 0 {
+                build_data
+                    .phase
+                    .as_ref()
+                    .map(|p| format!("{} ({} lines)", p, log_line_count))
+                    .or_else(|| Some(format!("{} lines", log_line_count)))
             } else {
                 build_data.phase.clone()
             };
 
             // For selected build activities, use custom multi-line rendering
             if *is_selected {
-                let prefix = build_activity_prefix(*depth, *completed);
+                let prefix = build_activity_prefix(*depth, *completed, true);
 
                 let main_line = ActivityTextComponent::new(
                     "building".to_string(),
                     activity.short_name.clone(),
                     elapsed_str,
+                    activity.variant.clone(),
                 )
                 .with_suffix(phase_suffix.clone())
                 .with_completed(is_completed)
@@ -333,12 +335,13 @@ fn ActivityItem(hooks: Hooks) -> impl Into<AnyElement<'static>> {
             }
 
             // Non-selected build activities use normal rendering
-            let prefix = build_activity_prefix(*depth, *completed);
+            let prefix = build_activity_prefix(*depth, *completed, true);
 
             return ActivityTextComponent::new(
                 "building".to_string(),
                 activity.short_name.clone(),
                 elapsed_str,
+                activity.variant.clone(),
             )
             .with_suffix(phase_suffix)
             .with_completed(is_completed)
@@ -346,21 +349,54 @@ fn ActivityItem(hooks: Hooks) -> impl Into<AnyElement<'static>> {
             .render(terminal_width, *depth, prefix);
         }
         ActivityVariant::Task(task_data) => {
-            let status_text = match task_data.status {
-                TaskDisplayStatus::Pending => Some("pending"),
-                TaskDisplayStatus::Running => None, // Don't show "running", the spinner indicates it
-                TaskDisplayStatus::Success => Some("success"),
-                TaskDisplayStatus::Failed => Some("failed"),
-                TaskDisplayStatus::Skipped => Some("skipped"),
-                TaskDisplayStatus::Cancelled => Some("cancelled"),
+            // Base status without log line (used as fallback or when no log)
+            let base_status = match task_data.status {
+                TaskDisplayStatus::Pending => Some("pending".to_string()),
+                TaskDisplayStatus::Running if *log_line_count > 0 => {
+                    Some(format!("{} lines", log_line_count))
+                }
+                TaskDisplayStatus::Running => None,
+                TaskDisplayStatus::Success if *log_line_count > 0 => {
+                    Some(format!("{} lines", log_line_count))
+                }
+                TaskDisplayStatus::Success => None,
+                TaskDisplayStatus::Failed if *log_line_count > 0 => {
+                    Some(format!("failed ({} lines)", log_line_count))
+                }
+                TaskDisplayStatus::Failed => Some("failed".to_string()),
+                TaskDisplayStatus::Skipped => Some("skipped".to_string()),
+                TaskDisplayStatus::Cancelled => Some("cancelled".to_string()),
             };
-            let prefix = build_activity_prefix(*depth, *completed);
 
-            let main_line = ActivityTextComponent::name_only(activity.name.clone(), elapsed_str)
-                .with_suffix(status_text.map(String::from))
-                .with_completed(completed.is_some())
-                .with_selection(*is_selected)
-                .render(terminal_width, *depth, prefix);
+            // Append last log line if available (overflow will truncate naturally)
+            let status_text =
+                if let Some(last_line) = task_data.last_log_line.as_ref().map(|l| l.trim()) {
+                    if last_line.is_empty() {
+                        base_status
+                    } else {
+                        match task_data.status {
+                            TaskDisplayStatus::Failed => Some(format!("failed → {}", last_line)),
+                            _ => match base_status {
+                                Some(base) => Some(format!("{} → {}", base, last_line)),
+                                None => Some(format!("→ {}", last_line)),
+                            },
+                        }
+                    }
+                } else {
+                    base_status
+                };
+
+            let prefix = build_activity_prefix(*depth, *completed, true);
+
+            let main_line = ActivityTextComponent::name_only(
+                activity.name.clone(),
+                elapsed_str,
+                activity.variant.clone(),
+            )
+            .with_suffix(status_text)
+            .with_completed(completed.is_some())
+            .with_selection(*is_selected)
+            .render(terminal_width, *depth, prefix);
 
             // Show logs inline for tasks with show_output=true or failed tasks
             let task_failed = *completed == Some(false);
@@ -370,9 +406,14 @@ fn ActivityItem(hooks: Hooks) -> impl Into<AnyElement<'static>> {
                 } else {
                     "  → waiting for output..."
                 };
-                return ExpandedContentComponent::new(logs.as_deref())
-                    .with_empty_message(empty_message)
-                    .render_with_main_line(main_line);
+                let mut component = ExpandedContentComponent::new(logs.as_deref())
+                    .with_empty_message(empty_message);
+                if task_failed {
+                    component = component.with_max_lines(LOG_VIEWPORT_FAILED);
+                } else if task_data.show_output && !is_selected {
+                    component = component.with_max_lines(LOG_VIEWPORT_SHOW_OUTPUT);
+                }
+                return component.render_with_main_line(main_line);
             }
 
             return main_line;
@@ -402,12 +443,13 @@ fn ActivityItem(hooks: Hooks) -> impl Into<AnyElement<'static>> {
                             progress.current.unwrap_or(0).human_count_bytes()
                         )
                     });
-                    let prefix = build_activity_prefix(*depth, *completed);
+                    let prefix = build_activity_prefix(*depth, *completed, true);
 
                     return ActivityTextComponent::new(
                         "downloading".to_string(),
                         activity.short_name.clone(),
                         elapsed_str,
+                        activity.variant.clone(),
                     )
                     .with_suffix(from_suffix)
                     .with_completed(completed.is_some())
@@ -420,12 +462,13 @@ fn ActivityItem(hooks: Hooks) -> impl Into<AnyElement<'static>> {
                     .substituter
                     .as_ref()
                     .map(|s| format!("from {}", s));
-                let prefix = build_activity_prefix(*depth, *completed);
+                let prefix = build_activity_prefix(*depth, *completed, true);
 
                 return ActivityTextComponent::new(
                     "downloading".to_string(),
                     activity.short_name.clone(),
                     elapsed_str,
+                    activity.variant.clone(),
                 )
                 .with_suffix(from_suffix)
                 .with_completed(completed.is_some())
@@ -434,12 +477,13 @@ fn ActivityItem(hooks: Hooks) -> impl Into<AnyElement<'static>> {
             }
         }
         ActivityVariant::Copy => {
-            let prefix = build_activity_prefix(*depth, *completed);
+            let prefix = build_activity_prefix(*depth, *completed, true);
 
             return ActivityTextComponent::new(
                 "copying".to_string(),
                 activity.short_name.clone(),
                 elapsed_str,
+                activity.variant.clone(),
             )
             .with_suffix(Some("to the store".to_string()))
             .with_completed(completed.is_some())
@@ -451,12 +495,13 @@ fn ActivityItem(hooks: Hooks) -> impl Into<AnyElement<'static>> {
                 .substituter
                 .as_ref()
                 .map(|s| format!("from {}", s));
-            let prefix = build_activity_prefix(*depth, *completed);
+            let prefix = build_activity_prefix(*depth, *completed, true);
 
             return ActivityTextComponent::new(
                 "querying".to_string(),
                 activity.short_name.clone(),
                 elapsed_str,
+                activity.variant.clone(),
             )
             .with_suffix(suffix)
             .with_completed(completed.is_some())
@@ -464,12 +509,13 @@ fn ActivityItem(hooks: Hooks) -> impl Into<AnyElement<'static>> {
             .render(terminal_width, *depth, prefix);
         }
         ActivityVariant::FetchTree => {
-            let prefix = build_activity_prefix(*depth, *completed);
+            let prefix = build_activity_prefix(*depth, *completed, true);
 
             return ActivityTextComponent::new(
                 "fetching".to_string(),
                 activity.name.clone(),
                 elapsed_str,
+                activity.variant.clone(),
             )
             .with_completed(completed.is_some())
             .with_selection(*is_selected)
@@ -487,43 +533,201 @@ fn ActivityItem(hooks: Hooks) -> impl Into<AnyElement<'static>> {
 
             // For selected evaluation activities, show expandable file list
             if *is_selected && logs.is_some() {
-                let prefix = build_activity_prefix(*depth, *completed);
+                let prefix = build_activity_prefix(*depth, *completed, true);
 
-                let main_line =
-                    ActivityTextComponent::name_only(activity.name.clone(), elapsed_str)
-                        .with_suffix(suffix)
-                        .with_completed(completed.is_some())
-                        .with_selection(*is_selected)
-                        .render(terminal_width, *depth, prefix);
+                let main_line = ActivityTextComponent::name_only(
+                    activity.name.clone(),
+                    elapsed_str,
+                    activity.variant.clone(),
+                )
+                .with_suffix(suffix)
+                .with_completed(completed.is_some())
+                .with_selection(*is_selected)
+                .render(terminal_width, *depth, prefix);
 
                 return ExpandedContentComponent::new(logs.as_deref())
                     .with_empty_message("  → no files evaluated yet (press '^e' to expand)")
                     .render_with_main_line(main_line);
             }
 
-            let prefix = build_activity_prefix(*depth, *completed);
+            let prefix = build_activity_prefix(*depth, *completed, true);
 
-            return ActivityTextComponent::name_only(activity.name.clone(), elapsed_str)
-                .with_suffix(suffix)
-                .with_completed(completed.is_some())
-                .with_selection(*is_selected)
-                .render(terminal_width, *depth, prefix);
+            return ActivityTextComponent::name_only(
+                activity.name.clone(),
+                elapsed_str,
+                activity.variant.clone(),
+            )
+            .with_suffix(suffix)
+            .with_completed(completed.is_some())
+            .with_selection(*is_selected)
+            .render(terminal_width, *depth, prefix);
         }
         ActivityVariant::UserOperation => {
-            let prefix = build_activity_prefix(*depth, *completed);
+            let prefix = build_activity_prefix(*depth, *completed, true);
 
-            return ActivityTextComponent::name_only(activity.name.clone(), elapsed_str)
-                .with_completed(completed.is_some())
-                .with_selection(*is_selected)
-                .render(terminal_width, *depth, prefix);
+            return ActivityTextComponent::name_only(
+                activity.name.clone(),
+                elapsed_str,
+                activity.variant.clone(),
+            )
+            .with_completed(completed.is_some())
+            .with_selection(*is_selected)
+            .render(terminal_width, *depth, prefix);
         }
         ActivityVariant::Devenv => {
-            let prefix = build_activity_prefix(*depth, *completed);
+            let prefix = build_activity_prefix(*depth, *completed, true);
 
-            return ActivityTextComponent::name_only(activity.name.clone(), elapsed_str)
-                .with_completed(completed.is_some())
-                .with_selection(*is_selected)
-                .render(terminal_width, *depth, prefix);
+            // Show line count as suffix when active or failed with logs
+            let suffix = if *completed == Some(true) {
+                // Success - no suffix needed
+                None
+            } else if let Some(ref progress) = activity.progress {
+                // Show progress with optional detail
+                let progress_text = match (progress.current, progress.total) {
+                    (Some(current), Some(total)) if total > 0 => {
+                        format!("{}/{}", current, total)
+                    }
+                    _ => String::new(),
+                };
+                match (&activity.detail, progress_text.is_empty()) {
+                    (Some(detail), false) => Some(format!("{} → {}", progress_text, detail)),
+                    (Some(detail), true) => Some(format!("→ {}", detail)),
+                    (None, false) => Some(progress_text),
+                    (None, true) => None,
+                }
+            } else if let Some(ref detail) = activity.detail {
+                Some(format!("→ {}", detail))
+            } else if *log_line_count > 0 {
+                // In progress or failed with logs - show line count
+                Some(format!("{} lines", log_line_count))
+            } else {
+                None
+            };
+
+            let main_line = ActivityTextComponent::name_only(
+                activity.name.clone(),
+                elapsed_str,
+                activity.variant.clone(),
+            )
+            .with_suffix(suffix)
+            .with_completed(completed.is_some())
+            .with_selection(*is_selected)
+            .render(terminal_width, *depth, prefix);
+
+            // Show logs when selected or when failed
+            let failed = *completed == Some(false);
+            if (failed || *is_selected) && logs.is_some() {
+                let mut component = ExpandedContentComponent::new(logs.as_deref())
+                    .with_empty_message("  → no output yet");
+                if failed {
+                    component = component.with_max_lines(LOG_VIEWPORT_FAILED);
+                }
+                return component.render_with_main_line(main_line);
+            }
+
+            return main_line;
+        }
+        ActivityVariant::Process(process_data) => {
+            let is_active = matches!(
+                process_data.lifecycle,
+                ProcessLifecycle::Starting
+                    | ProcessLifecycle::Running
+                    | ProcessLifecycle::Ready
+                    | ProcessLifecycle::Restarting
+            );
+
+            // Build status text with optional ports
+            let status_str: std::borrow::Cow<str> = match &process_data.lifecycle {
+                _ if *shutting_down && is_active => "stopping".into(),
+                ProcessLifecycle::Disabled => "disabled".into(),
+                ProcessLifecycle::Starting => "starting".into(),
+                ProcessLifecycle::Running => {
+                    if let Some(probe) = &process_data.ready_probe {
+                        format!("running (not ready: {})", probe).into()
+                    } else {
+                        "running".into()
+                    }
+                }
+                ProcessLifecycle::Ready => "ready".into(),
+                ProcessLifecycle::Restarting => "restarting".into(),
+                ProcessLifecycle::Stopped { success: true } => "stopped".into(),
+                ProcessLifecycle::Stopped { success: false } => "failed".into(),
+            };
+
+            // Format ports: extract just the port numbers for brevity
+            let ports_suffix = if !process_data.ports.is_empty() {
+                let port_list: Vec<String> = process_data
+                    .ports
+                    .iter()
+                    .filter_map(|spec| {
+                        // spec is like "http:8080" or just "8080"
+                        // Extract the port number (last part after colon)
+                        spec.rsplit(':').next().map(|p| format!(":{}", p))
+                    })
+                    .collect();
+                if port_list.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", port_list.join(", "))
+                }
+            } else {
+                String::new()
+            };
+
+            let status_text = Some(format!("{}{}", status_str, ports_suffix));
+
+            // Process prefix: spinner when running, no indicator when stopped
+            // but not yet completed, checkmark/X when completed.
+            let show_spinner = completed.is_none() && is_active;
+            let prefix = build_activity_prefix(*depth, *completed, show_spinner);
+
+            // Hide elapsed time for disabled/stopped processes that were never started
+            let process_elapsed = if matches!(process_data.lifecycle, ProcessLifecycle::Disabled)
+                || (!is_active && completed.is_none())
+            {
+                String::new()
+            } else {
+                elapsed_str
+            };
+
+            let main_line = ActivityTextComponent::new(
+                "".to_string(),
+                activity.name.clone(),
+                process_elapsed,
+                activity.variant.clone(),
+            )
+            .with_suffix(status_text)
+            .with_selection(*is_selected)
+            .render(terminal_width, *depth, prefix);
+
+            // Show logs: always show LOG_VIEWPORT_SHOW_OUTPUT lines,
+            // expand when selected, show more when failed
+            let process_failed = *completed == Some(false);
+            if logs.is_some() {
+                let mut component = ExpandedContentComponent::new(logs.as_deref())
+                    .with_depth(*depth)
+                    .with_empty_message("→ no output yet (press 'e' to expand)");
+                if process_failed && *render_context == RenderContext::Final {
+                    component = component.with_max_lines(LOG_VIEWPORT_FAILED);
+                } else if !is_selected {
+                    component = component.with_max_lines(LOG_VIEWPORT_SHOW_OUTPUT);
+                }
+
+                let mut elements = vec![main_line];
+                let log_elements = component.render();
+                elements.extend(log_elements);
+
+                let log_viewport_height = component.calculate_height();
+                let total_height = (1 + log_viewport_height).min(50) as u32;
+                return element! {
+                    View(height: total_height, flex_direction: FlexDirection::Column) {
+                        #(elements)
+                    }
+                }
+                .into_any();
+            }
+
+            return main_line;
         }
         ActivityVariant::Message(msg_data) => {
             // Determine icon and color based on message level
@@ -562,7 +766,7 @@ fn ActivityItem(hooks: Hooks) -> impl Into<AnyElement<'static>> {
                     let visible_lines: Vec<_> = detail_lines
                         .iter()
                         .rev()
-                        .take(LOG_VIEWPORT_COLLAPSED)
+                        .take(LOG_VIEWPORT_FAILED)
                         .collect::<Vec<_>>()
                         .into_iter()
                         .rev()
@@ -668,12 +872,13 @@ fn ActivityItem(hooks: Hooks) -> impl Into<AnyElement<'static>> {
             }
         }
         ActivityVariant::Unknown => {
-            let prefix = build_activity_prefix(*depth, *completed);
+            let prefix = build_activity_prefix(*depth, *completed, true);
 
             return ActivityTextComponent::new(
                 "unknown".to_string(),
                 activity.name.clone(),
                 elapsed_str,
+                activity.variant.clone(),
             )
             .with_completed(completed.is_some())
             .with_selection(*is_selected)
@@ -686,7 +891,7 @@ fn ActivityItem(hooks: Hooks) -> impl Into<AnyElement<'static>> {
 #[derive(Clone)]
 struct SummaryViewContext {
     summary: ActivitySummary,
-    has_selection: bool,
+    selected: Option<Activity>,
     showing_logs: bool,
     can_go_up: bool,
     can_go_down: bool,
@@ -699,7 +904,7 @@ fn SummaryView(hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let ctx = hooks.use_context::<SummaryViewContext>();
     let SummaryViewContext {
         summary,
-        has_selection,
+        selected,
         showing_logs,
         can_go_up,
         can_go_down,
@@ -707,7 +912,7 @@ fn SummaryView(hooks: Hooks) -> impl Into<AnyElement<'static>> {
 
     build_summary_view_impl(
         summary,
-        *has_selection,
+        selected.as_ref(),
         *showing_logs,
         *can_go_up,
         *can_go_down,
@@ -718,7 +923,7 @@ fn SummaryView(hooks: Hooks) -> impl Into<AnyElement<'static>> {
 /// Build the summary view with colored counts
 fn build_summary_view_impl(
     summary: &ActivitySummary,
-    has_selection: bool,
+    selected: Option<&Activity>,
     showing_logs: bool,
     can_go_up: bool,
     can_go_down: bool,
@@ -726,6 +931,11 @@ fn build_summary_view_impl(
 ) -> AnyElement<'static> {
     let mut children = vec![];
     let mut has_content = false;
+
+    // Derive capabilities from selected activity
+    let has_selection = selected.is_some();
+    let is_process =
+        matches!(selected, Some(a) if matches!(a.variant, ActivityVariant::Process(_)));
 
     // Determine display mode based on terminal width
     let use_symbols = terminal_width < 60; // Use unicode symbols for very narrow terminals
@@ -737,7 +947,14 @@ fn build_summary_view_impl(
                 Text(content: "│", color: COLOR_HIERARCHY)
             }).into_any());
         }
-        let total_builds = summary.active_builds + summary.completed_builds + summary.failed_builds;
+        // Use expected count from SetExpected events if available, otherwise fall back to observed total
+        let observed_total =
+            summary.active_builds + summary.completed_builds + summary.failed_builds;
+        let total_builds = summary
+            .expected_builds
+            .map(|e| e as usize)
+            .unwrap_or(observed_total)
+            .max(observed_total);
 
         // Format: "2 of 4 builds" or "2/4 builds" - protect numbers from truncation
         if use_symbols {
@@ -773,7 +990,13 @@ fn build_summary_view_impl(
                 Text(content: "│", color: COLOR_HIERARCHY)
             }).into_any());
         }
-        let total_downloads = summary.active_downloads + summary.completed_downloads;
+        // Use expected count from SetExpected events if available, otherwise fall back to observed total
+        let observed_total = summary.active_downloads + summary.completed_downloads;
+        let total_downloads = summary
+            .expected_downloads
+            .map(|e| e as usize)
+            .unwrap_or(observed_total)
+            .max(observed_total);
 
         // Format: "3 of 7 downloads" or "3/7 downloads" - protect numbers from truncation
         if use_symbols {
@@ -871,6 +1094,27 @@ fn build_summary_view_impl(
             })
             .into_any(),
         );
+        has_content = true;
+    }
+
+    // Processes - show if there are any running
+    if summary.running_processes > 0 {
+        if has_content {
+            children.push(element!(View(margin_left: if use_symbols { 1 } else { 2 }, margin_right: if use_symbols { 1 } else { 2 }, flex_shrink: 0.0) {
+                Text(content: "│", color: COLOR_HIERARCHY)
+            }).into_any());
+        }
+
+        children.push(element!(View(margin_right: 1, flex_shrink: 0.0) {
+            Text(content: format!("{}", summary.running_processes), color: COLOR_COMPLETED, weight: Weight::Bold)
+        }).into_any());
+
+        children.push(
+            element!(View(flex_shrink: 0.0) {
+                Text(content: if summary.running_processes == 1 { "process" } else { "processes" })
+            })
+            .into_any(),
+        );
     }
 
     // Build help text - always show, adapt based on terminal width
@@ -908,6 +1152,14 @@ fn build_summary_view_impl(
             help_children.push(element!(Text(content: " expand • ")).into_any());
         } else {
             help_children.push(element!(Text(content: " expand logs • ")).into_any());
+        }
+        if is_process {
+            help_children.push(element!(Text(content: "^r", color: COLOR_INTERACTIVE)).into_any());
+            if use_short_text {
+                help_children.push(element!(Text(content: " restart • ")).into_any());
+            } else {
+                help_children.push(element!(Text(content: " restart process • ")).into_any());
+            }
         }
         help_children.push(element!(Text(content: "Esc", color: COLOR_INTERACTIVE)).into_any());
         if showing_logs {
@@ -948,5 +1200,8 @@ fn build_summary_view_impl(
 
 /// Format a duration in a human-readable way
 pub fn format_duration(duration: Duration) -> String {
+    if cfg!(feature = "deterministic-tui") {
+        return "[TIME]".to_string();
+    }
     duration.human_duration().to_string()
 }

@@ -1,14 +1,12 @@
 mod devenv_layer;
 mod human_duration;
-mod indicatif_layer;
 mod span_ids;
 mod span_timings;
 
-use devenv_layer::{DevenvFieldFormatter, DevenvFormat, DevenvLayer};
-use indicatif_layer::{DevenvIndicatifFilter, IndicatifLayer};
-use span_ids::{SpanIdLayer, SpanIds};
+use devenv_layer::{DevenvFormat, DevenvLayer};
+use span_ids::{SpanContext, SpanIdLayer};
 
-pub use devenv_core::cli::{TraceFormat, TraceOutput};
+pub use crate::cli::{TraceFormat, TraceOutput};
 pub use human_duration::HumanReadableDuration;
 
 use json_subscriber::JsonLayer;
@@ -88,7 +86,7 @@ where
     layer.with_timer("timestamp", tracing_subscriber::fmt::time::SystemTime);
     layer.with_level("level");
     layer.with_target("target");
-    layer.serialize_extension::<SpanIds>("span_ids");
+    layer.serialize_extension::<SpanContext>("span_context");
     layer.with_event("fields");
     layer
 }
@@ -98,26 +96,18 @@ fn create_filter(level: Level) -> EnvFilter {
         .with_default_directive(LevelFilter::from(level).into())
         .from_env_lossy()
         .add_directive("devenv::activity=trace".parse().unwrap())
+        .add_directive("watchexec=warn".parse().unwrap())
 }
 
 pub fn init_tracing_default() {
     init_cli_tracing(Level::default(), None);
 }
 
-/// Initialize tracing for legacy CLI mode with spinners and progress indicators.
+/// Initialize tracing for legacy CLI mode.
 /// Export format is always JSON.
 pub fn init_cli_tracing(level: Level, trace_output: Option<&TraceOutput>) {
     let ansi = io::stderr().is_terminal();
     let export_writer = trace_output.and_then(create_trace_writer);
-
-    let style =
-        tracing_indicatif::style::ProgressStyle::with_template("{spinner:.blue} {span_fields}")
-            .unwrap()
-            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]);
-    let indicatif = IndicatifLayer::new()
-        .with_progress_style(style)
-        .with_span_field_formatter(DevenvFieldFormatter);
-    let writer = indicatif.get_stderr_writer();
 
     Registry::default()
         .with(create_filter(level))
@@ -126,12 +116,12 @@ pub fn init_cli_tracing(level: Level, trace_output: Option<&TraceOutput>) {
         .with(
             tracing_subscriber::fmt::layer()
                 .event_format(DevenvFormat::default())
-                .with_writer(writer)
+                .with_writer(io::stderr)
                 .with_ansi(ansi),
         )
-        .with(DevenvIndicatifFilter::new(indicatif))
         .with(export_writer.map(create_json_layer))
-        .init();
+        .try_init()
+        .ok();
 }
 
 /// Initialize tracing with the specified format and output destination.
@@ -152,14 +142,14 @@ pub fn init_tracing(level: Level, trace_format: TraceFormat, trace_output: Optio
 
     let writer = trace_output.and_then(create_trace_writer);
 
-    match trace_format {
+    let _ = match trace_format {
         TraceFormat::Full => {
             let layer = writer.map(|w| {
                 tracing_subscriber::fmt::layer()
                     .with_ansi(ansi)
                     .with_writer(w)
             });
-            base.with(layer).init()
+            base.with(layer).try_init()
         }
         TraceFormat::Pretty => {
             let layer = writer.map(|w| {
@@ -168,11 +158,11 @@ pub fn init_tracing(level: Level, trace_format: TraceFormat, trace_output: Optio
                     .with_writer(w)
                     .pretty()
             });
-            base.with(layer).init()
+            base.with(layer).try_init()
         }
         TraceFormat::Json => {
             let layer = writer.map(create_json_layer);
-            base.with(layer).init()
+            base.with(layer).try_init()
         }
-    }
+    };
 }

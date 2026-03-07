@@ -19,12 +19,18 @@ boolean
 
 
 *Default:*
-` false `
+
+```nix
+false
+```
 
 
 
 *Example:*
-` true `
+
+```nix
+true
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/services/wiremock\.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/wiremock.nix)
@@ -45,7 +51,10 @@ package
 
 
 *Default:*
-` pkgs.wiremock `
+
+```nix
+pkgs.wiremock
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/services/wiremock\.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/wiremock.nix)
@@ -64,7 +73,10 @@ boolean
 
 
 *Default:*
-` false `
+
+```nix
+false
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/services/wiremock\.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/wiremock.nix)
@@ -86,13 +98,16 @@ JSON value
 
 
 *Default:*
-` [ ] `
+
+```nix
+[ ]
+```
 
 
 
 *Example:*
 
-```
+```nix
 [
   {
     request = {
@@ -136,12 +151,15 @@ The port number for the HTTP server to listen on\.
 
 
 *Type:*
-signed integer
+16 bit unsigned integer; between 0 and 65535 (both inclusive)
 
 
 
 *Default:*
-` 8080 `
+
+```nix
+8080
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/services/wiremock\.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/wiremock.nix)
@@ -162,7 +180,10 @@ boolean
 
 
 *Default:*
-` false `
+
+```nix
+false
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/services/wiremock\.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/wiremock.nix)

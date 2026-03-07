@@ -14,8 +14,34 @@ pub enum ActivityEvent {
     Evaluate(Evaluate),
     Task(Task),
     Command(Command),
+    Process(Process),
     Operation(Operation),
     Message(Message),
+    /// Aggregate expected counts announcement from Nix
+    SetExpected(SetExpected),
+    Shell(Shell),
+}
+
+/// Expected count announcement for aggregate activity tracking.
+/// Nix emits these events to announce how many items/bytes are expected
+/// before individual activities start (e.g., "expect 10 downloads").
+#[derive(Debug, Clone, Serialize, Deserialize, Valuable)]
+pub struct SetExpected {
+    /// The category of activity this expectation applies to
+    pub category: ExpectedCategory,
+    /// The expected count (items for builds, bytes for downloads)
+    pub expected: u64,
+    pub timestamp: Timestamp,
+}
+
+/// Categories for expected count tracking
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Valuable)]
+#[serde(rename_all = "lowercase")]
+pub enum ExpectedCategory {
+    /// Build activities (derivations to build)
+    Build,
+    /// Download activities (store paths to download, bytes to transfer)
+    Download,
 }
 
 /// Build activity events - has Phase, Progress, Log
@@ -118,7 +144,35 @@ pub enum FetchKind {
     Copy,
 }
 
-/// Evaluate activity events - has Log only
+/// A filesystem or environment operation observed during Nix evaluation.
+///
+/// These operations are logged during evaluation and can be used for
+/// cache invalidation and dependency tracking.
+///
+/// Note: Duplicated in `devenv_core::eval_op::EvalOp`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Valuable)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EvalOp {
+    /// Copied a file to the Nix store.
+    CopiedSource {
+        source: std::path::PathBuf,
+        target: std::path::PathBuf,
+    },
+    /// Evaluated a Nix file.
+    EvaluatedFile { source: std::path::PathBuf },
+    /// Read a file's contents with `builtins.readFile`.
+    ReadFile { source: std::path::PathBuf },
+    /// List a directory's contents with `builtins.readDir`.
+    ReadDir { source: std::path::PathBuf },
+    /// Read an environment variable with `builtins.getEnv`.
+    GetEnv { name: String },
+    /// Check that a file exists with `builtins.pathExists`.
+    PathExists { source: std::path::PathBuf },
+    /// Used a tracked devenv string path.
+    TrackedPath { source: std::path::PathBuf },
+}
+
+/// Evaluate activity events.
 #[derive(Debug, Clone, Serialize, Deserialize, Valuable)]
 #[serde(tag = "event", rename_all = "lowercase")]
 pub enum Evaluate {
@@ -137,31 +191,50 @@ pub enum Evaluate {
         outcome: ActivityOutcome,
         timestamp: Timestamp,
     },
+    /// Plain text log line from evaluation.
     Log {
         #[serde(alias = "activity_id")]
         id: u64,
         line: String,
         timestamp: Timestamp,
     },
+    /// Structured evaluation operation (parsed from log).
+    Op {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        op: EvalOp,
+        timestamp: Timestamp,
+    },
+}
+
+/// Information about a task in the hierarchy
+#[derive(Debug, Clone, Serialize, Deserialize, Valuable)]
+pub struct TaskInfo {
+    pub id: u64,
+    pub name: String,
+    #[serde(default)]
+    pub show_output: bool,
+    #[serde(default)]
+    pub is_process: bool,
 }
 
 /// Task activity events - has Progress, Log
 #[derive(Debug, Clone, Serialize, Deserialize, Valuable)]
 #[serde(tag = "event", rename_all = "lowercase")]
 pub enum Task {
+    /// Emit task hierarchy once upfront before execution
+    Hierarchy {
+        /// All tasks with their metadata
+        tasks: Vec<TaskInfo>,
+        /// Edges representing parent-child relationships: (parent_id, child_id)
+        /// A task appears under its dependents (i.e., tasks that depend on it)
+        edges: Vec<(u64, u64)>,
+        timestamp: Timestamp,
+    },
+    /// Task execution has started
     Start {
         #[serde(alias = "activity_id")]
         id: u64,
-        name: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        parent: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        detail: Option<String>,
-        #[serde(default)]
-        show_output: bool,
-        /// Whether this is a long-running process task (always shows output)
-        #[serde(default)]
-        is_process: bool,
         timestamp: Timestamp,
     },
     Complete {
@@ -217,7 +290,64 @@ pub enum Command {
     },
 }
 
-/// Operation activity events - minimal (generic devenv operations)
+/// Process activity events - for long-running managed processes
+#[derive(Debug, Clone, Serialize, Deserialize, Valuable)]
+#[serde(tag = "event", rename_all = "lowercase")]
+pub enum Process {
+    Start {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent: Option<u64>,
+        /// The command being executed
+        #[serde(skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+        /// Ports this process listens on (e.g., ["http:8080", "admin:9000"])
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ports: Vec<String>,
+        /// Human-readable description of the readiness probe (e.g., "exec: pg_isready", "http: localhost:8080/health")
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ready_probe: Option<String>,
+        #[serde(default)]
+        level: ActivityLevel,
+        timestamp: Timestamp,
+    },
+    Complete {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        outcome: ActivityOutcome,
+        timestamp: Timestamp,
+    },
+    Log {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        line: String,
+        #[serde(default)]
+        is_error: bool,
+        timestamp: Timestamp,
+    },
+    Status {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        status: ProcessStatus,
+        timestamp: Timestamp,
+    },
+}
+
+/// Status of a managed process
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Valuable)]
+#[serde(rename_all = "lowercase")]
+pub enum ProcessStatus {
+    /// Process has `start.enable = false`; registered but never launched.
+    Disabled,
+    Running,
+    Ready,
+    Restarting,
+    Stopped,
+}
+
+/// Operation activity events - generic devenv operations with log support
 #[derive(Debug, Clone, Serialize, Deserialize, Valuable)]
 #[serde(tag = "event", rename_all = "lowercase")]
 pub enum Operation {
@@ -239,11 +369,29 @@ pub enum Operation {
         outcome: ActivityOutcome,
         timestamp: Timestamp,
     },
+    Progress {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        done: u64,
+        expected: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        timestamp: Timestamp,
+    },
+    Log {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        line: String,
+        #[serde(default)]
+        is_error: bool,
+        timestamp: Timestamp,
+    },
 }
 
 /// Message - standalone (not an activity)
 #[derive(Debug, Clone, Serialize, Deserialize, Valuable)]
 pub struct Message {
+    pub id: u64,
     pub level: ActivityLevel,
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -251,6 +399,64 @@ pub struct Message {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent: Option<u64>,
     pub timestamp: Timestamp,
+}
+
+/// Shell activity events - interactive shell with hot-reload capability
+#[derive(Debug, Clone, Serialize, Deserialize, Valuable)]
+#[serde(tag = "event", rename_all = "lowercase")]
+pub enum Shell {
+    /// Shell session started
+    Start {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        /// Shell command being run (None for interactive)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+        /// Files being watched for changes
+        watch_files: Vec<String>,
+        timestamp: Timestamp,
+    },
+    /// Shell session ended
+    Complete {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        outcome: ActivityOutcome,
+        timestamp: Timestamp,
+    },
+    /// Output from the shell (PTY output)
+    Output {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        /// Raw bytes from PTY (may contain ANSI escape codes)
+        data: Vec<u8>,
+        timestamp: Timestamp,
+    },
+    /// Shell is reloading due to file changes
+    Reloading {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        /// Files that changed and triggered the reload
+        changed_files: Vec<String>,
+        timestamp: Timestamp,
+    },
+    /// Shell reload completed successfully
+    Reloaded {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        /// Files that were changed
+        changed_files: Vec<String>,
+        timestamp: Timestamp,
+    },
+    /// Shell reload failed
+    ReloadFailed {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        /// Files that triggered the reload
+        changed_files: Vec<String>,
+        /// Error message
+        error: String,
+        timestamp: Timestamp,
+    },
 }
 
 /// Outcome of an activity
@@ -449,6 +655,7 @@ mod tests {
     #[test]
     fn test_message_event() {
         let event = ActivityEvent::Message(Message {
+            id: 1,
             level: ActivityLevel::Info,
             text: "Test message".to_string(),
             details: None,

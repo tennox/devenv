@@ -11,11 +11,14 @@ default-run = "devenv"
 
 [dependencies]
 devenv-activity.workspace = true
-devenv-core.workspace = true
+devenv-core = { workspace = true, features = ["clap"] }
 devenv-eval-cache.workspace = true
+devenv-processes.workspace = true
 devenv-tasks.workspace = true
 devenv-tui.workspace = true
 devenv-cache-core.workspace = true
+devenv-reload.workspace = true
+devenv-shell.workspace = true
 devenv-snix-backend = { workspace = true, optional = true }
 devenv-nix-backend.workspace = true
 rand.workspace = true
@@ -23,6 +26,7 @@ nix-conf-parser.workspace = true
 tokio-shutdown.workspace = true
 
 clap.workspace = true
+clap_complete.workspace = true
 cli-table.workspace = true
 console.workspace = true
 dialoguer.workspace = true
@@ -47,13 +51,12 @@ sha2.workspace = true
 sqlx.workspace = true
 tempfile.workspace = true
 termimad.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 json-subscriber.workspace = true
-tracing-indicatif.workspace = true
-indicatif.workspace = true
 which.workspace = true
 whoami.workspace = true
 xdg.workspace = true
@@ -80,12 +83,23 @@ snix-build = { workspace = true, optional = true }
 nix-compat = { workspace = true, optional = true }
 nix-compat-derive = { workspace = true, optional = true }
 
+[build-dependencies]
+vergen-gitcl.workspace = true
+
 [dev-dependencies]
 devenv-nix-backend-macros.workspace = true
 
 [features]
 default = []
-integration-tests = []
+test-all = [
+  "test-mcp",
+  "devenv-processes/test-all",
+  "devenv-nix-backend/test-all",
+  "devenv-reload/test-all",
+  "devenv-shell/test-all",
+  "devenv-tui/test-all",
+]
+test-mcp = []
 snix = [
   "dep:devenv-snix-backend",
   "dep:nix-compat",

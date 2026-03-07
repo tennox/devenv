@@ -7,6 +7,7 @@ let
     else config.name;
   types = lib.types;
   envContainerName = builtins.getEnv "DEVENV_CONTAINER";
+  projectRoot = builtins.path { path = self; name = "source"; };
 
   nix2containerInput = config.lib.getInput {
     name = "nix2container";
@@ -159,7 +160,7 @@ let
     };
   };
 
-  # <registry> <args>
+  # <container> <registry> <args>
   mkCopyScript = cfg: pkgs.writeShellScript "copy-container" ''
     set -e -o pipefail
 
@@ -167,7 +168,7 @@ let
     shift
 
     if [[ "$1" == false ]]; then
-      registry=${cfg.registry}
+      registry="${cfg.registry}"
     else
       registry="$1"
     fi
@@ -205,7 +206,7 @@ let
       copyToRoot = lib.mkOption {
         type = types.either types.path (types.listOf types.path);
         description = "Add a path to the container. Defaults to the whole git repo.";
-        default = self;
+        default = projectRoot;
         defaultText = lib.literalExpression "self";
       };
 
@@ -382,7 +383,11 @@ let
         type = types.package;
         internal = true;
         default = pkgs.writeShellScript "docker-run" ''
-          docker run -it ${config.name}:${config.version} "$@"
+          if [ -t 0 ]; then
+            docker run -it ${config.name}:${config.version} "$@"
+          else
+            docker run -i ${config.name}:${config.version} "$@"
+          fi
         '';
       };
     };
@@ -435,5 +440,18 @@ in
       devenv.root = lib.mkForce "${homeDir}";
       devenv.dotfile = lib.mkOverride 49 "${homeDir}/.devenv";
     })
+    {
+      tasks."devenv:container:copy" = {
+        exec = ''
+          copy_script=$(${pkgs.jq}/bin/jq -r '.copy_script' <<< "$DEVENV_TASK_INPUT")
+          spec=$(${pkgs.jq}/bin/jq -r '.spec' <<< "$DEVENV_TASK_INPUT")
+          registry=$(${pkgs.jq}/bin/jq -r '.registry' <<< "$DEVENV_TASK_INPUT")
+          readarray -t copy_args < <(${pkgs.jq}/bin/jq -r '.copy_args[]' <<< "$DEVENV_TASK_INPUT")
+
+          "$copy_script" "$spec" "$registry" "''${copy_args[@]}"
+        '';
+        showOutput = true;
+      };
+    }
   ];
 }

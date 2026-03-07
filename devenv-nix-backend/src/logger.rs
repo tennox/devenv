@@ -30,11 +30,11 @@ use std::sync::Arc;
 /// Result of setting up the Nix logger.
 ///
 /// Contains both the logger (which must be kept alive) and the bridge
-/// (which is used to track eval activities).
+/// (which is used to track eval activities and input collection for caching).
 pub struct NixLoggerSetup {
     /// The activity logger - must be kept alive for the duration of Nix operations
     pub logger: nix_bindings_expr::logger::ActivityLogger,
-    /// The bridge for tracking eval activities
+    /// The bridge for tracking eval activities and input collection
     pub bridge: Arc<NixLogBridge>,
 }
 
@@ -44,7 +44,8 @@ pub struct NixLoggerSetup {
 /// via NixLogBridge. Returns both the logger and the bridge.
 ///
 /// The logger must be kept alive for the duration of Nix operations.
-/// The bridge is used to track eval activities dynamically via `begin_eval`/`end_eval`.
+/// The bridge is used to track eval activities dynamically via `begin_eval`/`end_eval`
+/// and to collect input operations for caching via observers.
 pub fn setup_nix_logger() -> Result<NixLoggerSetup> {
     let bridge = NixLogBridge::new();
 
@@ -167,6 +168,14 @@ fn create_log_callback(
         // Convert level to Verbosity
         let verbosity = level.try_into().unwrap_or(Verbosity::Info);
 
+        // Store error-level messages to be printed after TUI exits.
+        // This ensures Nix evaluation errors are displayed cleanly
+        // before the REPL, not mixed with TUI output.
+        if level == 0 {
+            // Level 0 = Error
+            bridge.store_pre_repl_error(msg.to_string());
+        }
+
         let log = InternalLog::Msg {
             msg: msg.to_string(),
             raw_msg: None,
@@ -179,8 +188,10 @@ fn create_log_callback(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use devenv_activity::ActivityLevel;
-    use nix_bindings_expr::eval_state::{EvalStateBuilder, gc_register_my_thread};
+    #[cfg(feature = "test-nix-store")]
+    use nix_bindings_expr::eval_state::EvalStateBuilder;
+    use nix_bindings_expr::eval_state::gc_register_my_thread;
+    #[cfg(feature = "test-nix-store")]
     use nix_bindings_store::store::Store;
 
     #[test]
@@ -197,6 +208,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "test-nix-store")]
     fn test_logger_captures_activity() {
         // Initialize Nix
         nix_bindings_expr::eval_state::init().expect("Failed to initialize Nix");
@@ -205,10 +217,8 @@ mod tests {
         // Create logger - this registers the activity callbacks
         let setup = setup_nix_logger().expect("Failed to setup logger");
 
-        // Begin eval scope - activity will be created lazily on first callback
-        setup
-            .bridge
-            .begin_eval(None, "Test evaluation".to_string(), ActivityLevel::Info);
+        // Begin eval scope - guard calls end_eval on drop
+        let _eval_guard = setup.bridge.begin_eval(1);
 
         let store = Store::open(None, []).expect("Failed to open store");
         let mut eval_state = EvalStateBuilder::new(store)
@@ -221,8 +231,7 @@ mod tests {
         let result = eval_state.eval_from_string(expr, ".");
         assert!(result.is_ok(), "Simple evaluation should work");
 
-        // End eval scope - activity (if created) completes
-        setup.bridge.end_eval();
+        // eval_guard drops here, calling end_eval automatically
     }
 
     #[test]

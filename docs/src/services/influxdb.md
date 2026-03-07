@@ -7,8 +7,6 @@
 
 ### services\.influxdb\.enable
 
-
-
 Whether to enable influxdb\.
 
 
@@ -19,12 +17,18 @@ boolean
 
 
 *Default:*
-` false `
+
+```nix
+false
+```
 
 
 
 *Example:*
-` true `
+
+```nix
+true
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/services/influxdb\.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/influxdb.nix)
@@ -35,7 +39,7 @@ boolean
 
 
 
-An open-source distributed time series database
+Which package of InfluxDB server to use
 
 
 
@@ -45,26 +49,68 @@ package
 
 
 *Default:*
-` pkgs.influxdb `
+
+```nix
+pkgs.influxdb2-server
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/services/influxdb\.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/influxdb.nix)
 
 
 
-### services\.influxdb\.config
+### services\.influxdb\.extraArgs
 
-Configuration for InfluxDB-server
+
+
+Additional arguments passed to ` influxd ` during startup\.
 
 
 
 *Type:*
-strings concatenated with “\\n”
+list of string
 
 
 
 *Default:*
-` "" `
+
+```nix
+[ ]
+```
+
+
+
+*Example:*
+
+```nix
+[
+  "--flux-log-enabled"
+]
+```
+
+*Declared by:*
+ - [https://github\.com/cachix/devenv/blob/main/src/modules/services/influxdb\.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/influxdb.nix)
+
+
+
+### services\.influxdb\.port
+
+
+
+The TCP port for the InfluxDB HTTP API\.
+
+
+
+*Type:*
+16 bit unsigned integer; between 0 and 65535 (both inclusive)
+
+
+
+*Default:*
+
+```nix
+8086
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/services/influxdb\.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/influxdb.nix)

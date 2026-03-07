@@ -10,6 +10,9 @@
     # The path to the eval cache database (for migrations)
     DATABASE_URL = "sqlite:.devenv/nix-eval-cache.db";
 
+    # Use sqlite from nixpkgs to match the version used by Nix
+    LIBSQLITE3_SYS_USE_PKG_CONFIG = "1";
+
     RUST_LOG = "devenv=debug";
     RUST_LOG_SPAN_EVENTS = "full";
   };
@@ -23,17 +26,18 @@
 
         1. Update version in Cargo.toml to $ARGUMENTS using `cargo set-version`
         2. Run `cargo check` to update Cargo.lock
-        3. Generate release notes:
-           - Find the latest git tag
-           - Get the diff between that tag and HEAD
-           - Summarize changes into release notes format
-        4. Ask user for access to nixpkgs repository to bump devenv there
-           - The package is at pkgs/by-name/de/devenv/package.nix
-           - Sync with ./package.nix from this repo and bump version
+        3. Put today's date in CHANGELOG.md replacing "(unreleased)"
+        4. Create a new "## X.Y.Z (unreleased)" section above the released version in CHANGELOG.md
         5. If this is a major version bump (X.Y.0, not X.Y.Z patch):
            - Generate a blog post in docs/src/blog/posts/
            - Follow the naming convention: devenv-vX.Y-short-description.md
            - Use existing blog posts as reference for format and style
+        6. Commit the changes
+        7. Push the commit(s) to GitHub
+        8. Create a GitHub release with `gh release create v$ARGUMENTS --title "v$ARGUMENTS" --latest --notes  "<changelog for this release>"`
+        9. At the end, tell the user that the package still needs to be bumped in nixpkgs:
+           - The package is at pkgs/by-name/de/devenv/package.nix
+           - Sync with ./package.nix from this repo and bump version
       '';
     };
     permissions = {
@@ -65,7 +69,9 @@
     pkgs.tesh
     pkgs.watchexec
     pkgs.openssl
+    pkgs.sqlite
     pkgs.sqlx-cli
+    pkgs.tig
     pkgs.process-compose
     pkgs.cargo-outdated # Find outdated crates
     pkgs.cargo-machete # Find unused crates
@@ -126,3 +132,5 @@
     };
   };
 }
+
+# reload-test

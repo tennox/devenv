@@ -77,6 +77,7 @@ let
       optionsDoc = pkgs.nixosOptionsDoc (
         {
           options = filterOptions filterGitHooks (builtins.removeAttrs opts [ "_module" ]);
+          warningsAreErrors = true;
           transformOptions = opt: (opt // { declarations = map rewriteSource opt.declarations; });
         }
         // docOpts
@@ -194,6 +195,11 @@ in
     devenv-docs-options = allOptions.optionsCommonMark;
     devenv-docs-options-json = allOptions.optionsJSON;
     devenv-generate-individual-docs = generateIndividualDocs;
+  };
+
+  scripts."devenv-build" = {
+    description = "Run devenv build, handling JSON output for devenv 2.0.0+";
+    exec = ./scripts/devenv-build.sh;
   };
 
   scripts."devenv-generate-doc-options" = {

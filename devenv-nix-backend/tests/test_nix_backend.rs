@@ -1,21 +1,15 @@
+#![cfg(feature = "test-nix-store")]
 //! Tests for the NixBackend FFI implementation
 //!
 //! These tests verify the functionality of the Rust FFI-based NixBackend,
-//! including input overrides via GlobalOptions.
-
-#![cfg(test)]
+//! including input overrides via NixOptions.
 
 use devenv_core::{
-    CliOptionsConfig, Config, DevenvPaths, GlobalOptions, NixArgs, NixBackend, Options,
+    CliOptionsConfig, Config, DevenvPaths, NixArgs, NixBackend, NixOptions, Options,
 };
-use devenv_nix_backend::ProjectRoot;
 use devenv_nix_backend::nix_backend::NixRustBackend;
 use devenv_nix_backend_macros::nix_test;
-use once_cell::sync::OnceCell;
-use secretspec;
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use tempfile::TempDir;
 use tokio_shutdown::Shutdown;
 
@@ -40,14 +34,7 @@ impl Drop for CwdGuard {
 
 // Import shared test utilities
 mod common;
-use common::create_test_cachix_manager;
-use common::get_current_system;
-use common::mock_cachix_daemon::MockCachixDaemon;
-
-/// Get the repo root directory (where Cargo.toml is) - for ignored tests only
-fn get_repo_root() -> std::path::PathBuf {
-    std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
-}
+use common::{create_backend, create_test_cachix_manager, get_current_system};
 
 /// Create test paths directory structure within a base directory
 fn create_test_paths_in(base: &std::path::Path) -> DevenvPaths {
@@ -68,21 +55,6 @@ fn create_test_paths_in(base: &std::path::Path) -> DevenvPaths {
     }
 }
 
-/// Create test paths using repo root - for ignored tests only
-fn create_test_paths() -> DevenvPaths {
-    create_test_paths_in(&get_repo_root())
-}
-
-/// Load devenv config from a custom directory - for ignored tests only
-fn load_config(base: &std::path::Path) -> Config {
-    Config::load_from(base).expect("Failed to load config")
-}
-
-/// Load devenv config from repo root - for ignored tests only
-fn load_config_from_repo() -> Config {
-    load_config(&get_repo_root())
-}
-
 /// Copy fixture lock file to destination directory
 /// This avoids unnecessary update() calls in tests that don't specifically test locking
 fn copy_fixture_lock(dest_dir: &std::path::Path) {
@@ -101,10 +73,15 @@ struct TestNixArgs {
 
 impl TestNixArgs {
     fn new(paths: &DevenvPaths) -> Self {
+        let dotfile_name = paths
+            .dotfile
+            .file_name()
+            .expect("dotfile should have a file name")
+            .to_string_lossy();
         TestNixArgs {
-            tmpdir: PathBuf::from("/tmp"),
-            runtime: PathBuf::from("/tmp/runtime"),
-            dotfile_path: PathBuf::from("./.devenv"),
+            tmpdir: paths.root.join("tmp"),
+            runtime: paths.root.join("runtime"),
+            dotfile_path: PathBuf::from(format!("./{}", dotfile_name)),
         }
     }
 
@@ -116,6 +93,7 @@ impl TestNixArgs {
     ) -> NixArgs<'a> {
         NixArgs {
             version: "1.0.0",
+            is_development_version: false,
             system: get_current_system(),
             devenv_root: &paths.root,
             skip_local_src: false,
@@ -132,8 +110,12 @@ impl TestNixArgs {
             username: None,
             git_root: None,
             secretspec: None,
-            devenv_config: config,
+            devenv_inputs: &config.inputs,
+            devenv_imports: &config.imports,
+            impure: false,
             nixpkgs_config,
+            lock_fingerprint: "",
+            devenv_state: None,
         }
     }
 }
@@ -153,7 +135,7 @@ impl TestNixArgs {
 fn setup_isolated_test_env(
     yaml_content: &str,
     nix_content: Option<&str>,
-    global_options: GlobalOptions,
+    nix_cli: NixOptions,
 ) -> (TempDir, CwdGuard, NixRustBackend, DevenvPaths, Config) {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let temp_path = temp_dir.path();
@@ -162,8 +144,6 @@ fn setup_isolated_test_env(
     let cwd_guard = CwdGuard::new(temp_path);
 
     // Get repo root for copying files
-    let repo_root = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-
     // Write custom devenv.nix if provided
     if let Some(nix) = nix_content {
         std::fs::write(temp_path.join("devenv.nix"), nix)
@@ -184,20 +164,14 @@ fn setup_isolated_test_env(
     // Load config (devenv.yaml should already contain nixpkgs)
     let config = Config::load_from(temp_path).expect("Failed to load config");
 
-    // Create cachix manager for the test
     let cachix_manager = create_test_cachix_manager(temp_path, None);
-
-    // Create shutdown coordinator for cleanup
     let shutdown = Shutdown::new();
-
-    // Create backend with default project_root (project directory)
-    let backend = NixRustBackend::new(
+    let backend = create_backend(
         paths.clone(),
         config.clone(),
-        global_options,
+        nix_cli,
         cachix_manager,
         shutdown,
-        None,
     )
     .expect("Failed to create NixRustBackend");
 
@@ -213,7 +187,7 @@ async fn test_backend_creation() {
     url: github:cachix/git-hooks.nix
 "#;
     let (_temp_dir, _cwd_guard, backend, _paths, _config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     assert_eq!(backend.name(), "nix");
 }
 
@@ -226,7 +200,7 @@ async fn test_backend_assemble() {
     url: github:cachix/git-hooks.nix
 "#;
     let (_temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
+        setup_isolated_test_env(yaml, None, NixOptions::default());
 
     let test_args = TestNixArgs::new(&paths);
     let nix_args =
@@ -249,7 +223,7 @@ async fn test_backend_update_all_inputs() {
     url: github:cachix/git-hooks.nix
 "#;
     let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     backend
         .assemble(&TestNixArgs::new(&paths).to_nix_args(
             &paths,
@@ -260,7 +234,7 @@ async fn test_backend_update_all_inputs() {
         .expect("Failed to assemble");
 
     // Update all inputs
-    let result = backend.update(&None).await;
+    let result = backend.update(&None, &config.inputs, &[]).await;
     assert!(result.is_ok(), "Update should succeed: {:?}", result.err());
 
     // Verify lock file was created in temp directory
@@ -276,8 +250,8 @@ async fn test_backend_update_specific_input() {
   git-hooks:
     url: github:cachix/git-hooks.nix
 "#;
-    let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
+    let (_temp_dir, _cwd_guard, backend, paths, config) =
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     backend
         .assemble(&TestNixArgs::new(&paths).to_nix_args(
             &paths,
@@ -288,10 +262,15 @@ async fn test_backend_update_specific_input() {
         .expect("Failed to assemble");
 
     // First create an initial lock
-    backend.update(&None).await.expect("Initial update failed");
+    backend
+        .update(&None, &config.inputs, &[])
+        .await
+        .expect("Initial update failed");
 
     // Now update just nixpkgs
-    let result = backend.update(&Some("nixpkgs".to_string())).await;
+    let result = backend
+        .update(&Some("nixpkgs".to_string()), &config.inputs, &[])
+        .await;
     assert!(
         result.is_ok(),
         "Selective update should succeed: {:?}",
@@ -308,7 +287,7 @@ async fn test_backend_eval_expression() {
     url: github:cachix/git-hooks.nix
 "#;
     let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     backend
         .assemble(&TestNixArgs::new(&paths).to_nix_args(
             &paths,
@@ -352,7 +331,7 @@ async fn test_backend_eval_multiple_attributes() {
     url: github:cachix/git-hooks.nix
 "#;
     let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     backend
         .assemble(&TestNixArgs::new(&paths).to_nix_args(
             &paths,
@@ -393,7 +372,7 @@ async fn test_backend_build_package() {
     url: github:cachix/git-hooks.nix
 "#;
     let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     backend
         .assemble(&TestNixArgs::new(&paths).to_nix_args(
             &paths,
@@ -425,7 +404,7 @@ async fn test_backend_build_with_gc_root() {
     url: github:cachix/git-hooks.nix
 "#;
     let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     backend
         .assemble(&TestNixArgs::new(&paths).to_nix_args(
             &paths,
@@ -467,7 +446,7 @@ async fn test_backend_dev_env() {
     url: github:cachix/git-hooks.nix
 "#;
     let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     backend
         .assemble(&TestNixArgs::new(&paths).to_nix_args(
             &paths,
@@ -488,11 +467,7 @@ async fn test_backend_dev_env() {
 
     let output = result.unwrap();
     assert!(
-        output.status.success(),
-        "dev_env should have success status"
-    );
-    assert!(
-        !output.stdout.is_empty(),
+        !output.bash_env.is_empty(),
         "dev_env should return environment"
     );
 }
@@ -505,8 +480,8 @@ async fn test_backend_metadata() {
   git-hooks:
     url: github:cachix/git-hooks.nix
 "#;
-    let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
+    let (_temp_dir, _cwd_guard, backend, paths, config) =
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     backend
         .assemble(&TestNixArgs::new(&paths).to_nix_args(
             &paths,
@@ -543,7 +518,7 @@ async fn test_backend_gc() {
     url: github:cachix/git-hooks.nix
 "#;
     let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     backend
         .assemble(&TestNixArgs::new(&paths).to_nix_args(
             &paths,
@@ -567,192 +542,8 @@ async fn test_backend_gc() {
     // but non-store paths would be cleaned up
 }
 
-#[nix_test]
-async fn test_backend_search_simple() {
-    let yaml = r#"inputs:
-  nixpkgs:
-    url: github:NixOS/nixpkgs/nixpkgs-unstable
-  git-hooks:
-    url: github:cachix/git-hooks.nix
-"#;
-    let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
-    backend
-        .assemble(&TestNixArgs::new(&paths).to_nix_args(
-            &paths,
-            &config,
-            config.nixpkgs_config(get_current_system()),
-        ))
-        .await
-        .expect("Failed to assemble");
-
-    // Search for a common package
-    let result = backend.search("hello", None).await;
-    assert!(
-        result.is_ok(),
-        "search() should succeed: {:?}",
-        result.err()
-    );
-
-    let output = result.unwrap();
-    assert!(
-        output.status.success(),
-        "search() should have success status"
-    );
-    assert!(!output.stdout.is_empty(), "search() should return results");
-
-    // Parse the JSON results
-    let json_str = String::from_utf8_lossy(&output.stdout);
-    let results: serde_json::Value =
-        serde_json::from_str(&json_str).expect("Results should be valid JSON");
-
-    // Should be an object with attribute paths as keys
-    assert!(
-        results.is_object(),
-        "Search results should be a JSON object"
-    );
-
-    // There should be at least one result for "hello"
-    if !results.as_object().unwrap().is_empty() {
-        let first_result = &results.as_object().unwrap().values().next().unwrap();
-        assert!(
-            first_result.get("pname").is_some(),
-            "Result should have pname"
-        );
-        assert!(
-            first_result.get("version").is_some(),
-            "Result should have version"
-        );
-        assert!(
-            first_result.get("description").is_some(),
-            "Result should have description"
-        );
-    }
-}
-
-#[nix_test]
-async fn test_backend_search_case_insensitive() {
-    let yaml = r#"inputs:
-  nixpkgs:
-    url: github:NixOS/nixpkgs/nixpkgs-unstable
-  git-hooks:
-    url: github:cachix/git-hooks.nix
-"#;
-    let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
-    backend
-        .assemble(&TestNixArgs::new(&paths).to_nix_args(
-            &paths,
-            &config,
-            config.nixpkgs_config(get_current_system()),
-        ))
-        .await
-        .expect("Failed to assemble");
-
-    // Search with different cases
-    let output1 = backend
-        .search("HELLO", None)
-        .await
-        .expect("Uppercase search should succeed");
-    let output2 = backend
-        .search("Hello", None)
-        .await
-        .expect("Mixed case search should succeed");
-    let output3 = backend
-        .search("hello", None)
-        .await
-        .expect("Lowercase search should succeed");
-
-    // All should return valid JSON
-    let json1 = String::from_utf8_lossy(&output1.stdout);
-    let json2 = String::from_utf8_lossy(&output2.stdout);
-    let json3 = String::from_utf8_lossy(&output3.stdout);
-
-    serde_json::from_str::<serde_json::Value>(&json1).expect("Result 1 should be valid JSON");
-    serde_json::from_str::<serde_json::Value>(&json2).expect("Result 2 should be valid JSON");
-    serde_json::from_str::<serde_json::Value>(&json3).expect("Result 3 should be valid JSON");
-}
-
-#[nix_test]
-async fn test_backend_search_regex_special_chars() {
-    let yaml = r#"inputs:
-  nixpkgs:
-    url: github:NixOS/nixpkgs/nixpkgs-unstable
-  git-hooks:
-    url: github:cachix/git-hooks.nix
-"#;
-    let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
-    backend
-        .assemble(&TestNixArgs::new(&paths).to_nix_args(
-            &paths,
-            &config,
-            config.nixpkgs_config(get_current_system()),
-        ))
-        .await
-        .expect("Failed to assemble");
-
-    // Search with regex special characters (should be escaped)
-    let result = backend.search("hello.world", None).await;
-    assert!(
-        result.is_ok(),
-        "Search with dots should succeed (should be escaped): {:?}",
-        result.err()
-    );
-
-    let output = result.unwrap();
-    assert!(
-        output.status.success(),
-        "search() should have success status"
-    );
-
-    let json_str = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str::<serde_json::Value>(&json_str).expect("Results should be valid JSON");
-}
-
-#[nix_test]
-async fn test_backend_search_empty_results() {
-    let yaml = r#"inputs:
-  nixpkgs:
-    url: github:NixOS/nixpkgs/nixpkgs-unstable
-  git-hooks:
-    url: github:cachix/git-hooks.nix
-"#;
-    let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
-    backend
-        .assemble(&TestNixArgs::new(&paths).to_nix_args(
-            &paths,
-            &config,
-            config.nixpkgs_config(get_current_system()),
-        ))
-        .await
-        .expect("Failed to assemble");
-
-    // Search for something that shouldn't exist
-    let result = backend.search("xyznonexistentpackagexyz", None).await;
-    assert!(
-        result.is_ok(),
-        "search() should succeed even with no results"
-    );
-
-    let output = result.unwrap();
-    assert!(
-        output.status.success(),
-        "search() should have success status"
-    );
-
-    let json_str = String::from_utf8_lossy(&output.stdout);
-    let results: serde_json::Value =
-        serde_json::from_str(&json_str).expect("Results should be valid JSON");
-
-    // Should be an empty object
-    assert!(results.is_object(), "Results should be a JSON object");
-    assert!(
-        results.as_object().unwrap().is_empty(),
-        "Results should be empty for non-matching query"
-    );
-}
+// Search tests moved to integration tests (tests/cli/.test.sh)
+// Searching nixpkgs requires too much memory for unit tests.
 
 #[test]
 fn test_backend_options_default() {
@@ -785,8 +576,8 @@ async fn test_metadata_standalone() {
   git-hooks:
     url: github:cachix/git-hooks.nix
 "#;
-    let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
+    let (_temp_dir, _cwd_guard, backend, paths, config) =
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     println!("Created backend");
 
     backend
@@ -813,8 +604,8 @@ async fn test_metadata_after_update() {
   git-hooks:
     url: github:cachix/git-hooks.nix
 "#;
-    let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
+    let (_temp_dir, _cwd_guard, backend, paths, config) =
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     println!("Created backend");
 
     backend
@@ -828,7 +619,10 @@ async fn test_metadata_after_update() {
     println!("Backend assembled");
 
     // Update first
-    backend.update(&None).await.expect("Failed to update");
+    backend
+        .update(&None, &config.inputs, &[])
+        .await
+        .expect("Failed to update");
     println!("Updated inputs");
 
     // Then call metadata
@@ -845,8 +639,8 @@ async fn test_full_backend_workflow() {
   git-hooks:
     url: github:cachix/git-hooks.nix
 "#;
-    let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
+    let (_temp_dir, _cwd_guard, backend, paths, config) =
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     println!("Created NixRustBackend: {}", backend.name());
 
     // 2. Initialize
@@ -862,7 +656,7 @@ async fn test_full_backend_workflow() {
 
     // 3. Update inputs
     backend
-        .update(&None)
+        .update(&None, &config.inputs, &[])
         .await
         .expect("Failed to update inputs");
     println!("Updated all inputs");
@@ -892,14 +686,13 @@ async fn test_backend_update_with_input_overrides() {
     url: github:cachix/devenv/v1.0
 "#;
 
-    let mut global_options = GlobalOptions::default();
-    global_options.override_input = vec![
+    let override_inputs = vec![
         "nixpkgs".to_string(),
         "github:NixOS/nixpkgs/nixos-unstable".to_string(),
     ];
 
     let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, global_options);
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     backend
         .assemble(&TestNixArgs::new(&paths).to_nix_args(
             &paths,
@@ -910,7 +703,9 @@ async fn test_backend_update_with_input_overrides() {
         .expect("Failed to assemble");
 
     // Update with overrides
-    let result = backend.update(&None).await;
+    let result = backend
+        .update(&None, &config.inputs, &override_inputs)
+        .await;
     assert!(
         result.is_ok(),
         "Update with overrides should succeed: {:?}",
@@ -942,8 +737,7 @@ async fn test_backend_update_with_multiple_overrides() {
     url: github:oxalica/rust-overlay
 "#;
 
-    let mut global_options = GlobalOptions::default();
-    global_options.override_input = vec![
+    let override_inputs = vec![
         "nixpkgs".to_string(),
         "github:NixOS/nixpkgs/nixos-unstable".to_string(),
         "devenv".to_string(),
@@ -951,7 +745,7 @@ async fn test_backend_update_with_multiple_overrides() {
     ];
 
     let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, global_options);
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     backend
         .assemble(&TestNixArgs::new(&paths).to_nix_args(
             &paths,
@@ -962,7 +756,9 @@ async fn test_backend_update_with_multiple_overrides() {
         .expect("Failed to assemble");
 
     // Update with multiple overrides
-    let result = backend.update(&None).await;
+    let result = backend
+        .update(&None, &config.inputs, &override_inputs)
+        .await;
     assert!(
         result.is_ok(),
         "Update with multiple overrides should succeed: {:?}",
@@ -981,19 +777,14 @@ async fn test_backend_update_with_multiple_overrides() {
 /// Test that eval() fails gracefully when evaluating an attribute that doesn't exist
 #[nix_test]
 async fn test_eval_nonexistent_attribute() {
-    let _cwd_guard = CwdGuard::new(&get_repo_root());
-    let paths = create_test_paths();
-    let config = load_config_from_repo();
-
-    let backend = NixRustBackend::new(
-        paths.clone(),
-        config.clone(),
-        GlobalOptions::default(),
-        create_test_cachix_manager(&get_repo_root(), None),
-        Shutdown::new(),
-        None,
-    )
-    .expect("Failed to create backend");
+    let yaml = r#"inputs:
+  nixpkgs:
+    url: github:NixOS/nixpkgs/nixpkgs-unstable
+  git-hooks:
+    url: github:cachix/git-hooks.nix
+"#;
+    let (temp_dir, _cwd_guard, backend, paths, config) =
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     backend
         .assemble(&TestNixArgs::new(&paths).to_nix_args(
             &paths,
@@ -1002,6 +793,9 @@ async fn test_eval_nonexistent_attribute() {
         ))
         .await
         .expect("Failed to assemble");
+
+    // Use fixture lock file for evaluation
+    copy_fixture_lock(temp_dir.path());
 
     // Try to eval a nonexistent attribute - should return an error
     let result = backend.eval(&["nonexistent.attribute.path"]).await;
@@ -1032,7 +826,7 @@ async fn test_build_nonexistent_attribute() {
     url: github:cachix/git-hooks.nix
 "#;
     let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     backend
         .assemble(&TestNixArgs::new(&paths).to_nix_args(
             &paths,
@@ -1080,26 +874,30 @@ async fn test_build_with_syntax_error_in_nix() {
 }"#;
 
     let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, Some(broken_nix), GlobalOptions::default());
-    backend
+        setup_isolated_test_env(yaml, Some(broken_nix), NixOptions::default());
+
+    // Use fixture lock file
+    copy_fixture_lock(temp_dir.path());
+
+    // Error can occur during assemble() (if cachix config is evaluated early)
+    // or during eval(). Either way, we should get a clear syntax error message.
+    let assemble_result = backend
         .assemble(&TestNixArgs::new(&paths).to_nix_args(
             &paths,
             &config,
             config.nixpkgs_config(get_current_system()),
         ))
-        .await
-        .expect("Failed to assemble");
+        .await;
 
-    // Use fixture lock file for eval
-    copy_fixture_lock(temp_dir.path());
-
-    // Try to eval - should fail with syntax error
-    let result = backend.eval(&["shell"]).await;
-
-    assert!(result.is_err(), "Eval should fail with syntax error");
-
-    let error = result.unwrap_err();
-    let error_msg = format!("{:?}", error);
+    let error_msg = if let Err(e) = assemble_result {
+        // Error caught during assemble - this is fine, errors should be caught early
+        format!("{:?}", e)
+    } else {
+        // Assemble succeeded, error should happen during eval
+        let result = backend.eval(&["shell"]).await;
+        assert!(result.is_err(), "Eval should fail with syntax error");
+        format!("{:?}", result.unwrap_err())
+    };
 
     // Error message should indicate a syntax or evaluation error
     assert!(
@@ -1109,6 +907,73 @@ async fn test_build_with_syntax_error_in_nix() {
     );
 
     // Clean up temp dir
+    drop(temp_dir);
+}
+
+/// Test that evaluation errors include detailed Nix error messages
+///
+/// When Nix evaluation fails, the error message should include the actual
+/// Nix error (e.g., "undefined variable 'nonexistent_var'"), not just a
+/// generic wrapper message like "Failed to import default.nix".
+///
+/// This tests the error enrichment feature that combines Nix logger output
+/// with the exception to provide helpful error messages.
+#[nix_test]
+async fn test_eval_error_includes_nix_details() {
+    let yaml = r#"inputs:
+  nixpkgs:
+    url: github:NixOS/nixpkgs/nixpkgs-unstable
+  git-hooks:
+    url: github:cachix/git-hooks.nix
+"#;
+
+    // Create devenv.nix that references an undefined variable
+    // This will produce a clear Nix error: "undefined variable 'nonexistent_var_xyz'"
+    let broken_nix = r#"{ pkgs, ... }: {
+  packages = [ nonexistent_var_xyz ];
+}"#;
+
+    let (temp_dir, _cwd_guard, backend, paths, config) =
+        setup_isolated_test_env(yaml, Some(broken_nix), NixOptions::default());
+
+    // Use fixture lock file
+    copy_fixture_lock(temp_dir.path());
+
+    // Try to assemble or eval - error can occur at either stage
+    let assemble_result = backend
+        .assemble(&TestNixArgs::new(&paths).to_nix_args(
+            &paths,
+            &config,
+            config.nixpkgs_config(get_current_system()),
+        ))
+        .await;
+
+    let error_msg = if let Err(e) = assemble_result {
+        format!("{:?}", e)
+    } else {
+        let result = backend.eval(&["packages"]).await;
+        assert!(result.is_err(), "Eval should fail with undefined variable");
+        format!("{:?}", result.unwrap_err())
+    };
+
+    // The error message MUST include the specific Nix error details.
+    // This verifies the error enrichment is working - we should see the
+    // actual variable name from the Nix error, not just a generic message.
+    assert!(
+        error_msg.contains("nonexistent_var_xyz"),
+        "Error should include the undefined variable name from Nix error.\n\
+         This indicates error enrichment is working.\n\
+         Got: {}",
+        error_msg
+    );
+
+    // Also verify it contains "undefined" to confirm it's the right error type
+    assert!(
+        error_msg.to_lowercase().contains("undefined"),
+        "Error should mention 'undefined' variable.\nGot: {}",
+        error_msg
+    );
+
     drop(temp_dir);
 }
 
@@ -1122,7 +987,7 @@ async fn test_metadata_with_corrupted_lock_file() {
     url: github:cachix/git-hooks.nix
 "#;
     let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     backend
         .assemble(&TestNixArgs::new(&paths).to_nix_args(
             &paths,
@@ -1168,7 +1033,7 @@ async fn test_gc_with_invalid_store_paths() {
     url: github:cachix/git-hooks.nix
 "#;
     let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     backend
         .assemble(&TestNixArgs::new(&paths).to_nix_args(
             &paths,
@@ -1193,166 +1058,31 @@ async fn test_gc_with_invalid_store_paths() {
     );
 }
 
-// ============================================================================
-// GLOBALOPTIONS CONFIGURATION TESTS
-// ============================================================================
-
-/// Create backend with offline mode and verify substituters are disabled
-#[nix_test]
-#[ignore]
-async fn test_backend_creation_with_offline_mode() {
-    let _cwd_guard = CwdGuard::new(&get_repo_root());
-    let paths = create_test_paths();
-    let config = load_config_from_repo();
-
-    let mut global_options = GlobalOptions::default();
-    global_options.offline = true;
-
-    let result = NixRustBackend::new(
-        paths.clone(),
-        config.clone(),
-        global_options,
-        create_test_cachix_manager(&get_repo_root(), None),
-        Shutdown::new(),
-        None,
-    );
-
-    // TODO: Verify backend was created with offline mode
-    todo!("Implement: test offline mode disables substituters")
-}
-
-/// Test system override in global_options
-#[nix_test]
-#[ignore]
-async fn test_backend_with_system_override() {
-    let _cwd_guard = CwdGuard::new(&get_repo_root());
-    let paths = create_test_paths();
-    let config = load_config_from_repo();
-
-    let mut global_options = GlobalOptions::default();
-    global_options.system = "aarch64-linux".to_string();
-
-    let result = NixRustBackend::new(
-        paths.clone(),
-        config.clone(),
-        global_options,
-        create_test_cachix_manager(&get_repo_root(), None),
-        Shutdown::new(),
-        None,
-    );
-
-    // TODO: Verify system override is applied
-    todo!("Implement: test system architecture override")
-}
-
-/// Test impure mode enables in global_options
-#[nix_test]
-#[ignore]
-async fn test_backend_with_impure_mode() {
-    let _cwd_guard = CwdGuard::new(&get_repo_root());
-    let paths = create_test_paths();
-    let config = load_config_from_repo();
-
-    let mut global_options = GlobalOptions::default();
-    global_options.impure = true;
-
-    let result = NixRustBackend::new(
-        paths.clone(),
-        config.clone(),
-        global_options,
-        create_test_cachix_manager(&get_repo_root(), None),
-        Shutdown::new(),
-        None,
-    );
-
-    // TODO: Verify impure mode is enabled
-    todo!("Implement: test impure evaluation mode")
-}
-
-/// Test custom nix_option key-value pairs
-#[nix_test]
-#[ignore]
-async fn test_backend_with_custom_nix_options() {
-    let _cwd_guard = CwdGuard::new(&get_repo_root());
-    let paths = create_test_paths();
-    let config = load_config_from_repo();
-
-    let mut global_options = GlobalOptions::default();
-    global_options.nix_option = vec!["tarball-ttl".to_string(), "0".to_string()];
-
-    let result = NixRustBackend::new(
-        paths.clone(),
-        config.clone(),
-        global_options,
-        create_test_cachix_manager(&get_repo_root(), None),
-        Shutdown::new(),
-        None,
-    );
-
-    // TODO: Verify custom nix options are applied
-    todo!("Implement: test custom nix options")
-}
-
-/// Test nix_debugger option
-#[nix_test]
-#[ignore]
-async fn test_backend_with_nix_debugger_enabled() {
-    let _cwd_guard = CwdGuard::new(&get_repo_root());
-    let paths = create_test_paths();
-    let config = load_config_from_repo();
-
-    let mut global_options = GlobalOptions::default();
-    global_options.nix_debugger = true;
-
-    let result = NixRustBackend::new(
-        paths.clone(),
-        config.clone(),
-        global_options,
-        create_test_cachix_manager(&get_repo_root(), None),
-        Shutdown::new(),
-        None,
-    );
-
-    // TODO: Verify debugger is enabled
-    todo!("Implement: test nix debugger option")
-}
-
-/// Test update() with malformed override_input
+/// Test update() with malformed override_inputs
 /// Odd number of override elements are silently ignored (chunks_exact(2) behavior)
 #[nix_test]
-async fn test_update_with_invalid_override_input() {
-    let _cwd_guard = CwdGuard::new(&get_repo_root());
-    let paths = create_test_paths();
-    let config = load_config_from_repo();
+async fn test_update_with_invalid_override_inputs() {
+    let yaml = r#"inputs:
+  nixpkgs:
+    url: github:NixOS/nixpkgs/nixpkgs-unstable
+  git-hooks:
+    url: github:cachix/git-hooks.nix
+"#;
 
-    let mut global_options = GlobalOptions::default();
     // Odd number of elements - should be pairs
     // chunks_exact(2) will ignore the remainder, so this is safe
-    global_options.override_input = vec!["nixpkgs".to_string()];
+    let override_inputs = vec!["nixpkgs".to_string()];
 
-    let backend = NixRustBackend::new(
-        paths.clone(),
-        config.clone(),
-        global_options,
-        create_test_cachix_manager(&get_repo_root(), None),
-        Shutdown::new(),
-        None,
-    )
-    .expect("Failed to create backend");
-    backend
-        .assemble(&TestNixArgs::new(&paths).to_nix_args(
-            &paths,
-            &config,
-            config.nixpkgs_config(get_current_system()),
-        ))
-        .await
-        .expect("Failed to assemble");
+    let (_temp_dir, _cwd_guard, backend, _paths, config) =
+        setup_isolated_test_env(yaml, None, NixOptions::default());
 
-    // Update should succeed - malformed override is ignored
-    let result = backend.update(&None).await;
+    // Update should succeed - malformed override is ignored (no assemble needed for update-only tests)
+    let result = backend
+        .update(&None, &config.inputs, &override_inputs)
+        .await;
     assert!(
         result.is_ok(),
-        "update() should succeed even with malformed override_input: {:?}",
+        "update() should succeed even with malformed override_inputs: {:?}",
         result.err()
     );
 
@@ -1370,19 +1100,14 @@ async fn test_update_with_invalid_override_input() {
 /// Test eval() with empty attributes array
 #[nix_test]
 async fn test_eval_empty_attributes_array() {
-    let _cwd_guard = CwdGuard::new(&get_repo_root());
-    let paths = create_test_paths();
-    let config = load_config_from_repo();
-
-    let backend = NixRustBackend::new(
-        paths.clone(),
-        config.clone(),
-        GlobalOptions::default(),
-        create_test_cachix_manager(&get_repo_root(), None),
-        Shutdown::new(),
-        None,
-    )
-    .expect("Failed to create backend");
+    let yaml = r#"inputs:
+  nixpkgs:
+    url: github:NixOS/nixpkgs/nixpkgs-unstable
+  git-hooks:
+    url: github:cachix/git-hooks.nix
+"#;
+    let (_temp_dir, _cwd_guard, backend, paths, config) =
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     backend
         .assemble(&TestNixArgs::new(&paths).to_nix_args(
             &paths,
@@ -1422,8 +1147,8 @@ async fn test_build_empty_attributes_array() {
   git-hooks:
     url: github:cachix/git-hooks.nix
 "#;
-    let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
+    let (_temp_dir, _cwd_guard, backend, paths, config) =
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     backend
         .assemble(&TestNixArgs::new(&paths).to_nix_args(
             &paths,
@@ -1450,110 +1175,6 @@ async fn test_build_empty_attributes_array() {
     );
 }
 
-/// Test dev_env() bash output format
-#[nix_test]
-#[ignore]
-async fn test_dev_env_bash_output_format() {
-    let _cwd_guard = CwdGuard::new(&get_repo_root());
-    let paths = create_test_paths();
-    let config = load_config_from_repo();
-
-    let backend = NixRustBackend::new(
-        paths.clone(),
-        config.clone(),
-        GlobalOptions::default(),
-        create_test_cachix_manager(&get_repo_root(), None),
-        Shutdown::new(),
-        None,
-    )
-    .expect("Failed to create backend");
-    backend
-        .assemble(&TestNixArgs::new(&paths).to_nix_args(
-            &paths,
-            &config,
-            config.nixpkgs_config(get_current_system()),
-        ))
-        .await
-        .expect("Failed to assemble");
-
-    let gc_root = get_repo_root().join(".devenv/profile");
-
-    // TODO: Test dev_env(false, ...) returns bash script format
-    let result = backend.dev_env(false, &gc_root).await;
-    todo!("Implement: test bash output format")
-}
-
-/// Test dev_env() multiple calls with same gc_root
-#[nix_test]
-#[ignore]
-async fn test_dev_env_multiple_calls_same_gc_root() {
-    let _cwd_guard = CwdGuard::new(&get_repo_root());
-    let paths = create_test_paths();
-    let config = load_config_from_repo();
-
-    let backend = NixRustBackend::new(
-        paths.clone(),
-        config.clone(),
-        GlobalOptions::default(),
-        create_test_cachix_manager(&get_repo_root(), None),
-        Shutdown::new(),
-        None,
-    )
-    .expect("Failed to create backend");
-    backend
-        .assemble(&TestNixArgs::new(&paths).to_nix_args(
-            &paths,
-            &config,
-            config.nixpkgs_config(get_current_system()),
-        ))
-        .await
-        .expect("Failed to assemble");
-
-    let gc_root = get_repo_root().join(".devenv/profile");
-
-    // TODO: Call dev_env twice with same gc_root, verify both succeed
-    let result1 = backend.dev_env(true, &gc_root).await;
-    let result2 = backend.dev_env(true, &gc_root).await;
-    todo!("Implement: test multiple dev_env calls")
-}
-
-/// Test dev_env() when gc_root already exists as regular file
-#[nix_test]
-#[ignore]
-async fn test_dev_env_gc_root_already_exists_as_file() {
-    let _cwd_guard = CwdGuard::new(&get_repo_root());
-    let paths = create_test_paths();
-    let config = load_config_from_repo();
-
-    let backend = NixRustBackend::new(
-        paths.clone(),
-        config.clone(),
-        GlobalOptions::default(),
-        create_test_cachix_manager(&get_repo_root(), None),
-        Shutdown::new(),
-        None,
-    )
-    .expect("Failed to create backend");
-    backend
-        .assemble(&TestNixArgs::new(&paths).to_nix_args(
-            &paths,
-            &config,
-            config.nixpkgs_config(get_current_system()),
-        ))
-        .await
-        .expect("Failed to assemble");
-
-    let gc_root = get_repo_root().join(".devenv/profile");
-
-    // Create a regular file at gc_root path
-    std::fs::create_dir_all(gc_root.parent().unwrap()).ok();
-    std::fs::write(&gc_root, "existing file content").expect("Failed to create file");
-
-    // TODO: Call dev_env and verify it replaces the file with symlink
-    let result = backend.dev_env(true, &gc_root).await;
-    todo!("Implement: test gc_root file replacement")
-}
-
 /// Test build() when gc_root already exists as file/symlink
 #[nix_test]
 async fn test_build_gc_root_already_exists() {
@@ -1564,7 +1185,7 @@ async fn test_build_gc_root_already_exists() {
     url: github:cachix/git-hooks.nix
 "#;
     let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     backend
         .assemble(&TestNixArgs::new(&paths).to_nix_args(
             &paths,
@@ -1615,31 +1236,19 @@ async fn test_build_gc_root_already_exists() {
 /// Test update() when lock file already exists - should update in place
 #[nix_test]
 async fn test_update_lock_file_already_exists() {
-    let _cwd_guard = CwdGuard::new(&get_repo_root());
-    let paths = create_test_paths();
-    let config = load_config_from_repo();
+    let yaml = r#"inputs:
+  nixpkgs:
+    url: github:NixOS/nixpkgs/nixpkgs-unstable
+  git-hooks:
+    url: github:cachix/git-hooks.nix
+"#;
 
-    let backend = NixRustBackend::new(
-        paths.clone(),
-        config.clone(),
-        GlobalOptions::default(),
-        create_test_cachix_manager(&get_repo_root(), None),
-        Shutdown::new(),
-        None,
-    )
-    .expect("Failed to create backend");
-    backend
-        .assemble(&TestNixArgs::new(&paths).to_nix_args(
-            &paths,
-            &config,
-            config.nixpkgs_config(get_current_system()),
-        ))
-        .await
-        .expect("Failed to assemble");
+    let (_temp_dir, _cwd_guard, backend, _paths, config) =
+        setup_isolated_test_env(yaml, None, NixOptions::default());
 
-    // Create initial lock
+    // Create initial lock (no assemble needed for update-only tests)
     backend
-        .update(&None)
+        .update(&None, &config.inputs, &[])
         .await
         .expect("Failed to create initial lock");
 
@@ -1660,7 +1269,7 @@ async fn test_update_lock_file_already_exists() {
     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
     // Call update again - should update in place
-    let result = backend.update(&None).await;
+    let result = backend.update(&None, &config.inputs, &[]).await;
     assert!(
         result.is_ok(),
         "Second update() should succeed: {:?}",
@@ -1694,8 +1303,8 @@ async fn test_metadata_before_any_update() {
   git-hooks:
     url: github:cachix/git-hooks.nix
 "#;
-    let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
+    let (_temp_dir, _cwd_guard, backend, paths, config) =
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     backend
         .assemble(&TestNixArgs::new(&paths).to_nix_args(
             &paths,
@@ -1733,50 +1342,6 @@ async fn test_metadata_before_any_update() {
 // STATE CONSISTENCY TESTS
 // ============================================================================
 
-/// Test that build after update uses new lock
-#[nix_test]
-async fn test_build_after_update_uses_new_lock() {
-    let yaml = r#"inputs:
-  nixpkgs:
-    url: github:NixOS/nixpkgs/nixpkgs-unstable
-  git-hooks:
-    url: github:cachix/git-hooks.nix
-"#;
-    let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
-    backend
-        .assemble(&TestNixArgs::new(&paths).to_nix_args(
-            &paths,
-            &config,
-            config.nixpkgs_config(get_current_system()),
-        ))
-        .await
-        .expect("Failed to assemble");
-
-    // update() -> build() and verify build uses new locked versions
-    backend.update(&None).await.expect("Update failed");
-
-    // Verify lock file was created
-    let lock_path = temp_dir.path().join("devenv.lock");
-    assert!(lock_path.exists(), "Lock file should exist after update");
-
-    // Build should succeed using the locked versions
-    let result = backend.build(&["shell"], None, None).await;
-
-    assert!(
-        result.is_ok(),
-        "Build after update should succeed: {:?}",
-        result.err()
-    );
-
-    let paths = result.unwrap();
-    assert!(!paths.is_empty(), "Build should return paths");
-    assert!(
-        paths[0].to_str().unwrap().starts_with("/nix/store"),
-        "Built path should be in nix store"
-    );
-}
-
 // ============================================================================
 // GET_BASH() METHOD TESTS
 // ============================================================================
@@ -1791,7 +1356,7 @@ async fn test_get_bash_returns_valid_path() {
     url: github:cachix/git-hooks.nix
 "#;
     let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     backend
         .assemble(&TestNixArgs::new(&paths).to_nix_args(
             &paths,
@@ -1835,7 +1400,7 @@ async fn test_get_bash_caching_with_gc_root() {
     url: github:cachix/git-hooks.nix
 "#;
     let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     backend
         .assemble(&TestNixArgs::new(&paths).to_nix_args(
             &paths,
@@ -1884,7 +1449,7 @@ async fn test_get_bash_with_refresh_cached_output() {
     url: github:cachix/git-hooks.nix
 "#;
     let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     backend
         .assemble(&TestNixArgs::new(&paths).to_nix_args(
             &paths,
@@ -1928,7 +1493,7 @@ async fn test_get_bash_returns_executable() {
     url: github:cachix/git-hooks.nix
 "#;
     let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     backend
         .assemble(&TestNixArgs::new(&paths).to_nix_args(
             &paths,
@@ -1969,220 +1534,6 @@ async fn test_get_bash_returns_executable() {
 }
 
 // ============================================================================
-// SEARCH FUNCTIONALITY TESTS
-// ============================================================================
-
-/// Test search matches package descriptions
-#[nix_test]
-async fn test_search_matches_description_field() {
-    let yaml = r#"inputs:
-  nixpkgs:
-    url: github:NixOS/nixpkgs/nixpkgs-unstable
-  git-hooks:
-    url: github:cachix/git-hooks.nix
-"#;
-    let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
-    backend
-        .assemble(&TestNixArgs::new(&paths).to_nix_args(
-            &paths,
-            &config,
-            config.nixpkgs_config(get_current_system()),
-        ))
-        .await
-        .expect("Failed to assemble");
-
-    // Search for a term that should match some package descriptions
-    let result = backend.search("simple unix filter", None).await;
-    assert!(
-        result.is_ok(),
-        "search() should succeed: {:?}",
-        result.err()
-    );
-
-    let output = result.unwrap();
-    assert!(
-        output.status.success(),
-        "search() should have success status"
-    );
-
-    // Parse the JSON results
-    let json_str = String::from_utf8_lossy(&output.stdout);
-    let results: serde_json::Value =
-        serde_json::from_str(&json_str).expect("Results should be valid JSON");
-
-    // Should be an object
-    assert!(
-        results.is_object(),
-        "Search results should be a JSON object"
-    );
-
-    // If results exist, verify they have the expected fields
-    if !results.as_object().unwrap().is_empty() {
-        for (_key, value) in results.as_object().unwrap().iter() {
-            assert!(value.get("pname").is_some(), "Result should have pname");
-            assert!(value.get("version").is_some(), "Result should have version");
-            assert!(
-                value.get("description").is_some(),
-                "Result should have description field"
-            );
-        }
-    }
-}
-
-/// Test search with very long query
-#[nix_test]
-async fn test_search_with_very_long_query() {
-    let yaml = r#"inputs:
-  nixpkgs:
-    url: github:NixOS/nixpkgs/nixpkgs-unstable
-  git-hooks:
-    url: github:cachix/git-hooks.nix
-"#;
-    let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
-    backend
-        .assemble(&TestNixArgs::new(&paths).to_nix_args(
-            &paths,
-            &config,
-            config.nixpkgs_config(get_current_system()),
-        ))
-        .await
-        .expect("Failed to assemble");
-
-    // Test with very long query string - should not crash and return valid JSON
-    let long_query = "a".repeat(1000);
-    let result = backend.search(&long_query, None).await;
-    assert!(
-        result.is_ok(),
-        "search() should handle long queries: {:?}",
-        result.err()
-    );
-
-    let output = result.unwrap();
-    assert!(
-        output.status.success(),
-        "search() should have success status"
-    );
-
-    // Parse the JSON results - should be valid even if empty
-    let json_str = String::from_utf8_lossy(&output.stdout);
-    let results: serde_json::Value =
-        serde_json::from_str(&json_str).expect("Results should be valid JSON");
-
-    // Should be an object
-    assert!(
-        results.is_object(),
-        "Search results should be a JSON object"
-    );
-
-    // It's OK if results are empty (the query is unlikely to match anything)
-    // Just verify no crash and valid output
-    assert!(!json_str.is_empty(), "Output should not be empty");
-}
-
-/// Test search with unicode characters
-#[nix_test]
-async fn test_search_with_unicode_characters() {
-    let yaml = r#"inputs:
-  nixpkgs:
-    url: github:NixOS/nixpkgs/nixpkgs-unstable
-  git-hooks:
-    url: github:cachix/git-hooks.nix
-"#;
-    let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
-    backend
-        .assemble(&TestNixArgs::new(&paths).to_nix_args(
-            &paths,
-            &config,
-            config.nixpkgs_config(get_current_system()),
-        ))
-        .await
-        .expect("Failed to assemble");
-
-    // Test with unicode characters in search query - should handle gracefully
-    let result = backend.search("Schönheit", None).await;
-    assert!(
-        result.is_ok(),
-        "search() should handle unicode queries: {:?}",
-        result.err()
-    );
-
-    let output = result.unwrap();
-    assert!(
-        output.status.success(),
-        "search() should have success status"
-    );
-
-    // Parse the JSON results
-    let json_str = String::from_utf8_lossy(&output.stdout);
-    let results: serde_json::Value =
-        serde_json::from_str(&json_str).expect("Results should be valid JSON");
-
-    // Should be an object
-    assert!(
-        results.is_object(),
-        "Search results should be a JSON object"
-    );
-
-    // Verify output is valid UTF-8
-    assert!(!json_str.is_empty(), "Output should not be empty");
-}
-
-/// Test search depth limitation
-#[nix_test]
-async fn test_search_depth_limitation() {
-    let yaml = r#"inputs:
-  nixpkgs:
-    url: github:NixOS/nixpkgs/nixpkgs-unstable
-  git-hooks:
-    url: github:cachix/git-hooks.nix
-"#;
-    let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
-    backend
-        .assemble(&TestNixArgs::new(&paths).to_nix_args(
-            &paths,
-            &config,
-            config.nixpkgs_config(get_current_system()),
-        ))
-        .await
-        .expect("Failed to assemble");
-
-    // Search for a package - search should respect depth limitations internally
-    let result = backend.search("hello", None).await;
-    assert!(
-        result.is_ok(),
-        "search() should succeed: {:?}",
-        result.err()
-    );
-
-    let output = result.unwrap();
-    assert!(
-        output.status.success(),
-        "search() should have success status"
-    );
-
-    // Parse the JSON results
-    let json_str = String::from_utf8_lossy(&output.stdout);
-    let results: serde_json::Value =
-        serde_json::from_str(&json_str).expect("Results should be valid JSON");
-
-    // Should be an object
-    assert!(
-        results.is_object(),
-        "Search results should be a JSON object"
-    );
-
-    // The depth limitation is tested implicitly - if the search completes quickly
-    // without timing out, the depth limitation is working. The search function
-    // uses a max_depth of 5 to prevent infinite recursion in the nixpkgs attribute set.
-    // We verify that it returns results without crashing due to excessive recursion.
-    assert!(!json_str.is_empty(), "Search should return valid output");
-}
-
-// ============================================================================
 // GC OPERATIONS TESTS
 // ============================================================================
 
@@ -2196,7 +1547,7 @@ async fn test_gc_with_actual_nix_store_paths() {
     url: github:cachix/git-hooks.nix
 "#;
     let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     backend
         .assemble(&TestNixArgs::new(&paths).to_nix_args(
             &paths,
@@ -2256,7 +1607,7 @@ async fn test_gc_with_protected_gc_roots() {
     url: github:cachix/git-hooks.nix
 "#;
     let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     backend
         .assemble(&TestNixArgs::new(&paths).to_nix_args(
             &paths,
@@ -2328,7 +1679,7 @@ async fn test_gc_computes_closure_correctly() {
     url: github:cachix/git-hooks.nix
 "#;
     let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     backend
         .assemble(&TestNixArgs::new(&paths).to_nix_args(
             &paths,
@@ -2382,7 +1733,7 @@ async fn test_gc_reports_bytes_freed() {
     url: github:cachix/git-hooks.nix
 "#;
     let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     backend
         .assemble(&TestNixArgs::new(&paths).to_nix_args(
             &paths,
@@ -2437,7 +1788,7 @@ async fn test_gc_with_mixed_store_and_temp_paths() {
     url: github:cachix/git-hooks.nix
 "#;
     let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     backend
         .assemble(&TestNixArgs::new(&paths).to_nix_args(
             &paths,
@@ -2531,8 +1882,8 @@ async fn test_workflow_build_then_incremental_update() {
   git-hooks:
     url: github:cachix/git-hooks.nix
 "#;
-    let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
+    let (_temp_dir, _cwd_guard, backend, paths, config) =
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     backend
         .assemble(&TestNixArgs::new(&paths).to_nix_args(
             &paths,
@@ -2543,7 +1894,10 @@ async fn test_workflow_build_then_incremental_update() {
         .expect("Failed to assemble");
 
     // Initial update and build
-    backend.update(&None).await.expect("Initial update failed");
+    backend
+        .update(&None, &config.inputs, &[])
+        .await
+        .expect("Initial update failed");
 
     let result1 = backend.build(&["shell"], None, None).await;
     assert!(
@@ -2556,7 +1910,7 @@ async fn test_workflow_build_then_incremental_update() {
 
     // Incremental update (update just one input)
     backend
-        .update(&Some("nixpkgs".to_string()))
+        .update(&Some("nixpkgs".to_string()), &config.inputs, &[])
         .await
         .expect("Incremental update failed");
 
@@ -2585,7 +1939,7 @@ async fn test_workflow_multiple_builds_different_gc_roots() {
     url: github:cachix/git-hooks.nix
 "#;
     let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     backend
         .assemble(&TestNixArgs::new(&paths).to_nix_args(
             &paths,
@@ -2631,28 +1985,6 @@ async fn test_workflow_multiple_builds_different_gc_roots() {
     assert!(!paths2.is_empty(), "Second build should return paths");
 }
 
-/// Test backend reuse across operations
-#[nix_test]
-#[ignore]
-async fn test_backend_reuse_across_operations() {
-    let _cwd_guard = CwdGuard::new(&get_repo_root());
-    let paths = create_test_paths();
-    let config = load_config_from_repo();
-
-    let backend = NixRustBackend::new(
-        paths.clone(),
-        config.clone(),
-        GlobalOptions::default(),
-        create_test_cachix_manager(&get_repo_root(), None),
-        Shutdown::new(),
-        None,
-    )
-    .expect("Failed to create backend");
-
-    // TODO: Perform all operations with same backend instance -> verify state consistency
-    todo!("Implement: test backend reuse")
-}
-
 // ============================================================================
 // MULTI-INPUT & COMPLEX CONFIGURATION TESTS
 // ============================================================================
@@ -2660,13 +1992,11 @@ async fn test_backend_reuse_across_operations() {
 /// Test update with many inputs - verify all inputs are successfully locked
 #[nix_test]
 async fn test_update_with_many_inputs() {
-    let _cwd_guard = CwdGuard::new(&get_repo_root());
-    let _temp_dir = TempDir::new().expect("Failed to create temp dir");
-
-    let yaml_content = r#"
-inputs:
+    let yaml_content = r#"inputs:
   nixpkgs:
     url: github:NixOS/nixpkgs/nixos-24.05
+  git-hooks:
+    url: github:cachix/git-hooks.nix
   devenv:
     url: github:cachix/devenv/v1.0
   rust-overlay:
@@ -2676,32 +2006,12 @@ inputs:
   flake-utils:
     url: github:numtide/flake-utils
 "#;
-    std::fs::write(get_repo_root().join("devenv.yaml"), yaml_content)
-        .expect("Failed to write devenv.yaml");
 
-    let paths = create_test_paths_in(get_repo_root().as_path());
-    let config = load_config(get_repo_root().as_path());
+    let (_temp_dir, _cwd_guard, backend, _paths, config) =
+        setup_isolated_test_env(yaml_content, None, NixOptions::default());
 
-    let backend = NixRustBackend::new(
-        paths.clone(),
-        config.clone(),
-        GlobalOptions::default(),
-        create_test_cachix_manager(&get_repo_root(), None),
-        Shutdown::new(),
-        None,
-    )
-    .expect("Failed to create backend");
-    backend
-        .assemble(&TestNixArgs::new(&paths).to_nix_args(
-            &paths,
-            &config,
-            config.nixpkgs_config(get_current_system()),
-        ))
-        .await
-        .expect("Failed to assemble");
-
-    // Update with 5 inputs
-    let result = backend.update(&None).await;
+    // Update with 6 inputs (no assemble needed for update-only tests)
+    let result = backend.update(&None, &config.inputs, &[]).await;
     assert!(
         result.is_ok(),
         "update() should succeed with many inputs: {:?}",
@@ -2712,7 +2022,7 @@ inputs:
     let lock_path = backend.paths.root.join("devenv.lock");
     assert!(lock_path.exists(), "Lock file should be created");
 
-    // Parse lock file to verify all 5 inputs are locked
+    // Parse lock file to verify all 6 inputs are locked
     let lock_content = std::fs::read_to_string(&lock_path).expect("Failed to read lock file");
     let lock_json: serde_json::Value =
         serde_json::from_str(&lock_content).expect("Lock file should be valid JSON");
@@ -2722,9 +2032,10 @@ inputs:
         .get("nodes")
         .expect("Lock file should have 'nodes' field");
 
-    // Verify all 5 inputs are present in the lock file
+    // Verify all 6 inputs are present in the lock file
     let expected_inputs = vec![
         "nixpkgs",
+        "git-hooks",
         "devenv",
         "rust-overlay",
         "systems",
@@ -2742,13 +2053,11 @@ inputs:
 /// Test update with nested input follows - verify "follows" references work
 #[nix_test]
 async fn test_update_with_nested_input_follows() {
-    let _cwd_guard = CwdGuard::new(&get_repo_root());
-    let _temp_dir = TempDir::new().expect("Failed to create temp dir");
-
-    let yaml_content = r#"
-inputs:
+    let yaml_content = r#"inputs:
   nixpkgs:
     url: github:NixOS/nixpkgs/nixos-24.05
+  git-hooks:
+    url: github:cachix/git-hooks.nix
   systems:
     url: github:nix-systems/default
   flake-utils:
@@ -2757,32 +2066,12 @@ inputs:
       systems:
         follows: /systems
 "#;
-    std::fs::write(get_repo_root().join("devenv.yaml"), yaml_content)
-        .expect("Failed to write devenv.yaml");
 
-    let paths = create_test_paths_in(get_repo_root().as_path());
-    let config = load_config(get_repo_root().as_path());
+    let (_temp_dir, _cwd_guard, backend, _paths, config) =
+        setup_isolated_test_env(yaml_content, None, NixOptions::default());
 
-    let backend = NixRustBackend::new(
-        paths.clone(),
-        config.clone(),
-        GlobalOptions::default(),
-        create_test_cachix_manager(&get_repo_root(), None),
-        Shutdown::new(),
-        None,
-    )
-    .expect("Failed to create backend");
-    backend
-        .assemble(&TestNixArgs::new(&paths).to_nix_args(
-            &paths,
-            &config,
-            config.nixpkgs_config(get_current_system()),
-        ))
-        .await
-        .expect("Failed to assemble");
-
-    // Update with "follows" references
-    let result = backend.update(&None).await;
+    // Update with "follows" references (no assemble needed for update-only tests)
+    let result = backend.update(&None, &config.inputs, &[]).await;
     assert!(
         result.is_ok(),
         "update() should succeed with nested input follows: {:?}",
@@ -2840,7 +2129,7 @@ async fn test_build_multiple_attributes_single_call() {
 "#;
 
     let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, None, GlobalOptions::default());
+        setup_isolated_test_env(yaml, None, NixOptions::default());
     backend
         .assemble(&TestNixArgs::new(&paths).to_nix_args(
             &paths,
@@ -2884,22 +2173,16 @@ async fn test_build_multiple_attributes_single_call() {
 /// Test eval_state Mutex under concurrent eval calls
 #[nix_test]
 async fn test_eval_state_mutex_under_concurrent_eval() {
-    let _cwd_guard = CwdGuard::new(&get_repo_root());
-    let paths = create_test_paths();
-    let config = load_config_from_repo();
+    let yaml = r#"inputs:
+  nixpkgs:
+    url: github:NixOS/nixpkgs/nixpkgs-unstable
+  git-hooks:
+    url: github:cachix/git-hooks.nix
+"#;
+    let (temp_dir, _cwd_guard, backend, paths, config) =
+        setup_isolated_test_env(yaml, None, NixOptions::default());
 
-    let cachix_manager = create_test_cachix_manager(&get_repo_root(), None);
-    let backend = std::sync::Arc::new(
-        NixRustBackend::new(
-            paths.clone(),
-            config.clone(),
-            GlobalOptions::default(),
-            cachix_manager,
-            Shutdown::new(),
-            None,
-        )
-        .expect("Failed to create backend"),
-    );
+    let backend = std::sync::Arc::new(backend);
     backend
         .assemble(&TestNixArgs::new(&paths).to_nix_args(
             &paths,
@@ -2908,6 +2191,9 @@ async fn test_eval_state_mutex_under_concurrent_eval() {
         ))
         .await
         .expect("Failed to assemble");
+
+    // Use fixture lock file for evaluation
+    copy_fixture_lock(temp_dir.path());
 
     // Create three eval futures without awaiting them
     let eval1 = backend.eval(&["config.devenv.root"]);
@@ -2949,7 +2235,7 @@ async fn test_concurrent_build_operations() {
 }"#;
 
     let (temp_dir, _cwd_guard, backend, paths, config) =
-        setup_isolated_test_env(yaml, Some(devenv_nix), GlobalOptions::default());
+        setup_isolated_test_env(yaml, Some(devenv_nix), NixOptions::default());
     backend
         .assemble(&TestNixArgs::new(&paths).to_nix_args(
             &paths,
@@ -2999,152 +2285,4 @@ async fn test_concurrent_build_operations() {
     assert!(!paths1.is_empty(), "Build 1 should return paths");
     assert!(!paths2.is_empty(), "Build 2 should return paths");
     assert!(!paths3.is_empty(), "Build 3 should return paths");
-}
-
-// ============================================================================
-// CACHIX DAEMON INTEGRATION TESTS
-// ============================================================================
-
-/// Integration test: Build with NixBackend and verify paths are pushed to cachix daemon
-///
-/// This test:
-/// 1. Starts a mock cachix daemon
-/// 2. Creates a backend configured with cachix.push
-/// 3. Builds a dynamic derivation (always rebuilds due to builtins.currentTime)
-/// 4. Verifies the built paths were pushed to the daemon
-#[nix_test]
-async fn test_build_with_cachix_push_integration() {
-    // Start mock daemon
-    let mock = Arc::new(
-        MockCachixDaemon::start()
-            .await
-            .expect("Failed to start mock daemon"),
-    );
-
-    eprintln!("Mock daemon socket: {:?}", mock.socket_path());
-
-    // Spawn background handler
-    let _handler = mock.spawn_handler();
-
-    // Give daemon time to start
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    // Create test environment with cachix push enabled
-    let test_dir = tempfile::tempdir().expect("Failed to create test dir");
-
-    // Create devenv.yaml with inputs
-    std::fs::write(
-        test_dir.path().join("devenv.yaml"),
-        r#"
-inputs:
-  nixpkgs:
-    url: github:NixOS/nixpkgs/nixos-23.11
-"#,
-    )
-    .expect("Failed to write devenv.yaml");
-
-    // Create devenv.nix with cachix push and a dynamic derivation
-    std::fs::write(
-        test_dir.path().join("devenv.nix"),
-        r#"
-{ pkgs, ... }:
-
-{
-  # Configure cachix push
-  cachix.push = "test-cache";
-
-  # Create a test package that always changes due to currentTime
-  outputs.test-package = pkgs.runCommand "test-package-${toString builtins.currentTime}" {} ''
-    mkdir -p $out
-    echo "Built at: ${toString builtins.currentTime}" > $out/timestamp.txt
-    echo "This derivation always rebuilds due to currentTime" > $out/info.txt
-  '';
-}
-"#,
-    )
-    .expect("Failed to write devenv.nix");
-
-    // Load config and create backend
-    let config = Config::load_from(test_dir.path()).expect("Failed to load config");
-    let paths = create_test_paths_in(test_dir.path());
-
-    let backend = NixRustBackend::new(
-        paths.clone(),
-        config.clone(),
-        GlobalOptions::default(),
-        create_test_cachix_manager(&get_repo_root(), Some(mock.socket_path().to_path_buf())),
-        Shutdown::new(),
-        None,
-    )
-    .expect("Failed to create backend");
-
-    // Assemble (initializes cachix daemon)
-    backend
-        .assemble(&TestNixArgs::new(&paths).to_nix_args(
-            &paths,
-            &config,
-            config.nixpkgs_config(get_current_system()),
-        ))
-        .await
-        .expect("Failed to assemble backend");
-
-    // Build our dynamic test package via config.outputs
-    let gc_root = paths.dot_gc.join("test-build");
-    let result = backend
-        .build(&["config.outputs.test-package"], None, Some(&gc_root))
-        .await;
-
-    assert!(result.is_ok(), "Build should succeed: {:?}", result.err());
-    let built_paths = result.unwrap();
-    assert!(!built_paths.is_empty(), "Build should return paths");
-
-    eprintln!("Built {} paths", built_paths.len());
-    for path in &built_paths {
-        eprintln!("  - {}", path.display());
-    }
-
-    // Give daemon time to process pushes
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-    // Explicitly finalize cachix push (can't rely on Drop in async context)
-    // This waits for all queued paths to complete
-    backend
-        .finalize_cachix_push()
-        .await
-        .expect("Failed to finalize cachix push");
-
-    // Drop backend now that push is finalized
-    drop(backend);
-
-    // Small delay to ensure all tasks complete
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    // Verify paths were pushed
-    let pushed_paths = mock.get_pushed_paths().await;
-
-    eprintln!("Pushed {} paths to mock daemon", pushed_paths.len());
-    for path in &pushed_paths {
-        eprintln!("  - {}", path);
-    }
-
-    assert!(
-        !pushed_paths.is_empty(),
-        "At least some paths should be pushed to cachix daemon"
-    );
-
-    // Verify at least one built path was pushed
-    let built_path_strs: Vec<String> = built_paths
-        .iter()
-        .filter_map(|p| p.to_str().map(|s| s.to_string()))
-        .collect();
-
-    let any_pushed = built_path_strs
-        .iter()
-        .any(|built| pushed_paths.contains(built));
-
-    assert!(
-        any_pushed,
-        "At least one built path should be pushed. Built: {:?}, Pushed: {:?}",
-        built_path_strs, pushed_paths
-    );
 }

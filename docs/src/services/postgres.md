@@ -20,12 +20,18 @@ boolean
 
 
 *Default:*
-` false `
+
+```nix
+false
+```
 
 
 
 *Example:*
-` true `
+
+```nix
+true
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/services/postgres\.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/postgres.nix)
@@ -46,13 +52,16 @@ package
 
 
 *Default:*
-` pkgs.postgresql `
+
+```nix
+pkgs.postgresql
+```
 
 
 
 *Example:*
 
-```
+```nix
 pkgs.postgresql_15
 
 ```
@@ -74,7 +83,10 @@ boolean
 
 
 *Default:*
-` true `
+
+```nix
+true
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/services/postgres\.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/postgres.nix)
@@ -92,6 +104,7 @@ The available extensions are:
  - age
  - anonymizer
  - apache_datasketches
+ - callPackage
  - citus
  - cstore_fdw
  - h3-pg
@@ -104,6 +117,7 @@ The available extensions are:
  - pg-gvm
  - pg-semver
  - pg_auto_failover
+ - pg_background
  - pg_bigm
  - pg_byteamagic
  - pg_cron
@@ -122,6 +136,7 @@ The available extensions are:
  - pg_repack
  - pg_roaringbitmap
  - pg_safeupdate
+ - pg_search
  - pg_similarity
  - pg_squeeze
  - pg_tle
@@ -146,6 +161,7 @@ The available extensions are:
  - plr
  - pltcl
  - plv8
+ - pointcloud
  - postgis
  - repmgr
  - rum
@@ -169,13 +185,16 @@ null or (function that evaluates to a(n) list of package)
 
 
 *Default:*
-` null `
+
+```nix
+null
+```
 
 
 
 *Example:*
 
-```
+```nix
 extensions: [
   extensions.pg_cron
   extensions.postgis
@@ -204,13 +223,16 @@ null or string
 
 
 *Default:*
-` null `
+
+```nix
+null
+```
 
 
 
 *Example:*
 
-```
+```nix
 builtins.readFile ./my-custom/directory/to/pg_hba.conf
 
 ```
@@ -236,7 +258,7 @@ list of strings concatenated with “\\n”
 
 *Default:*
 
-```
+```nix
 [
   "--locale=C"
   "--encoding=UTF8"
@@ -247,7 +269,7 @@ list of strings concatenated with “\\n”
 
 *Example:*
 
-```
+```nix
 [
   "--data-checksums"
   "--allow-group-access"
@@ -274,13 +296,16 @@ list of (submodule)
 
 
 *Default:*
-` [ ] `
+
+```nix
+[ ]
+```
 
 
 
 *Example:*
 
-```
+```nix
 [
   {
     name = "foodatabase";
@@ -311,13 +336,16 @@ null or string
 
 
 *Default:*
-` null `
+
+```nix
+null
+```
 
 
 
 *Example:*
 
-```
+```nix
 CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT);
 INSERT INTO users (name) VALUES ('admin');
 CREATE EXTENSION IF NOT EXISTS pg_uuidv7;
@@ -359,7 +387,10 @@ null or string
 
 
 *Default:*
-` null `
+
+```nix
+null
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/services/postgres\.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/postgres.nix)
@@ -381,7 +412,10 @@ null or absolute path
 
 
 *Default:*
-` null `
+
+```nix
+null
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/services/postgres\.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/postgres.nix)
@@ -392,7 +426,7 @@ null or absolute path
 
 
 
-Username of owner of the database (if null, the default $USER is used)\.
+Username of owner of the database (if null, the default $USER is used, only takes effect if ` pass ` is not ` null `)\.
 
 
 
@@ -402,7 +436,10 @@ null or string
 
 
 *Default:*
-` null `
+
+```nix
+null
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/services/postgres\.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/postgres.nix)
@@ -417,7 +454,8 @@ Initial SQL commands to run during database initialization\. This can be multipl
 SQL expressions separated by a semi-colon\.
 Use ` initialScript ` for server-wide setup, such as creating roles or configuring
 global settings\. For database-specific initialization, use ` initialSQL ` within
-` initialDatabases `\.
+` initialDatabases `\. ` initialScript ` is executed after the ` initialDatabases `
+setup is done\.
 
 
 
@@ -427,13 +465,16 @@ null or string
 
 
 *Default:*
-` null `
+
+```nix
+null
+```
 
 
 
 *Example:*
 
-```
+```nix
 CREATE ROLE postgres SUPERUSER;
 CREATE ROLE bar;
 
@@ -470,12 +511,18 @@ string
 
 
 *Default:*
-` "" `
+
+```nix
+""
+```
 
 
 
 *Example:*
-` "127.0.0.1" `
+
+```nix
+"127.0.0.1"
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/services/postgres\.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/postgres.nix)
@@ -496,7 +543,10 @@ The TCP port to accept connections\.
 
 
 *Default:*
-` 5432 `
+
+```nix
+5432
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/services/postgres\.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/postgres.nix)
@@ -522,13 +572,16 @@ attribute set of (boolean or floating point number or signed integer or string)
 
 
 *Default:*
-` { } `
+
+```nix
+{ }
+```
 
 
 
 *Example:*
 
-```
+```nix
 {
   log_connections = true;
   log_statement = "all";

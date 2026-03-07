@@ -19,12 +19,18 @@ boolean
 
 
 *Default:*
-` false `
+
+```nix
+false
+```
 
 
 
 *Example:*
-` true `
+
+```nix
+true
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/services/opentelemetry-collector\.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/opentelemetry-collector.nix)
@@ -45,7 +51,10 @@ package
 
 
 *Default:*
-` pkgs.opentelemetry-collector-contrib `
+
+```nix
+pkgs.opentelemetry-collector-contrib
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/services/opentelemetry-collector\.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/opentelemetry-collector.nix)
@@ -57,8 +66,8 @@ package
 Override the configuration file used by OpenTelemetry Collector\.
 By default, a configuration is generated from ` services.opentelemetry-collector.settings `\.
 
-If overriding, enable the ` health_check ` extension to allow process-compose to check whether the Collector is ready\.
-Otherwise, disable the readiness probe by setting ` processes.opentelemetry-collector.process-compose.readiness_probe = lib.mkForce {}; `\.
+If overriding, enable the ` health_check ` extension to allow the readiness probe to check whether the Collector is ready\.
+Otherwise, disable the readiness probe by setting ` processes.opentelemetry-collector.ready = lib.mkForce null; `\.
 
 
 
@@ -68,13 +77,16 @@ null or absolute path
 
 
 *Default:*
-` null `
+
+```nix
+null
+```
 
 
 
 *Example:*
 
-```
+```nix
 pkgs.writeTextFile { name = "otel-config.yaml"; text = "..."; }
 
 ```
@@ -100,7 +112,10 @@ open submodule of (YAML 1\.1 value)
 
 
 *Default:*
-` defaultSettings `
+
+```nix
+defaultSettings
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/services/opentelemetry-collector\.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/opentelemetry-collector.nix)

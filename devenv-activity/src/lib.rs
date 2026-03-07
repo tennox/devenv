@@ -50,22 +50,27 @@ pub use devenv_activity_macros::activity;
 pub use tracing_subscriber::Registry;
 
 // Core types
-pub use activity::{Activity, ActivityType};
+pub use activity::{Activity, ActivityRef, ActivityType};
 pub use events::{
-    ActivityEvent, ActivityLevel, ActivityOutcome, Build, Command, Evaluate, Fetch, FetchKind,
-    Message, Operation, Task,
+    ActivityEvent, ActivityLevel, ActivityOutcome, Build, Command, EvalOp, Evaluate,
+    ExpectedCategory, Fetch, FetchKind, Message, Operation, Process, ProcessStatus, SetExpected,
+    Task, TaskInfo,
 };
 pub use timestamp::Timestamp;
 
 // Builders
 pub use builders::{
-    BuildBuilder, CommandBuilder, EvaluateBuilder, FetchBuilder, OperationBuilder, TaskBuilder,
+    BuildBuilder, CommandBuilder, EvaluateBuilder, FetchBuilder, OperationBuilder, ProcessBuilder,
+    TaskBuilder, next_id,
 };
 
 // Functions
-pub use handle::{ActivityHandle, init};
+pub use handle::{ActivityGuard, ActivityHandle, init};
 pub use serde_valuable::SerdeValue;
-pub use stack::{current_activity_id, current_activity_level, message, message_with_details};
+pub use stack::{
+    current_activity_id, current_activity_level, emit_task_hierarchy, log_to_evaluate, log_to_task,
+    message, message_with_details, op_to_evaluate, set_expected,
+};
 
 // Trait
 pub use instrument::ActivityInstrument;

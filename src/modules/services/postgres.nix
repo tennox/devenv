@@ -7,6 +7,10 @@ let
   cfg = config.services.postgres;
   inherit (lib) types;
 
+  # Port allocation
+  basePort = cfg.port;
+  allocatedPort = config.processes.postgres.ports.main.value;
+
   q = lib.escapeShellArg;
 
   runtimeDir = "${config.env.DEVENV_RUNTIME}/postgres";
@@ -169,7 +173,7 @@ let
       OLDPGHOST="$PGHOST"
       PGHOST=${q runtimeDir}
 
-      pg_ctl -D "$PGDATA" -w start -o "-c unix_socket_directories=${runtimeDir} -c listen_addresses= -p ${toString cfg.port}"
+      pg_ctl -D "$PGDATA" -w start -o "-c unix_socket_directories=${runtimeDir} -c listen_addresses= -p ${toString allocatedPort}"
       ${setupInitialDatabases}
 
       ${runInitialScript}
@@ -327,7 +331,7 @@ in
             type = types.nullOr types.str;
             default = null;
             description = ''
-              Username of owner of the database (if null, the default $USER is used).
+              Username of owner of the database (if null, the default $USER is used, only takes effect if `pass` is not `null`).
             '';
           };
           pass = lib.mkOption {
@@ -376,7 +380,8 @@ in
         SQL expressions separated by a semi-colon.
         Use `initialScript` for server-wide setup, such as creating roles or configuring
         global settings. For database-specific initialization, use `initialSQL` within
-        `initialDatabases`.
+        `initialDatabases`. `initialScript` is executed after the `initialDatabases`
+        setup is done.
       '';
       example = lib.literalExpression ''
         CREATE ROLE postgres SUPERUSER;
@@ -411,41 +416,36 @@ in
       in
       lib.mkDefault host;
     # Required for init scripts.
-    env.PGPORT = cfg.port;
+    env.PGPORT = allocatedPort;
 
     services.postgres.settings = {
       listen_addresses = cfg.listen_addresses;
-      port = cfg.port;
+      port = allocatedPort;
       unix_socket_directories = lib.mkDefault runtimeDir;
     };
 
     processes.postgres = {
+      ports.main.allocate = basePort;
       exec = "${startScript}/bin/start-postgres";
+
+      ready = {
+        exec = ''
+          if [[ -f "$PGDATA/.devenv_initialized" ]]; then
+            ${postgresPkg}/bin/pg_isready -d template1 && \\
+            ${postgresPkg}/bin/psql -c "SELECT 1" template1 > /dev/null 2>&1
+          else
+            echo "Waiting for PostgreSQL initialization to complete..." 2>&1
+            exit 1
+          fi
+        '';
+        initial_delay = 2;
+        probe_timeout = 4;
+        failure_threshold = 5;
+      };
 
       process-compose = {
         # SIGINT (= 2) for faster shutdown: https://www.postgresql.org/docs/current/server-shutdown.html
         shutdown.signal = 2;
-
-        readiness_probe = {
-          # pg_isready does not distinguish between a server that is ready and one that's being initialized by initdb.
-          exec.command = ''
-            if [[ -f "$PGDATA/.devenv_initialized" ]]; then
-              ${postgresPkg}/bin/pg_isready -d template1 && \\
-              ${postgresPkg}/bin/psql -c "SELECT 1" template1 > /dev/null 2>&1
-            else
-              echo "Waiting for PostgreSQL initialization to complete..." 2>&1
-              exit 1
-            fi
-          '';
-          initial_delay_seconds = 2;
-          period_seconds = 10;
-          timeout_seconds = 4;
-          success_threshold = 1;
-          failure_threshold = 5;
-        };
-
-        # https://github.com/F1bonacc1/process-compose#-auto-restart-if-not-healthy
-        availability.restart = "on_failure";
       };
     };
   };

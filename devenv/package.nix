@@ -2,6 +2,8 @@
 , version
 , cargoLock
 , cargoProfile ? "release"
+, gitRev ? ""
+, isRelease ? false
 , lib
 , stdenv
 , makeBinaryWrapper
@@ -9,22 +11,29 @@
 , rustPlatform
 , cachix
 , nixd
-, gitMinimal
+, gitSetupHook
 , openssl
 , dbus
 , protobuf
 , pkg-config
 , glibcLocalesUtf8
+, bash
 , nix
 , llvmPackages
 , boehmgc
+, sqlite
 }:
 
 rustPlatform.buildRustPackage {
   pname = "devenv";
   inherit src version cargoLock;
 
-  RUSTFLAGS = "--cfg tracing_unstable";
+  env = {
+    DEVENV_GIT_REV = gitRev;
+    DEVENV_IS_RELEASE = if isRelease then "true" else "";
+    RUSTFLAGS = "--cfg tracing_unstable";
+    LIBSQLITE3_SYS_USE_PKG_CONFIG = "1";
+  };
 
   cargoBuildFlags = [ "-p devenv -p devenv-run-tests" ];
   buildType = cargoProfile;
@@ -34,11 +43,13 @@ rustPlatform.buildRustPackage {
     makeBinaryWrapper
     pkg-config
     protobuf
+    llvmPackages.clang-unwrapped
     rustPlatform.bindgenHook
   ];
 
   buildInputs = [
     openssl
+    sqlite
     nix.libs.nix-expr-c
     nix.libs.nix-store-c
     nix.libs.nix-util-c
@@ -47,7 +58,6 @@ rustPlatform.buildRustPackage {
     nix.libs.nix-fetchers-c
     nix.libs.nix-main-c
     boehmgc
-    llvmPackages.clang-unwrapped
   ]
   # secretspec
   ++ lib.optional stdenv.isLinux dbus;
@@ -70,17 +80,15 @@ rustPlatform.buildRustPackage {
     export PROTO_ROOT="$NIX_BUILD_TOP/cargo-vendor-dir"
   '';
 
-  nativeCheckInputs = [ gitMinimal ];
-  preCheck = ''
-    # Initialize git repo for tests that use git-root-relative imports
-    pushd $NIX_BUILD_TOP/source
-    git init -b main
-    git add -A
-    popd
+  sandboxProfile = lib.optionalString stdenv.isDarwin ''
+    (allow mach-lookup (global-name "com.apple.FSEvents"))
   '';
 
-  # Skip devenv-nix-backend tests in sandbox due to store permission restrictions
-  cargoTestFlags = [ "--workspace" "--exclude" "devenv-nix-backend" ];
+  nativeCheckInputs = [ gitSetupHook bash ];
+
+  useNextest = true;
+
+  cargoTestFlags = [ "--workspace" ];
 
   postInstall =
     let
@@ -102,8 +110,9 @@ rustPlatform.buildRustPackage {
       cargo xtask generate-manpages --out-dir man
       installManPage man/*
 
-      # Generate shell completions
+      # Generate shell completions (devenv must be in PATH)
       compdir=./completions
+      export PATH="$out/bin:$PATH"
       for shell in bash fish zsh; do
         cargo xtask generate-shell-completion $shell --out-dir $compdir
       done

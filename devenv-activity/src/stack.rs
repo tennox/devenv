@@ -18,28 +18,32 @@
 //! ```rust,ignore
 //! use devenv_activity::{Activity, ActivityInstrument};
 //!
-//! let activity = Arc::new(Activity::task("parent").start());
+//! let activity = Arc::new(Activity::task().start());
 //! let activity_clone = Arc::clone(&activity);
 //!
 //! tokio::spawn(move || {
 //!     async move {
 //!         // Activities created here will have `activity` as their parent
-//!         let child = Activity::task("child").start();
+//!         let child = Activity::task().start();
 //!     }.in_activity(&activity_clone)
 //! });
 //! ```
 
 use std::cell::RefCell;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 use tokio::sync::mpsc;
 use valuable::Valuable;
 
 use crate::Timestamp;
-use crate::events::{ActivityEvent, ActivityLevel, Message};
+use crate::builders::next_id;
+use crate::events::{ActivityEvent, ActivityLevel, ExpectedCategory, Message, SetExpected};
 use crate::serde_valuable::SerdeValue;
 
-/// Global sender for activity events (installed by ActivityHandle::install())
-pub(crate) static ACTIVITY_SENDER: OnceLock<mpsc::UnboundedSender<ActivityEvent>> = OnceLock::new();
+/// Global sender for activity events (installed by ActivityHandle::install()).
+/// Uses Mutex<Option<...>> so it can be cleared when the receiver is dropped,
+/// allowing subsequent log/error calls to fall back to tracing.
+pub(crate) static ACTIVITY_SENDER: Mutex<Option<mpsc::UnboundedSender<ActivityEvent>>> =
+    Mutex::new(None);
 
 // Task-local stack for tracking current Activity IDs and levels (for parent detection and level inheritance).
 // Using task_local instead of thread_local to support async code where tasks
@@ -56,7 +60,8 @@ pub(crate) fn send_activity_event(event: ActivityEvent) {
     }
 
     // Send to channel for TUI
-    if let Some(tx) = ACTIVITY_SENDER.get() {
+    let tx = ACTIVITY_SENDER.lock().ok().and_then(|g| g.clone());
+    if let Some(tx) = tx {
         let _ = tx.send(event);
     }
 }
@@ -105,10 +110,107 @@ pub fn message_with_details(
 ) {
     let parent = current_activity_id();
     send_activity_event(ActivityEvent::Message(Message {
+        id: next_id(),
         level,
         text: text.into(),
         details,
         parent,
+        timestamp: Timestamp::now(),
+    }));
+}
+
+/// Emit a SetExpected event to announce aggregate expected counts.
+/// This is used by Nix to announce how many items/bytes are expected
+/// before individual activities start.
+pub fn set_expected(category: ExpectedCategory, expected: u64) {
+    send_activity_event(ActivityEvent::SetExpected(SetExpected {
+        category,
+        expected,
+        timestamp: Timestamp::now(),
+    }));
+}
+
+/// Log a line to an Evaluate activity by ID.
+///
+/// Use this when you have the activity ID but not the Activity object,
+/// such as when logging from FFI callbacks where the Activity is owned elsewhere.
+pub fn log_to_evaluate(id: u64, line: impl Into<String>) {
+    use crate::events::Evaluate;
+
+    let line = line.into();
+    if ACTIVITY_SENDER
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .is_none()
+    {
+        tracing::info!("{}", line);
+    }
+    send_activity_event(ActivityEvent::Evaluate(Evaluate::Log {
+        id,
+        line,
+        timestamp: Timestamp::now(),
+    }));
+}
+
+/// Log a structured eval operation to an Evaluate activity by ID.
+///
+/// Use this for parsed/structured evaluation operations (readDir, pathExists, etc.)
+/// that carry richer data than plain text log lines.
+pub fn op_to_evaluate(id: u64, op: crate::events::EvalOp) {
+    use crate::events::Evaluate;
+
+    send_activity_event(ActivityEvent::Evaluate(Evaluate::Op {
+        id,
+        op,
+        timestamp: Timestamp::now(),
+    }));
+}
+
+/// Emit a task hierarchy event describing all tasks and their parent-child relationships.
+///
+/// This should be called once before task execution begins. The edges represent
+/// parent-child relationships where a task appears under its dependents in the TUI
+/// (i.e., the tasks that depend on it).
+///
+/// # Arguments
+/// * `tasks` - All tasks with their metadata
+/// * `edges` - Parent-child relationships as (parent_id, child_id) pairs
+pub fn emit_task_hierarchy(tasks: Vec<crate::events::TaskInfo>, edges: Vec<(u64, u64)>) {
+    use crate::events::Task;
+
+    send_activity_event(ActivityEvent::Task(Task::Hierarchy {
+        tasks,
+        edges,
+        timestamp: Timestamp::now(),
+    }));
+}
+
+/// Log a line to a Task activity by ID.
+///
+/// Use this when you have the activity ID but not the Activity object,
+/// such as when logging from task execution where the Activity lifecycle
+/// is managed by the calling code.
+pub fn log_to_task(id: u64, line: impl Into<String>, is_error: bool) {
+    use crate::events::Task;
+
+    let line = line.into();
+    if ACTIVITY_SENDER
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .is_none()
+    {
+        if is_error {
+            tracing::warn!("{}", line);
+        } else {
+            tracing::info!("{}", line);
+        }
+    }
+    send_activity_event(ActivityEvent::Task(Task::Log {
+        id,
+        line,
+        is_error,
         timestamp: Timestamp::now(),
     }));
 }

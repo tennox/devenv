@@ -7,57 +7,81 @@
 //! Both backends convert their input to `InternalLog` and feed it to `NixLogBridge`,
 //! ensuring consistent activity tracking and progress reporting.
 //!
-//! # Eval Activity Lifecycle
+//! # Eval Activity Tracking
 //!
-//! The bridge uses **lazy activity creation** to avoid creating empty activities
-//! when no Nix work actually happens. This is important because some operations
-//! (like lock validation) may or may not trigger Nix callbacks depending on
-//! whether inputs are cached.
+//! The bridge tracks which Activity file evaluations should be logged to.
+//! The caller owns the Activity and passes its ID to `begin_eval()`.
 //!
 //! ## How It Works
 //!
-//! 1. Caller captures the parent activity ID from the task-local stack
-//! 2. Caller acquires the eval_state lock
-//! 3. Caller calls `begin_eval(parent_id)` to register the pending parent
-//! 4. **Lazy**: When the first Nix callback arrives, the bridge creates the
-//!    eval activity using the stored parent ID
-//! 5. Caller calls `end_eval()` when done, which completes the activity (if created)
+//! 1. Caller creates an Activity (e.g., `Activity::evaluate("Building shell")`)
+//! 2. Caller calls `begin_eval(activity.id())` which returns an `EvalActivityGuard`
+//! 3. When file evaluation messages arrive, they are logged to that activity
+//! 4. When the guard is dropped, `end_eval()` is called automatically
 //!
-//! This is handled automatically by `EvalSession` in `devenv-nix-backend`.
-//!
-//! ## Re-entrancy
-//!
-//! The bridge supports nested eval sessions. Only the outermost session's parent
-//! ID is used, and the activity is only completed when all sessions have ended.
-//! This allows methods like `validate_lock_file()` to be called from within
-//! operations like `dev_env()` without creating duplicate activities.
+//! This guard-based API ensures eval scopes are always properly closed.
 
-use devenv_activity::{Activity, ActivityLevel, FetchKind, message, message_with_details};
-use devenv_eval_cache::Op;
-use devenv_eval_cache::internal_log::{ActivityType, Field, InternalLog, ResultType, Verbosity};
+use devenv_activity::{
+    Activity, ActivityLevel, ExpectedCategory, FetchKind, message, message_with_details,
+    op_to_evaluate, set_expected,
+};
 use regex::Regex;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::sync::{Arc, Mutex};
 use tracing::{error, trace, warn};
 
+use crate::eval_op::{EvalOp, OpObserver};
+use crate::internal_log::{ActivityType, Field, InternalLog, ResultType, Verbosity};
+
 /// State for tracking the current evaluation activity.
 ///
-/// This tracks both the pending parent (for lazy creation) and the nesting depth
-/// (for re-entrancy support).
+/// The bridge stores only the activity ID, not the Activity itself.
+/// The caller owns the Activity and controls its lifecycle.
 struct EvalActivityState {
-    /// Nesting depth - how many EvalSessions are currently active.
-    /// Only the outermost session controls activity creation/completion.
-    depth: usize,
-    /// Parent activity ID captured by the outermost session.
-    /// Used when lazily creating the eval activity on first Nix callback.
-    pending_parent: Option<u64>,
-    /// Name for the evaluation activity (e.g., "Building shell", "Searching packages").
-    pending_name: String,
-    /// Activity level for the evaluation (Info for user-visible, Debug for internal).
-    pending_level: ActivityLevel,
-    /// The current evaluation activity, created lazily on first Nix callback.
-    current_eval: Option<Activity>,
+    /// The current evaluation activity ID, used for logging file evaluations.
+    current_eval_id: Option<u64>,
+}
+
+/// Tracks per-activity expected counts and computes category totals.
+///
+/// Nix emits absolute expected counts per activity, potentially re-reporting
+/// the same value many times. This tracker deduplicates per-activity counts
+/// and computes correct totals by summing across all activities per category.
+#[derive(Debug, Default)]
+struct ExpectedCountTracker {
+    counts: HashMap<(u64, ExpectedCategory), u64>,
+}
+
+impl ExpectedCountTracker {
+    /// Update the expected count for an activity.
+    /// Returns `Some(total)` if the category total changed, `None` otherwise.
+    #[must_use]
+    fn update(
+        &mut self,
+        activity_id: u64,
+        category: ExpectedCategory,
+        expected: u64,
+    ) -> Option<u64> {
+        let key = (activity_id, category);
+        let prev = self.counts.insert(key, expected);
+        if prev == Some(expected) {
+            return None;
+        }
+        let total = self
+            .counts
+            .iter()
+            .filter(|((_, c), _)| *c == category)
+            .map(|(_, v)| v)
+            .sum();
+        Some(total)
+    }
+
+    /// Remove all counts for an activity (called when it stops).
+    /// Does not re-emit totals — we don't want the UI count to go down.
+    fn remove_activity(&mut self, activity_id: u64) {
+        self.counts.retain(|&(id, _), _| id != activity_id);
+    }
 }
 
 /// Bridge that converts Nix internal logs to tracing events.
@@ -70,12 +94,30 @@ pub struct NixLogBridge {
     active_activities: Arc<Mutex<HashMap<u64, NixActivityInfo>>>,
     /// State for the current evaluation activity (lazy creation + re-entrancy)
     eval_state: Mutex<EvalActivityState>,
+    /// Observers for file/env operations during eval (used by caching systems)
+    observers: Mutex<Vec<Arc<dyn OpObserver>>>,
+    /// Error messages to be printed after TUI exits, before entering REPL
+    pre_repl_errors: Mutex<Vec<String>>,
+    expected_counts: Mutex<ExpectedCountTracker>,
 }
 
 /// Information about an active Nix activity
 struct NixActivityInfo {
     activity_type: ActivityType,
     activity: Activity,
+}
+
+/// Guard that calls `end_eval` when dropped.
+///
+/// This ensures the eval scope is always closed, even if the code panics.
+pub struct EvalActivityGuard<'a> {
+    bridge: &'a NixLogBridge,
+}
+
+impl Drop for EvalActivityGuard<'_> {
+    fn drop(&mut self) {
+        self.bridge.end_eval();
+    }
 }
 
 impl NixLogBridge {
@@ -87,89 +129,97 @@ impl NixLogBridge {
         Arc::new(Self {
             active_activities: Arc::new(Mutex::new(HashMap::new())),
             eval_state: Mutex::new(EvalActivityState {
-                depth: 0,
-                pending_parent: None,
-                pending_name: String::new(),
-                pending_level: ActivityLevel::Info,
-                current_eval: None,
+                current_eval_id: None,
             }),
+            observers: Mutex::new(Vec::new()),
+            pre_repl_errors: Mutex::new(Vec::new()),
+            expected_counts: Mutex::new(ExpectedCountTracker::default()),
         })
     }
 
-    /// Begin a new evaluation scope.
+    /// Store an error message to be printed before entering REPL.
     ///
-    /// Call this after acquiring the eval_state lock. The `parent_id` should be
-    /// captured from the task-local activity stack (`current_activity_id()`)
-    /// **before** acquiring the lock.
-    ///
-    /// The eval activity is created **lazily** when the first Nix callback arrives.
-    /// If no callbacks arrive, no activity is created (avoiding empty 0ms activities).
-    ///
-    /// This method supports re-entrancy: nested calls increment a depth counter,
-    /// and only the outermost call's `parent_id` is used.
-    pub fn begin_eval(&self, parent_id: Option<u64>, name: String, level: ActivityLevel) {
-        let mut state = self.eval_state.lock().expect("eval_state mutex poisoned");
-
-        if state.depth == 0 {
-            // Outermost session - store the parent ID, name, and level for lazy activity creation
-            state.pending_parent = parent_id;
-            state.pending_name = name;
-            state.pending_level = level;
-            // Clear any stale activity (shouldn't happen, but be safe)
-            state.current_eval = None;
-        }
-        // Nested sessions don't change pending state - outer session's values are used
-
-        state.depth += 1;
-    }
-
-    /// End the current evaluation scope.
-    ///
-    /// Call this when the eval_state lock is released (typically via RAII guard).
-    /// This decrements the nesting depth, and when the outermost scope ends,
-    /// completes the eval activity (if one was created).
-    pub fn end_eval(&self) {
-        let mut state = self.eval_state.lock().expect("eval_state mutex poisoned");
-
-        if state.depth == 0 {
-            // Unbalanced end_eval call - shouldn't happen but don't panic
-            tracing::warn!("end_eval called without matching begin_eval");
-            return;
-        }
-
-        state.depth -= 1;
-
-        if state.depth == 0 {
-            // Outermost scope ended - complete the activity by dropping it
-            state.current_eval = None;
-            state.pending_parent = None;
-            state.pending_name.clear();
-            state.pending_level = ActivityLevel::Info;
+    /// Error-level log messages are stored here during evaluation and printed
+    /// after the TUI exits (before entering the REPL). This ensures errors are
+    /// visible to the user even when the TUI was capturing output.
+    pub fn store_pre_repl_error(&self, msg: String) {
+        if let Ok(mut errors) = self.pre_repl_errors.lock() {
+            errors.push(msg);
         }
     }
 
-    /// Ensure an eval activity exists and return its ID.
+    /// Take all stored pre-REPL errors, clearing the internal storage.
     ///
-    /// Creates the eval activity lazily on first call within an eval scope.
-    /// Returns `None` if not in an eval scope (depth == 0).
-    fn ensure_eval_activity(&self) -> Option<u64> {
+    /// Returns the error messages that were stored during evaluation.
+    /// These should be printed before entering the REPL.
+    pub fn take_pre_repl_errors(&self) -> Vec<String> {
+        if let Ok(mut errors) = self.pre_repl_errors.lock() {
+            std::mem::take(&mut *errors)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Peek at stored pre-REPL errors without clearing.
+    ///
+    /// Returns a clone of the error messages. Use this when you need to
+    /// include errors in an error message but want to keep them available
+    /// for later (e.g., for the debugger).
+    pub fn peek_pre_repl_errors(&self) -> Vec<String> {
+        if let Ok(errors) = self.pre_repl_errors.lock() {
+            errors.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Add an observer to receive operation notifications during evaluation.
+    ///
+    /// Observers are notified of file/env operations (EvalOp) as they are parsed
+    /// from Nix log messages. This is used by caching systems to track dependencies.
+    pub fn add_observer(&self, observer: Arc<dyn OpObserver>) {
+        if let Ok(mut guard) = self.observers.lock() {
+            guard.push(observer);
+        }
+    }
+
+    /// Clear all observers after evaluation completes.
+    ///
+    /// This should be called after evaluation to stop notifying observers
+    /// and allow them to be garbage collected.
+    pub fn clear_observers(&self) {
+        if let Ok(mut guard) = self.observers.lock() {
+            guard.clear();
+        }
+    }
+
+    /// Begin an evaluation scope.
+    ///
+    /// Returns a guard that calls `end_eval` when dropped.
+    /// The caller owns the Activity and controls its lifecycle.
+    pub fn begin_eval(&self, activity_id: u64) -> EvalActivityGuard<'_> {
         let mut state = self.eval_state.lock().expect("eval_state mutex poisoned");
+        state.current_eval_id = Some(activity_id);
+        EvalActivityGuard { bridge: self }
+    }
 
-        if state.depth == 0 {
-            // Not in an eval scope - no activity to create
-            return None;
-        }
+    /// End the current evaluation scope (called by EvalActivityGuard on drop).
+    fn end_eval(&self) {
+        let mut state = self.eval_state.lock().expect("eval_state mutex poisoned");
+        state.current_eval_id = None;
+    }
 
-        if state.current_eval.is_none() {
-            // First callback in this eval scope - create the activity lazily
-            let eval = Activity::evaluate(&state.pending_name)
-                .parent(state.pending_parent)
-                .level(state.pending_level)
-                .start();
-            state.current_eval = Some(eval);
-        }
-
-        state.current_eval.as_ref().map(|a| a.id())
+    /// Get the parent activity ID for Nix activities.
+    ///
+    /// Returns the current eval activity ID if in an eval scope, otherwise
+    /// falls back to the task-local activity stack. This allows downloads
+    /// during `apply_cachix_substituters()` (no eval session) to nest under
+    /// the current phase activity (e.g., "Configuring shell").
+    fn get_parent_activity_id(&self) -> Option<u64> {
+        let state = self.eval_state.lock().expect("eval_state mutex poisoned");
+        state
+            .current_eval_id
+            .or_else(devenv_activity::current_activity_id)
     }
 
     /// Returns a callback that can be used by any log source.
@@ -226,17 +276,21 @@ impl NixLogBridge {
                 }
             }
             InternalLog::Msg { level, ref msg, .. } => {
-                // First check if this is a file evaluation message
-                if let Some(op) = Op::from_internal_log(&log)
-                    && let Op::EvaluatedFile { source } = op
-                {
-                    self.handle_file_evaluation(source);
-                    return;
-                }
+                // Extract any input operation from the log for caching
+                if let Some(op) = EvalOp::from_internal_log(&log) {
+                    // Notify all active observers
+                    if let Ok(guard) = self.observers.lock() {
+                        for observer in guard.iter() {
+                            if observer.is_active() {
+                                observer.on_op(op.clone());
+                            }
+                        }
+                    }
 
-                // Filter out noise - fast local operations that aren't meaningful to users
-                if msg.contains("to the store") || msg.contains("copying path") {
-                    return;
+                    // Handle eval operations for UI - emit structured op to eval activity if in scope
+                    if self.op_to_current_eval(op) {
+                        return;
+                    }
                 }
 
                 // Handle regular log messages from Nix builds
@@ -244,17 +298,21 @@ impl NixLogBridge {
                 // Verbosity::Error (e.g., "setting up chroot environment", "executing builder").
                 // Only treat Error-level messages as actual errors if they pass is_nix_error()
                 // or is_builtin_trace() checks.
-                if level == Verbosity::Error {
-                    if log.is_nix_error() || log.is_builtin_trace() {
-                        let (summary, details) = parse_nix_error(msg);
-                        message_with_details(ActivityLevel::Error, summary, details);
-                        error!("{msg}");
-                    }
-                    // Skip falsely-labeled error messages from nix daemon
-                } else if level <= Verbosity::Warn {
+                if log.is_nix_error() || log.is_builtin_trace() {
+                    let (summary, details) = parse_nix_error(msg);
+                    message_with_details(ActivityLevel::Error, summary, details);
+                    error!("{msg}");
+                } else {
                     let activity_level = match level {
+                        // Remap the Error level to Debug for non-error messages
+                        Verbosity::Error => ActivityLevel::Debug,
                         Verbosity::Warn => ActivityLevel::Warn,
-                        _ => ActivityLevel::Info,
+                        Verbosity::Notice => ActivityLevel::Warn,
+                        Verbosity::Info => ActivityLevel::Info,
+                        Verbosity::Talkative => ActivityLevel::Debug,
+                        Verbosity::Chatty => ActivityLevel::Debug,
+                        Verbosity::Debug => ActivityLevel::Debug,
+                        Verbosity::Vomit => ActivityLevel::Trace,
                     };
                     message(activity_level, msg);
                 }
@@ -281,14 +339,6 @@ impl NixLogBridge {
             Field::String(s) => Some(s.clone()),
             _ => None,
         }
-    }
-
-    /// Get the parent activity ID for Nix activities.
-    ///
-    /// This triggers lazy creation of the eval activity if we're in an eval scope.
-    /// Returns `None` if not in an eval scope.
-    fn get_parent_activity_id(&self) -> Option<u64> {
-        self.ensure_eval_activity()
     }
 
     /// Handle the start of a Nix activity
@@ -442,6 +492,10 @@ impl NixLogBridge {
 
     /// Handle the stop of a Nix activity
     fn handle_activity_stop(&self, activity_id: u64, success: bool) {
+        if let Ok(mut tracker) = self.expected_counts.lock() {
+            tracker.remove_activity(activity_id);
+        }
+
         let Ok(mut activities) = self.active_activities.lock() else {
             return;
         };
@@ -471,7 +525,7 @@ impl NixLogBridge {
                         && let Ok(activities) = self.active_activities.lock()
                         && let Some(activity_info) = activities.get(&activity_id)
                     {
-                        activity_info.activity.progress(*done, *expected);
+                        activity_info.activity.progress(*done, *expected, None);
                     }
                 } else if fields.len() >= 2 {
                     // Fallback to download progress format for backward compatibility
@@ -517,6 +571,35 @@ impl NixLogBridge {
                     activity_info.activity.log(log_line);
                 }
             }
+            ResultType::SetExpected => {
+                // Handle expected count announcements from Nix.
+                // fields[0] is the ActivityType (as int), fields[1] is the expected count.
+                // Nix emits absolute counts per activity, potentially re-reporting the same
+                // value many times. We track per-activity and only emit when the total changes.
+                if let (Some(Field::Int(activity_type_int)), Some(Field::Int(expected))) =
+                    (fields.first(), fields.get(1))
+                {
+                    let category = ActivityType::try_from(*activity_type_int as i32)
+                        .ok()
+                        .and_then(|at| match at {
+                            ActivityType::Builds
+                            | ActivityType::Build
+                            | ActivityType::BuildWaiting => Some(ExpectedCategory::Build),
+                            ActivityType::CopyPaths | ActivityType::Substitute => {
+                                Some(ExpectedCategory::Download)
+                            }
+                            // CopyPath/FileTransfer report bytes, not counts
+                            _ => None,
+                        });
+
+                    if let Some(cat) = category
+                        && let Ok(mut tracker) = self.expected_counts.lock()
+                        && let Some(total) = tracker.update(activity_id, cat, *expected)
+                    {
+                        set_expected(cat, total);
+                    }
+                }
+            }
             _ => {
                 trace!(
                     result_type = ?result_type,
@@ -528,16 +611,19 @@ impl NixLogBridge {
         }
     }
 
-    /// Handle file evaluation events
-    fn handle_file_evaluation(&self, file_path: std::path::PathBuf) {
-        // Ensure eval activity exists (lazy creation) and log to it
-        self.ensure_eval_activity();
-
+    /// Emit a structured eval op to the current eval activity.
+    ///
+    /// Returns `true` if the op was emitted (we're in an eval scope),
+    /// `false` if there's no active eval scope (caller should fall back to `message()`).
+    fn op_to_current_eval(&self, op: EvalOp) -> bool {
         let state = self.eval_state.lock().expect("eval_state mutex poisoned");
 
-        if let Some(ref eval) = state.current_eval {
-            eval.log(file_path.display().to_string());
-        }
+        let Some(id) = state.current_eval_id else {
+            return false;
+        };
+
+        op_to_evaluate(id, op.into());
+        true
     }
 }
 
@@ -769,5 +855,77 @@ mod tests {
         let (summary, details) = parse_nix_error("error: something went wrong");
         assert_eq!(summary, "error: something went wrong");
         assert!(details.is_none());
+    }
+
+    #[test]
+    fn test_expected_count_single_activity() {
+        let mut tracker = ExpectedCountTracker::default();
+
+        // First report: activity 1 expects 5 downloads
+        assert_eq!(tracker.update(1, ExpectedCategory::Download, 5), Some(5),);
+
+        // Same value again: no change
+        assert_eq!(tracker.update(1, ExpectedCategory::Download, 5), None,);
+
+        // Updated count: activity 1 now expects 10 downloads
+        assert_eq!(tracker.update(1, ExpectedCategory::Download, 10), Some(10),);
+    }
+
+    #[test]
+    fn test_expected_count_multiple_activities_same_category() {
+        let mut tracker = ExpectedCountTracker::default();
+
+        // Activity 1 expects 5 downloads
+        assert_eq!(tracker.update(1, ExpectedCategory::Download, 5), Some(5),);
+
+        // Activity 2 expects 3 downloads — total is 8
+        assert_eq!(tracker.update(2, ExpectedCategory::Download, 3), Some(8),);
+
+        // Activity 1 re-reports 5 — no change
+        assert_eq!(tracker.update(1, ExpectedCategory::Download, 5), None,);
+
+        // Activity 2 updates to 7 — total is 12
+        assert_eq!(tracker.update(2, ExpectedCategory::Download, 7), Some(12),);
+    }
+
+    #[test]
+    fn test_expected_count_independent_categories() {
+        let mut tracker = ExpectedCountTracker::default();
+
+        // Builds and downloads tracked independently
+        assert_eq!(tracker.update(1, ExpectedCategory::Build, 3), Some(3),);
+        assert_eq!(tracker.update(1, ExpectedCategory::Download, 10), Some(10),);
+        assert_eq!(tracker.update(2, ExpectedCategory::Build, 2), Some(5),);
+
+        // Download total should still be 10
+        assert_eq!(tracker.update(1, ExpectedCategory::Download, 10), None,);
+    }
+
+    #[test]
+    fn test_expected_count_remove_activity() {
+        let mut tracker = ExpectedCountTracker::default();
+
+        let _ = tracker.update(1, ExpectedCategory::Download, 5);
+        let _ = tracker.update(2, ExpectedCategory::Download, 3);
+
+        // Remove activity 1 — only activity 2 remains
+        tracker.remove_activity(1);
+
+        // Activity 3 reports 2 downloads — total is 3 + 2 = 5 (activity 1 is gone)
+        assert_eq!(tracker.update(3, ExpectedCategory::Download, 2), Some(5),);
+    }
+
+    #[test]
+    fn test_expected_count_remove_cleans_all_categories() {
+        let mut tracker = ExpectedCountTracker::default();
+
+        let _ = tracker.update(1, ExpectedCategory::Build, 3);
+        let _ = tracker.update(1, ExpectedCategory::Download, 5);
+
+        tracker.remove_activity(1);
+
+        // Both categories should start fresh
+        assert_eq!(tracker.update(2, ExpectedCategory::Build, 1), Some(1),);
+        assert_eq!(tracker.update(2, ExpectedCategory::Download, 1), Some(1),);
     }
 }

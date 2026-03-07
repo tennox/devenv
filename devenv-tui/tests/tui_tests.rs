@@ -1,35 +1,21 @@
+#![cfg(feature = "test-all")]
 //! TUI snapshot tests.
 //!
 //! These tests verify that when activity events are fed into the model,
 //! the TUI renders the expected output.
 
-/// Assert a snapshot with timing filters to avoid flaky tests.
-/// Normalizes elapsed times like "123ms" -> "0ms" and "1.2s" -> "0.0s".
-macro_rules! assert_tui_snapshot {
-    ($output:expr) => {
-        insta::with_settings!({
-            filters => vec![
-                (r"\d+ms", "0ms"),
-                (r"\d+\.\d+s", "0.0s"),
-            ]
-        }, {
-            insta::assert_snapshot!($output);
-        });
-    };
-}
-
 use devenv_activity::{
     ActivityEvent, ActivityLevel, ActivityOutcome, Build, Evaluate, Fetch, FetchKind, Message,
-    Operation, Task, Timestamp,
+    Operation, Process, Task, TaskInfo, Timestamp,
 };
-use devenv_tui::{ActivityModel, UiState, view::view};
+use devenv_tui::{ActivityModel, RenderContext, UiState, view::view};
 use iocraft::prelude::*;
 
 const TEST_WIDTH: u16 = 80;
 const TEST_HEIGHT: u16 = 24;
 
 fn render_to_string(model: &ActivityModel, ui_state: &UiState) -> String {
-    let mut element = view(model, ui_state).into();
+    let mut element = view(model, ui_state, RenderContext::Normal, None, false).into();
     element.render(Some(TEST_WIDTH as usize)).to_string()
 }
 
@@ -40,12 +26,54 @@ fn new_test_model() -> (ActivityModel, UiState) {
     (model, ui_state)
 }
 
+/// Helper to create a task hierarchy event for a single task
+fn task_hierarchy_single(
+    id: u64,
+    name: &str,
+    parent: Option<u64>,
+    show_output: bool,
+    is_process: bool,
+) -> ActivityEvent {
+    let edges = if let Some(p) = parent {
+        vec![(p, id)]
+    } else {
+        vec![]
+    };
+    ActivityEvent::Task(Task::Hierarchy {
+        tasks: vec![TaskInfo {
+            id,
+            name: name.to_string(),
+            show_output,
+            is_process,
+        }],
+        edges,
+        timestamp: Timestamp::now(),
+    })
+}
+
+/// Helper to create a task hierarchy event for multiple tasks
+fn task_hierarchy_multi(tasks: Vec<TaskInfo>, edges: Vec<(u64, u64)>) -> ActivityEvent {
+    ActivityEvent::Task(Task::Hierarchy {
+        tasks,
+        edges,
+        timestamp: Timestamp::now(),
+    })
+}
+
+/// Helper to create a task start event
+fn task_start(id: u64) -> ActivityEvent {
+    ActivityEvent::Task(Task::Start {
+        id,
+        timestamp: Timestamp::now(),
+    })
+}
+
 /// Test that an empty model renders correctly.
 #[test]
 fn test_empty_model() {
     let (model, ui_state) = new_test_model();
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that a single build activity shows in the TUI.
@@ -72,7 +100,7 @@ fn test_single_build_activity() {
     model.apply_activity_event(phase_event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that a download activity with progress shows in the TUI.
@@ -101,7 +129,7 @@ fn test_download_with_progress() {
     model.apply_activity_event(progress_event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that a task activity shows in the TUI.
@@ -109,20 +137,18 @@ fn test_download_with_progress() {
 fn test_task_running() {
     let (mut model, ui_state) = new_test_model();
 
-    let event = ActivityEvent::Task(Task::Start {
-        id: 1,
-        name: "Running tests".to_string(),
-        parent: None,
-        detail: None,
-        show_output: false,
-        is_process: false,
-        timestamp: Timestamp::now(),
-    });
-
-    model.apply_activity_event(event);
+    // First emit hierarchy, then start
+    model.apply_activity_event(task_hierarchy_single(
+        1,
+        "Running tests",
+        None,
+        false,
+        false,
+    ));
+    model.apply_activity_event(task_start(1));
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that multiple concurrent activities show in the TUI.
@@ -160,24 +186,21 @@ fn test_multiple_activities() {
         timestamp: Timestamp::now(),
     });
 
-    let task_event = ActivityEvent::Task(Task::Start {
-        id: 3,
-        name: "Running setup".to_string(),
-        parent: None,
-        detail: None,
-        show_output: false,
-        is_process: false,
-        timestamp: Timestamp::now(),
-    });
-
     model.apply_activity_event(build_event);
     model.apply_activity_event(build_phase_event);
     model.apply_activity_event(download_event);
     model.apply_activity_event(download_progress_event);
-    model.apply_activity_event(task_event);
+    model.apply_activity_event(task_hierarchy_single(
+        3,
+        "Running setup",
+        None,
+        false,
+        false,
+    ));
+    model.apply_activity_event(task_start(3));
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test task status lifecycle: pending -> running -> success.
@@ -185,17 +208,14 @@ fn test_multiple_activities() {
 fn test_task_success() {
     let (mut model, ui_state) = new_test_model();
 
-    let start_event = ActivityEvent::Task(Task::Start {
-        id: 1,
-        name: "Build completed".to_string(),
-        parent: None,
-        detail: None,
-        show_output: false,
-        is_process: false,
-        timestamp: Timestamp::now(),
-    });
-
-    model.apply_activity_event(start_event);
+    model.apply_activity_event(task_hierarchy_single(
+        1,
+        "Build completed",
+        None,
+        false,
+        false,
+    ));
+    model.apply_activity_event(task_start(1));
 
     let complete_event = ActivityEvent::Task(Task::Complete {
         id: 1,
@@ -206,7 +226,7 @@ fn test_task_success() {
     model.apply_activity_event(complete_event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test task failure shows in the TUI.
@@ -214,17 +234,8 @@ fn test_task_success() {
 fn test_task_failed() {
     let (mut model, ui_state) = new_test_model();
 
-    let start_event = ActivityEvent::Task(Task::Start {
-        id: 1,
-        name: "Tests failed".to_string(),
-        parent: None,
-        detail: None,
-        show_output: false,
-        is_process: false,
-        timestamp: Timestamp::now(),
-    });
-
-    model.apply_activity_event(start_event);
+    model.apply_activity_event(task_hierarchy_single(1, "Tests failed", None, false, false));
+    model.apply_activity_event(task_start(1));
 
     let complete_event = ActivityEvent::Task(Task::Complete {
         id: 1,
@@ -235,7 +246,7 @@ fn test_task_failed() {
     model.apply_activity_event(complete_event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that failed tasks show logs even when show_output=false.
@@ -243,16 +254,14 @@ fn test_task_failed() {
 fn test_task_failed_shows_logs() {
     let (mut model, ui_state) = new_test_model();
 
-    let start_event = ActivityEvent::Task(Task::Start {
-        id: 1,
-        name: "test:failing-task".to_string(),
-        parent: None,
-        detail: None,
-        show_output: false,
-        is_process: false,
-        timestamp: Timestamp::now(),
-    });
-    model.apply_activity_event(start_event);
+    model.apply_activity_event(task_hierarchy_single(
+        1,
+        "test:failing-task",
+        None,
+        false,
+        false,
+    ));
+    model.apply_activity_event(task_start(1));
 
     // Send log events - these should be visible because the task fails
     model.apply_activity_event(ActivityEvent::Task(Task::Log {
@@ -282,7 +291,7 @@ fn test_task_failed_shows_logs() {
     model.apply_activity_event(complete_event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that task with show_output=true displays logs in the TUI.
@@ -290,16 +299,14 @@ fn test_task_failed_shows_logs() {
 fn test_task_show_output_true() {
     let (mut model, ui_state) = new_test_model();
 
-    let start_event = ActivityEvent::Task(Task::Start {
-        id: 1,
-        name: "test:with-output".to_string(),
-        parent: None,
-        detail: None,
-        show_output: true,
-        is_process: false,
-        timestamp: Timestamp::now(),
-    });
-    model.apply_activity_event(start_event);
+    model.apply_activity_event(task_hierarchy_single(
+        1,
+        "test:with-output",
+        None,
+        true,
+        false,
+    ));
+    model.apply_activity_event(task_start(1));
 
     // Send log events
     model.apply_activity_event(ActivityEvent::Task(Task::Log {
@@ -316,7 +323,7 @@ fn test_task_show_output_true() {
     }));
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that task with show_output=false hides logs in the TUI.
@@ -324,16 +331,14 @@ fn test_task_show_output_true() {
 fn test_task_show_output_false() {
     let (mut model, ui_state) = new_test_model();
 
-    let start_event = ActivityEvent::Task(Task::Start {
-        id: 1,
-        name: "test:without-output".to_string(),
-        parent: None,
-        detail: None,
-        show_output: false,
-        is_process: false,
-        timestamp: Timestamp::now(),
-    });
-    model.apply_activity_event(start_event);
+    model.apply_activity_event(task_hierarchy_single(
+        1,
+        "test:without-output",
+        None,
+        false,
+        false,
+    ));
+    model.apply_activity_event(task_start(1));
 
     // Send log events - these should be filtered out
     model.apply_activity_event(ActivityEvent::Task(Task::Log {
@@ -350,7 +355,7 @@ fn test_task_show_output_false() {
     }));
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test evaluating activity shows in the TUI.
@@ -369,7 +374,7 @@ fn test_evaluating_activity() {
     model.apply_activity_event(event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test query activity shows in the TUI.
@@ -389,7 +394,7 @@ fn test_query_activity() {
     model.apply_activity_event(event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test fetch tree activity shows in the TUI.
@@ -409,7 +414,7 @@ fn test_fetch_tree_activity() {
     model.apply_activity_event(event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test download with substituter info shows in the TUI.
@@ -438,7 +443,7 @@ fn test_download_with_substituter() {
     model.apply_activity_event(progress_event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that Nix evaluation with nested child activities (builds, fetches, downloads) shows hierarchy.
@@ -507,7 +512,7 @@ fn test_nested_evaluation_with_children() {
     model.apply_activity_event(nested_download_event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that activity details are stored correctly.
@@ -527,7 +532,7 @@ fn test_activity_with_details() {
     model.apply_activity_event(parent_event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test multiple parallel builds running concurrently.
@@ -593,7 +598,7 @@ fn test_multiple_parallel_builds() {
     }));
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test parallel downloads and builds happening simultaneously.
@@ -680,7 +685,7 @@ fn test_parallel_downloads_and_builds() {
     }));
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test indeterminate progress shows in the TUI.
@@ -707,7 +712,7 @@ fn test_indeterminate_progress() {
     model.apply_activity_event(progress_event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test deep nesting (3+ levels) shows hierarchy correctly.
@@ -780,7 +785,7 @@ fn test_deep_nesting() {
     model.apply_activity_event(deep_fetch);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test many concurrent activities (stress test for rendering).
@@ -822,15 +827,14 @@ fn test_many_concurrent_activities() {
                 }));
             }
             2 => {
-                model.apply_activity_event(ActivityEvent::Task(Task::Start {
-                    id: i as u64 + 1,
-                    name: format!("task-{}", i),
-                    parent: None,
-                    detail: None,
-                    show_output: false,
-                    is_process: false,
-                    timestamp: Timestamp::now(),
-                }));
+                model.apply_activity_event(task_hierarchy_single(
+                    i as u64 + 1,
+                    &format!("task-{}", i),
+                    None,
+                    false,
+                    false,
+                ));
+                model.apply_activity_event(task_start(i as u64 + 1));
             }
             _ => {
                 model.apply_activity_event(ActivityEvent::Evaluate(Evaluate::Start {
@@ -845,7 +849,7 @@ fn test_many_concurrent_activities() {
     }
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test mixed completed and active activities.
@@ -912,7 +916,7 @@ fn test_mixed_completed_and_active() {
     }));
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that standalone error messages (without parent) show in the TUI.
@@ -922,6 +926,7 @@ fn test_standalone_error_message() {
 
     // Add a standalone error message (no parent activity)
     let error_event = ActivityEvent::Message(Message {
+        id: 100,
         level: ActivityLevel::Error,
         text: "error: attribute 'nonExistentPackage' not found".to_string(),
         details: None,
@@ -931,7 +936,7 @@ fn test_standalone_error_message() {
     model.apply_activity_event(error_event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that multiple error messages show in the TUI.
@@ -941,6 +946,7 @@ fn test_multiple_error_messages() {
 
     // Add multiple standalone error messages
     let error1 = ActivityEvent::Message(Message {
+        id: 100,
         level: ActivityLevel::Error,
         text: "error: attribute 'foo' not found".to_string(),
         details: None,
@@ -950,6 +956,7 @@ fn test_multiple_error_messages() {
     model.apply_activity_event(error1);
 
     let error2 = ActivityEvent::Message(Message {
+        id: 101,
         level: ActivityLevel::Error,
         text: "error: while evaluating 'bar': infinite recursion".to_string(),
         details: None,
@@ -959,7 +966,7 @@ fn test_multiple_error_messages() {
     model.apply_activity_event(error2);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that error messages with parent activities show as child activities.
@@ -979,6 +986,7 @@ fn test_error_message_with_parent() {
 
     // Add an error message attached to the evaluation
     let error_event = ActivityEvent::Message(Message {
+        id: 100,
         level: ActivityLevel::Error,
         text: "error: undefined variable 'pkgs'".to_string(),
         details: None,
@@ -988,7 +996,7 @@ fn test_error_message_with_parent() {
     model.apply_activity_event(error_event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that warning messages with parent activities show as child activities.
@@ -1008,6 +1016,7 @@ fn test_warning_message_with_parent() {
 
     // Add a warning message attached to the evaluation
     let warn_event = ActivityEvent::Message(Message {
+        id: 100,
         level: ActivityLevel::Warn,
         text: "warning: deprecated option 'services.foo' used".to_string(),
         details: None,
@@ -1017,7 +1026,7 @@ fn test_warning_message_with_parent() {
     model.apply_activity_event(warn_event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test error messages alongside active builds.
@@ -1042,6 +1051,7 @@ fn test_error_with_active_builds() {
 
     // Add an error message
     let error_event = ActivityEvent::Message(Message {
+        id: 100,
         level: ActivityLevel::Error,
         text: "error: builder for '/nix/store/...-hello.drv' failed".to_string(),
         details: None,
@@ -1051,7 +1061,7 @@ fn test_error_with_active_builds() {
     model.apply_activity_event(error_event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that error messages with details show expansion indicator.
@@ -1071,6 +1081,7 @@ fn test_error_message_with_details() {
 
     // Add an error message with details (stack trace)
     let error_event = ActivityEvent::Message(Message {
+        id: 100,
         level: ActivityLevel::Error,
         text: "error: undefined variable 'pkgs'".to_string(),
         details: Some("error:\n       … while evaluating\n         at devenv.nix:10:5\n\n       error: undefined variable 'pkgs'".to_string()),
@@ -1080,7 +1091,7 @@ fn test_error_message_with_details() {
     model.apply_activity_event(error_event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that error messages without details don't show the [+] indicator.
@@ -1100,6 +1111,7 @@ fn test_error_message_without_details() {
 
     // Add an error message without details
     let error_event = ActivityEvent::Message(Message {
+        id: 100,
         level: ActivityLevel::Error,
         text: "error: simple error".to_string(),
         details: None,
@@ -1109,5 +1121,754 @@ fn test_error_message_without_details() {
     model.apply_activity_event(error_event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
+}
+
+/// Test that failed devenv operations show logs automatically (not just when selected).
+#[test]
+fn test_devenv_failed_shows_logs() {
+    let (mut model, ui_state) = new_test_model();
+
+    // Start a devenv operation
+    let start_event = ActivityEvent::Operation(Operation::Start {
+        id: 1,
+        name: "devenv shell".to_string(),
+        parent: None,
+        detail: None,
+        level: ActivityLevel::Info,
+        timestamp: Timestamp::now(),
+    });
+    model.apply_activity_event(start_event);
+
+    // Send log events - these should be visible because the operation fails
+    model.apply_activity_event(ActivityEvent::Operation(Operation::Log {
+        id: 1,
+        line: "Running enterShell hook...".to_string(),
+        is_error: false,
+        timestamp: Timestamp::now(),
+    }));
+    model.apply_activity_event(ActivityEvent::Operation(Operation::Log {
+        id: 1,
+        line: "error: command 'foo' not found".to_string(),
+        is_error: true,
+        timestamp: Timestamp::now(),
+    }));
+    model.apply_activity_event(ActivityEvent::Operation(Operation::Log {
+        id: 1,
+        line: "hint: did you mean 'bar'?".to_string(),
+        is_error: true,
+        timestamp: Timestamp::now(),
+    }));
+
+    // Complete with failure
+    let complete_event = ActivityEvent::Operation(Operation::Complete {
+        id: 1,
+        outcome: ActivityOutcome::Failed,
+        timestamp: Timestamp::now(),
+    });
+    model.apply_activity_event(complete_event);
+
+    let output = render_to_string(&model, &ui_state);
+    insta::assert_snapshot!(output);
+}
+
+/// Test that a task with additional_parents appears under multiple parents.
+#[test]
+fn test_task_additional_parents() {
+    let (mut model, ui_state) = new_test_model();
+
+    // Emit hierarchy: two parent tasks and a shared dependency
+    // The "build" task (id=3) has primary parent 1 (test:unit) and additional parent 2 (test:integration)
+    let hierarchy = task_hierarchy_multi(
+        vec![
+            TaskInfo {
+                id: 1,
+                name: "test:unit".to_string(),
+                show_output: false,
+                is_process: false,
+            },
+            TaskInfo {
+                id: 2,
+                name: "test:integration".to_string(),
+                show_output: false,
+                is_process: false,
+            },
+            TaskInfo {
+                id: 3,
+                name: "build".to_string(),
+                show_output: false,
+                is_process: false,
+            },
+        ],
+        vec![
+            // build appears under both test:unit (primary) and test:integration (additional)
+            (1, 3), // test:unit -> build
+            (2, 3), // test:integration -> build
+        ],
+    );
+    model.apply_activity_event(hierarchy);
+
+    // Start all tasks
+    model.apply_activity_event(task_start(1));
+    model.apply_activity_event(task_start(2));
+    model.apply_activity_event(task_start(3));
+
+    let output = render_to_string(&model, &ui_state);
+    // The "build" task should appear under both test:unit and test:integration
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn test_selectable_ids_dedup_for_multi_parent_tasks() {
+    let (mut model, mut ui_state) = new_test_model();
+
+    let hierarchy = task_hierarchy_multi(
+        vec![
+            TaskInfo {
+                id: 1,
+                name: "parent:a".to_string(),
+                show_output: false,
+                is_process: false,
+            },
+            TaskInfo {
+                id: 2,
+                name: "parent:b".to_string(),
+                show_output: false,
+                is_process: false,
+            },
+            TaskInfo {
+                id: 3,
+                name: "shared".to_string(),
+                show_output: false,
+                is_process: false,
+            },
+        ],
+        vec![
+            (1, 3), // parent:a -> shared (primary)
+            (2, 3), // parent:b -> shared (additional)
+        ],
+    );
+    model.apply_activity_event(hierarchy);
+
+    // Add logs so tasks 1 and 3 are selectable.
+    model.apply_activity_event(ActivityEvent::Task(Task::Log {
+        id: 1,
+        line: "log-1".to_string(),
+        is_error: false,
+        timestamp: Timestamp::now(),
+    }));
+    model.apply_activity_event(ActivityEvent::Task(Task::Log {
+        id: 3,
+        line: "log-3".to_string(),
+        is_error: false,
+        timestamp: Timestamp::now(),
+    }));
+
+    let selectable = model.get_selectable_activity_ids();
+    assert_eq!(selectable, vec![1, 3]);
+
+    ui_state.select_next_activity(&selectable);
+    assert_eq!(ui_state.selected_activity, Some(1));
+
+    ui_state.select_next_activity(&selectable);
+    assert_eq!(ui_state.selected_activity, Some(3));
+
+    ui_state.select_next_activity(&selectable);
+    assert_eq!(ui_state.selected_activity, Some(3));
+
+    ui_state.select_previous_activity(&selectable);
+    assert_eq!(ui_state.selected_activity, Some(1));
+}
+
+/// Test that tasks in Queued state (hierarchy emitted but not started) render correctly.
+#[test]
+fn test_task_queued_state() {
+    let (mut model, ui_state) = new_test_model();
+
+    // Emit hierarchy for three tasks but only start one
+    let hierarchy = task_hierarchy_multi(
+        vec![
+            TaskInfo {
+                id: 1,
+                name: "test:first".to_string(),
+                show_output: false,
+                is_process: false,
+            },
+            TaskInfo {
+                id: 2,
+                name: "test:second".to_string(),
+                show_output: false,
+                is_process: false,
+            },
+            TaskInfo {
+                id: 3,
+                name: "test:third".to_string(),
+                show_output: false,
+                is_process: false,
+            },
+        ],
+        vec![],
+    );
+    model.apply_activity_event(hierarchy);
+
+    // Only start the first task - others remain in Queued state
+    model.apply_activity_event(task_start(1));
+
+    let output = render_to_string(&model, &ui_state);
+    // First task should show as running, others should show as pending/queued
+    insta::assert_snapshot!(output);
+}
+
+/// Test that a task that completes without ever starting (skipped) shows correctly.
+#[test]
+fn test_task_skipped_never_started() {
+    let (mut model, ui_state) = new_test_model();
+
+    // Emit hierarchy
+    model.apply_activity_event(task_hierarchy_single(
+        1,
+        "test:skipped-task",
+        None,
+        false,
+        false,
+    ));
+
+    // Complete with Skipped without ever calling task_start
+    // This simulates a task that was skipped due to caching or no command
+    model.apply_activity_event(ActivityEvent::Task(Task::Complete {
+        id: 1,
+        outcome: ActivityOutcome::Skipped,
+        timestamp: Timestamp::now(),
+    }));
+
+    let output = render_to_string(&model, &ui_state);
+    // Task should show as skipped with zero duration
+    insta::assert_snapshot!(output);
+}
+
+/// Test that a task cancelled due to dependency failure shows correctly.
+#[test]
+fn test_task_dependency_failed_never_started() {
+    let (mut model, ui_state) = new_test_model();
+
+    // Emit hierarchy with dependency relationship
+    let hierarchy = task_hierarchy_multi(
+        vec![
+            TaskInfo {
+                id: 1,
+                name: "test:dep".to_string(),
+                show_output: false,
+                is_process: false,
+            },
+            TaskInfo {
+                id: 2,
+                name: "test:dependent".to_string(),
+                show_output: false,
+                is_process: false,
+            },
+        ],
+        vec![(2, 1)], // test:dependent depends on test:dep
+    );
+    model.apply_activity_event(hierarchy);
+
+    // Start and fail the dependency
+    model.apply_activity_event(task_start(1));
+    model.apply_activity_event(ActivityEvent::Task(Task::Complete {
+        id: 1,
+        outcome: ActivityOutcome::Failed,
+        timestamp: Timestamp::now(),
+    }));
+
+    // The dependent task never starts, just gets DependencyFailed
+    model.apply_activity_event(ActivityEvent::Task(Task::Complete {
+        id: 2,
+        outcome: ActivityOutcome::DependencyFailed,
+        timestamp: Timestamp::now(),
+    }));
+
+    let output = render_to_string(&model, &ui_state);
+    insta::assert_snapshot!(output);
+}
+
+/// Test task hierarchy with 3+ levels of nesting.
+#[test]
+fn test_task_deep_nesting() {
+    let (mut model, ui_state) = new_test_model();
+
+    // Create a deep hierarchy: root -> level1 -> level2 -> level3
+    let hierarchy = task_hierarchy_multi(
+        vec![
+            TaskInfo {
+                id: 1,
+                name: "test:root".to_string(),
+                show_output: false,
+                is_process: false,
+            },
+            TaskInfo {
+                id: 2,
+                name: "test:level1".to_string(),
+                show_output: false,
+                is_process: false,
+            },
+            TaskInfo {
+                id: 3,
+                name: "test:level2".to_string(),
+                show_output: false,
+                is_process: false,
+            },
+            TaskInfo {
+                id: 4,
+                name: "test:level3".to_string(),
+                show_output: false,
+                is_process: false,
+            },
+        ],
+        vec![
+            (1, 2), // root -> level1
+            (2, 3), // level1 -> level2
+            (3, 4), // level2 -> level3
+        ],
+    );
+    model.apply_activity_event(hierarchy);
+
+    // Start all tasks
+    model.apply_activity_event(task_start(1));
+    model.apply_activity_event(task_start(2));
+    model.apply_activity_event(task_start(3));
+    model.apply_activity_event(task_start(4));
+
+    let output = render_to_string(&model, &ui_state);
+    // Should show proper indentation for each nesting level
+    insta::assert_snapshot!(output);
+}
+
+/// Test multiple tasks under the same parent render in consistent order.
+#[test]
+fn test_task_multiple_under_same_parent() {
+    let (mut model, ui_state) = new_test_model();
+
+    // Create a parent with multiple children
+    let hierarchy = task_hierarchy_multi(
+        vec![
+            TaskInfo {
+                id: 1,
+                name: "test:parent".to_string(),
+                show_output: false,
+                is_process: false,
+            },
+            TaskInfo {
+                id: 2,
+                name: "test:child-a".to_string(),
+                show_output: false,
+                is_process: false,
+            },
+            TaskInfo {
+                id: 3,
+                name: "test:child-b".to_string(),
+                show_output: false,
+                is_process: false,
+            },
+            TaskInfo {
+                id: 4,
+                name: "test:child-c".to_string(),
+                show_output: false,
+                is_process: false,
+            },
+        ],
+        vec![
+            (1, 2), // parent -> child-a
+            (1, 3), // parent -> child-b
+            (1, 4), // parent -> child-c
+        ],
+    );
+    model.apply_activity_event(hierarchy);
+
+    // Start parent and all children
+    model.apply_activity_event(task_start(1));
+    model.apply_activity_event(task_start(2));
+    model.apply_activity_event(task_start(3));
+    model.apply_activity_event(task_start(4));
+
+    let output = render_to_string(&model, &ui_state);
+    // Children should appear under parent in consistent order
+    insta::assert_snapshot!(output);
+}
+
+/// Test diamond dependency pattern where a shared dependency appears under multiple parents.
+#[test]
+fn test_task_diamond_dependency() {
+    let (mut model, ui_state) = new_test_model();
+
+    // Diamond pattern:
+    //     root
+    //    /    \
+    //   A      B
+    //    \    /
+    //     shared
+    let hierarchy = task_hierarchy_multi(
+        vec![
+            TaskInfo {
+                id: 1,
+                name: "test:root".to_string(),
+                show_output: false,
+                is_process: false,
+            },
+            TaskInfo {
+                id: 2,
+                name: "test:branch-a".to_string(),
+                show_output: false,
+                is_process: false,
+            },
+            TaskInfo {
+                id: 3,
+                name: "test:branch-b".to_string(),
+                show_output: false,
+                is_process: false,
+            },
+            TaskInfo {
+                id: 4,
+                name: "test:shared".to_string(),
+                show_output: false,
+                is_process: false,
+            },
+        ],
+        vec![
+            (1, 2), // root -> branch-a
+            (1, 3), // root -> branch-b
+            (2, 4), // branch-a -> shared (primary parent)
+            (3, 4), // branch-b -> shared (additional parent)
+        ],
+    );
+    model.apply_activity_event(hierarchy);
+
+    // Start all tasks
+    model.apply_activity_event(task_start(1));
+    model.apply_activity_event(task_start(2));
+    model.apply_activity_event(task_start(3));
+    model.apply_activity_event(task_start(4));
+
+    let output = render_to_string(&model, &ui_state);
+    // Shared task should appear under both branch-a and branch-b
+    insta::assert_snapshot!(output);
+}
+
+/// Test that when activities overflow a small terminal, the bottom content
+/// (running processes with logs) remains visible and the summary line is last.
+#[test]
+fn test_overflow_clips_top_keeps_bottom() {
+    let model = ActivityModel::new();
+    let mut ui_state = UiState::new();
+    // Use a very small terminal height to force overflow
+    ui_state.set_terminal_size(TEST_WIDTH, 10);
+
+    let mut model = model;
+
+    // Create several completed activities (these should get clipped at the top)
+    for i in 1..=5 {
+        model.apply_activity_event(ActivityEvent::Build(Build::Start {
+            id: i,
+            name: format!("completed-build-{}", i),
+            parent: None,
+            derivation_path: None,
+            timestamp: Timestamp::now(),
+        }));
+        model.apply_activity_event(ActivityEvent::Build(Build::Complete {
+            id: i,
+            outcome: ActivityOutcome::Success,
+            timestamp: Timestamp::now(),
+        }));
+    }
+
+    // Create a running process with logs (this should remain visible at the bottom)
+    model.apply_activity_event(ActivityEvent::Process(Process::Start {
+        id: 10,
+        name: "web-server".to_string(),
+        parent: None,
+        command: None,
+        ports: vec![],
+        ready_probe: None,
+        level: ActivityLevel::Info,
+        timestamp: Timestamp::now(),
+    }));
+    model.apply_activity_event(ActivityEvent::Process(Process::Log {
+        id: 10,
+        line: "Listening on port 3000".to_string(),
+        is_error: false,
+        timestamp: Timestamp::now(),
+    }));
+
+    let output = render_to_string(&model, &ui_state);
+
+    // The last non-empty line should be the summary/status line (contains nav hints)
+    let lines: Vec<&str> = output.lines().collect();
+    let last_non_empty = lines.iter().rev().find(|l| !l.trim().is_empty()).unwrap();
+    assert!(
+        last_non_empty.contains("nav"),
+        "Last line should be the summary status line, got: {:?}",
+        last_non_empty
+    );
+
+    // The process log should be visible
+    assert!(
+        output.contains("Listening on port 3000"),
+        "Process log line should be visible in overflow output.\nFull output:\n{}",
+        output
+    );
+
+    // The very last line should be the summary (no trailing empty lines)
+    let last_line = lines.last().unwrap();
+    assert!(
+        !last_line.trim().is_empty(),
+        "Last line should be summary, not empty.\nFull output (debug):\n{:?}",
+        output
+    );
+}
+
+/// Test cachix push operation starting shows in the TUI.
+#[test]
+fn test_cachix_push_started() {
+    let (mut model, ui_state) = new_test_model();
+
+    model.apply_activity_event(ActivityEvent::Operation(Operation::Start {
+        id: 1,
+        name: "Pushing to my-cache".to_string(),
+        parent: None,
+        detail: None,
+        level: ActivityLevel::Info,
+        timestamp: Timestamp::now(),
+    }));
+
+    let output = render_to_string(&model, &ui_state);
+    insta::assert_snapshot!(output);
+}
+
+/// Test cachix push operation with progress updates showing path detail.
+#[test]
+fn test_cachix_push_progress() {
+    let (mut model, ui_state) = new_test_model();
+
+    model.apply_activity_event(ActivityEvent::Operation(Operation::Start {
+        id: 1,
+        name: "Pushing to my-cache".to_string(),
+        parent: None,
+        detail: None,
+        level: ActivityLevel::Info,
+        timestamp: Timestamp::now(),
+    }));
+
+    model.apply_activity_event(ActivityEvent::Operation(Operation::Progress {
+        id: 1,
+        done: 3,
+        expected: 10,
+        detail: Some("hello-2.12".to_string()),
+        timestamp: Timestamp::now(),
+    }));
+
+    let output = render_to_string(&model, &ui_state);
+    insta::assert_snapshot!(output);
+}
+
+/// Test cachix push operation completing successfully.
+#[test]
+fn test_cachix_push_success() {
+    let (mut model, ui_state) = new_test_model();
+
+    model.apply_activity_event(ActivityEvent::Operation(Operation::Start {
+        id: 1,
+        name: "Pushing to my-cache".to_string(),
+        parent: None,
+        detail: None,
+        level: ActivityLevel::Info,
+        timestamp: Timestamp::now(),
+    }));
+
+    model.apply_activity_event(ActivityEvent::Operation(Operation::Progress {
+        id: 1,
+        done: 10,
+        expected: 10,
+        detail: None,
+        timestamp: Timestamp::now(),
+    }));
+
+    model.apply_activity_event(ActivityEvent::Operation(Operation::Complete {
+        id: 1,
+        outcome: ActivityOutcome::Success,
+        timestamp: Timestamp::now(),
+    }));
+
+    let output = render_to_string(&model, &ui_state);
+    insta::assert_snapshot!(output);
+}
+
+/// Test cachix push operation with failed paths shows error logs.
+#[test]
+fn test_cachix_push_with_failures() {
+    let (mut model, ui_state) = new_test_model();
+
+    model.apply_activity_event(ActivityEvent::Operation(Operation::Start {
+        id: 1,
+        name: "Pushing to my-cache".to_string(),
+        parent: None,
+        detail: None,
+        level: ActivityLevel::Info,
+        timestamp: Timestamp::now(),
+    }));
+
+    model.apply_activity_event(ActivityEvent::Operation(Operation::Progress {
+        id: 1,
+        done: 5,
+        expected: 10,
+        detail: Some("openssl-3.0.0".to_string()),
+        timestamp: Timestamp::now(),
+    }));
+
+    model.apply_activity_event(ActivityEvent::Operation(Operation::Log {
+        id: 1,
+        line: "openssl-3.0.0: HTTP 403: Access Denied".to_string(),
+        is_error: true,
+        timestamp: Timestamp::now(),
+    }));
+
+    model.apply_activity_event(ActivityEvent::Operation(Operation::Log {
+        id: 1,
+        line: "glibc-2.37: HTTP 500: Internal Server Error".to_string(),
+        is_error: true,
+        timestamp: Timestamp::now(),
+    }));
+
+    model.apply_activity_event(ActivityEvent::Operation(Operation::Progress {
+        id: 1,
+        done: 8,
+        expected: 10,
+        detail: None,
+        timestamp: Timestamp::now(),
+    }));
+
+    model.apply_activity_event(ActivityEvent::Operation(Operation::Complete {
+        id: 1,
+        outcome: ActivityOutcome::Failed,
+        timestamp: Timestamp::now(),
+    }));
+
+    let output = render_to_string(&model, &ui_state);
+    insta::assert_snapshot!(output);
+}
+
+/// Test that non-process activities (like "Evaluating Nix") appear first,
+/// followed by processes in alphabetical order.
+#[test]
+fn test_processes_alphabetical_order() {
+    let (mut model, ui_state) = new_test_model();
+
+    // Create the "Running processes" parent operation (matches real usage)
+    model.apply_activity_event(ActivityEvent::Operation(Operation::Start {
+        id: 100,
+        name: "Running processes".to_string(),
+        parent: None,
+        detail: None,
+        level: ActivityLevel::Info,
+        timestamp: Timestamp::now(),
+    }));
+
+    // Start processes in non-alphabetical order (z, a, m)
+    model.apply_activity_event(ActivityEvent::Process(Process::Start {
+        id: 1,
+        name: "zookeeper".to_string(),
+        parent: Some(100),
+        command: None,
+        ports: vec![],
+        ready_probe: None,
+        level: ActivityLevel::Info,
+        timestamp: Timestamp::now(),
+    }));
+    model.apply_activity_event(ActivityEvent::Process(Process::Start {
+        id: 2,
+        name: "api-server".to_string(),
+        parent: Some(100),
+        command: None,
+        ports: vec![],
+        ready_probe: None,
+        level: ActivityLevel::Info,
+        timestamp: Timestamp::now(),
+    }));
+
+    // Add "Evaluating Nix" as a child of "Running processes" (happens during process manager eval)
+    model.apply_activity_event(ActivityEvent::Evaluate(Evaluate::Start {
+        id: 3,
+        name: "Evaluating Nix".to_string(),
+        parent: Some(100),
+        level: ActivityLevel::Info,
+        timestamp: Timestamp::now(),
+    }));
+
+    model.apply_activity_event(ActivityEvent::Process(Process::Start {
+        id: 4,
+        name: "mysql".to_string(),
+        parent: Some(100),
+        command: None,
+        ports: vec![],
+        ready_probe: None,
+        level: ActivityLevel::Info,
+        timestamp: Timestamp::now(),
+    }));
+
+    let output = render_to_string(&model, &ui_state);
+
+    // Verify "Evaluating Nix" comes first, then processes alphabetically
+    let eval_pos = output
+        .find("Evaluating Nix")
+        .expect("Evaluating Nix should be in output");
+    let api_pos = output
+        .find("api-server")
+        .expect("api-server should be in output");
+    let mysql_pos = output.find("mysql").expect("mysql should be in output");
+    let zoo_pos = output
+        .find("zookeeper")
+        .expect("zookeeper should be in output");
+    assert!(
+        eval_pos < api_pos && api_pos < mysql_pos && mysql_pos < zoo_pos,
+        "Evaluating Nix should come first, then processes in alphabetical order.\nFull output:\n{}",
+        output
+    );
+
+    insta::assert_snapshot!(output);
+}
+
+/// Test cachix push alongside other activities (build + push concurrent).
+#[test]
+fn test_cachix_push_alongside_build() {
+    let (mut model, ui_state) = new_test_model();
+
+    model.apply_activity_event(ActivityEvent::Build(Build::Start {
+        id: 1,
+        name: "hello-2.12".to_string(),
+        parent: None,
+        derivation_path: None,
+        timestamp: Timestamp::now(),
+    }));
+    model.apply_activity_event(ActivityEvent::Build(Build::Phase {
+        id: 1,
+        phase: "buildPhase".to_string(),
+        timestamp: Timestamp::now(),
+    }));
+
+    model.apply_activity_event(ActivityEvent::Operation(Operation::Start {
+        id: 2,
+        name: "Pushing to my-cache".to_string(),
+        parent: None,
+        detail: None,
+        level: ActivityLevel::Info,
+        timestamp: Timestamp::now(),
+    }));
+
+    model.apply_activity_event(ActivityEvent::Operation(Operation::Progress {
+        id: 2,
+        done: 3,
+        expected: 7,
+        detail: Some("python-3.11.5".to_string()),
+        timestamp: Timestamp::now(),
+    }));
+
+    let output = render_to_string(&model, &ui_state);
+    insta::assert_snapshot!(output);
 }

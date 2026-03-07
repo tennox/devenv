@@ -1,7 +1,8 @@
+#![cfg(feature = "test-nix-store")]
 //! Integration tests for flake locking functionality
 
-use devenv_core::{CliOptionsConfig, Config, DevenvPaths, GlobalOptions, NixArgs, NixBackend};
-use devenv_nix_backend::{ProjectRoot, load_lock_file, nix_backend::NixRustBackend};
+use devenv_core::{CliOptionsConfig, Config, DevenvPaths, NixArgs, NixBackend, NixOptions};
+use devenv_nix_backend::load_lock_file;
 use devenv_nix_backend_macros::nix_test;
 use nix_bindings_fetchers::FetchersSettings;
 use std::fs;
@@ -11,8 +12,7 @@ use tokio_shutdown::Shutdown;
 
 // Import shared test utilities
 mod common;
-use common::create_test_cachix_manager;
-use common::get_current_system;
+use common::{create_backend, create_test_cachix_manager, get_current_system};
 
 /// Helper struct to keep NixArgs and its owned values alive together
 struct TestNixArgs {
@@ -23,10 +23,15 @@ struct TestNixArgs {
 
 impl TestNixArgs {
     fn new(paths: &DevenvPaths) -> Self {
+        let dotfile_name = paths
+            .dotfile
+            .file_name()
+            .expect("dotfile should have a file name")
+            .to_string_lossy();
         TestNixArgs {
-            tmpdir: PathBuf::from("/tmp"),
-            runtime: PathBuf::from("/tmp/runtime"),
-            dotfile_path: PathBuf::from(".devenv"),
+            tmpdir: paths.root.join("tmp"),
+            runtime: paths.root.join("runtime"),
+            dotfile_path: PathBuf::from(format!("./{}", dotfile_name)),
         }
     }
 
@@ -38,6 +43,7 @@ impl TestNixArgs {
     ) -> NixArgs<'a> {
         NixArgs {
             version: "1.0.0",
+            is_development_version: false,
             system: get_current_system(),
             devenv_root: &paths.root,
             skip_local_src: false,
@@ -54,8 +60,12 @@ impl TestNixArgs {
             username: None,
             git_root: None,
             secretspec: None,
-            devenv_config: config,
+            devenv_inputs: &config.inputs,
+            devenv_imports: &config.imports,
+            impure: false,
             nixpkgs_config,
+            lock_fingerprint: "",
+            devenv_state: None,
         }
     }
 }
@@ -90,15 +100,6 @@ inputs:
     yaml_path
 }
 
-/// Copy fixture lock file to destination directory
-/// This avoids unnecessary update() calls in tests that don't specifically test locking
-fn copy_fixture_lock(dest_dir: &Path) {
-    let fixture_lock = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
-        .join("tests/fixtures/devenv.lock");
-    let dest_lock = dest_dir.join("devenv.lock");
-    fs::copy(&fixture_lock, &dest_lock).expect("Failed to copy fixture lock file");
-}
-
 #[test]
 fn test_base_dir_loading() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -121,6 +122,9 @@ async fn test_create_flake_inputs() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     create_test_devenv_yaml(temp_dir.path());
 
+    // Create minimal devenv.nix - required when assemble() evaluates default.nix
+    fs::write(temp_dir.path().join("devenv.nix"), "{ }").expect("Failed to write devenv.nix");
+
     let config = Config::load_from(temp_dir.path()).expect("Failed to load config");
     let paths = DevenvPaths {
         root: temp_dir.path().to_path_buf(),
@@ -130,13 +134,18 @@ async fn test_create_flake_inputs() {
     };
 
     let cachix_manager = create_test_cachix_manager(temp_dir.path(), None);
-    let backend = NixRustBackend::new(
+    // Use offline mode to skip cachix config evaluation in assemble()
+    // This test focuses on lock file creation, not cachix configuration
+    let nix_cli = NixOptions {
+        offline: Some(true),
+        ..Default::default()
+    };
+    let backend = create_backend(
         paths.clone(),
         config.clone(),
-        GlobalOptions::default(),
+        nix_cli,
         cachix_manager,
         Shutdown::new(),
-        None,
     )
     .expect("Failed to create backend");
 
@@ -151,7 +160,7 @@ async fn test_create_flake_inputs() {
         .expect("Failed to assemble backend");
 
     // Call update() which enables flakes and creates flake inputs
-    let result = backend.update(&None).await;
+    let result = backend.update(&None, &config.inputs, &[]).await;
 
     assert!(
         result.is_ok(),
@@ -200,21 +209,19 @@ async fn test_selective_input_update() {
     // Load config from devenv.yaml
     let config = Config::load_from(temp_dir.path()).expect("Failed to load config");
 
-    // Create NixBackend
     let cachix_manager = create_test_cachix_manager(temp_dir.path(), None);
-    let backend = NixRustBackend::new(
+    let backend = create_backend(
         paths,
-        config,
-        GlobalOptions::default(),
+        config.clone(),
+        NixOptions::default(),
         cachix_manager,
         Shutdown::new(),
-        None,
     )
     .expect("Failed to create backend");
 
     // First, create an initial lock (update all inputs)
     backend
-        .update(&None)
+        .update(&None, &config.inputs, &[])
         .await
         .expect("Failed to create initial lock");
 
@@ -234,7 +241,7 @@ async fn test_selective_input_update() {
 
     // Now update only nixpkgs
     backend
-        .update(&Some("nixpkgs".to_string()))
+        .update(&Some("nixpkgs".to_string()), &config.inputs, &[])
         .await
         .expect("Failed to update nixpkgs");
 
@@ -274,21 +281,19 @@ async fn test_full_workflow() {
     // Load config from devenv.yaml
     let config = Config::load_from(temp_dir.path()).expect("Failed to load config");
 
-    // 3. Create NixBackend
     let cachix_manager = create_test_cachix_manager(temp_dir.path(), None);
-    let backend = NixRustBackend::new(
+    let backend = create_backend(
         paths,
-        config,
-        GlobalOptions::default(),
+        config.clone(),
+        NixOptions::default(),
         cachix_manager,
         Shutdown::new(),
-        None,
     )
     .expect("Failed to create backend");
 
     // 4. Update all inputs (creates lock file)
     backend
-        .update(&None)
+        .update(&None, &config.inputs, &[])
         .await
         .expect("Failed to update inputs");
 
@@ -378,22 +383,20 @@ async fn test_relative_path_with_parent_dir_in_path() {
     // Load config from devenv.yaml
     let config = Config::load_from(&inner_dir).expect("Failed to load config");
 
-    // Create NixBackend
     let cachix_manager = create_test_cachix_manager(temp_dir.path(), None);
-    let backend = NixRustBackend::new(
+    let backend = create_backend(
         paths,
-        config,
-        GlobalOptions::default(),
+        config.clone(),
+        NixOptions::default(),
         cachix_manager,
         Shutdown::new(),
-        None,
     )
     .expect("Failed to create backend");
 
     // Update should resolve the relative path correctly
     // Before the fix, this would fail because `..` in the path portion was resolved
     // relative to the wrong base directory
-    let result = backend.update(&None).await;
+    let result = backend.update(&None, &config.inputs, &[]).await;
 
     assert!(
         result.is_ok(),

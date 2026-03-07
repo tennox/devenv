@@ -19,12 +19,18 @@ boolean
 
 
 *Default:*
-` false `
+
+```nix
+false
+```
 
 
 
 *Example:*
-` true `
+
+```nix
+true
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/services/clickhouse\.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/clickhouse.nix)
@@ -45,7 +51,10 @@ package
 
 
 *Default:*
-` pkgs.clickhouse `
+
+```nix
+pkgs.clickhouse
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/services/clickhouse\.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/clickhouse.nix)
@@ -70,17 +79,20 @@ strings concatenated with “\\n”
 
 
 
-Which http port to run clickhouse on
+Which http port to run clickhouse on\.
 
 
 
 *Type:*
-signed integer
+16 bit unsigned integer; between 0 and 65535 (both inclusive)
 
 
 
 *Default:*
-` 8123 `
+
+```nix
+8123
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/services/clickhouse\.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/clickhouse.nix)
@@ -91,17 +103,20 @@ signed integer
 
 
 
-Which port to run clickhouse on
+Which port to run clickhouse on\.
 
 
 
 *Type:*
-signed integer
+16 bit unsigned integer; between 0 and 65535 (both inclusive)
 
 
 
 *Default:*
-` 9000 `
+
+```nix
+9000
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/services/clickhouse\.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/clickhouse.nix)

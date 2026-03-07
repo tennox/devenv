@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use devenv_processes::get_process_runtime_dir;
 use devenv_tasks::{
     Config, RunMode, SudoContext, TaskConfig, Tasks, TasksUi, VerbosityLevel, is_tty,
 };
@@ -29,6 +30,18 @@ enum Command {
             help = "Path to a JSON file containing task definitions"
         )]
         task_file: Option<PathBuf>,
+
+        #[clap(long, help = "Directory for task cache database")]
+        cache_dir: PathBuf,
+
+        #[clap(long, help = "Runtime directory for process state")]
+        runtime_dir: PathBuf,
+
+        #[clap(
+            long,
+            help = "Exclude non-root process tasks from the scheduled subgraph (used when process-compose manages process ordering)"
+        )]
+        ignore_process_deps: bool,
     },
     Export {
         #[clap()]
@@ -145,6 +158,9 @@ async fn run_tasks(shutdown: Arc<Shutdown>) -> Result<()> {
             roots,
             mode,
             task_file,
+            cache_dir,
+            runtime_dir,
+            ignore_process_deps,
         } => {
             let mut tasks: Vec<TaskConfig> = fetch_tasks(&task_file)?;
 
@@ -158,11 +174,20 @@ async fn run_tasks(shutdown: Arc<Shutdown>) -> Result<()> {
                 }
             }
 
+            let runtime_dir = get_process_runtime_dir(&runtime_dir).map_err(|e| {
+                TaskError::Other(format!("Failed to create runtime directory: {}", e))
+            })?;
+
             let config = Config {
                 tasks,
                 roots,
                 run_mode: mode,
+                runtime_dir,
+                cache_dir,
                 sudo_context: sudo_context.clone(),
+                env: std::env::vars().collect(),
+                bash: String::new(),
+                ignore_process_deps,
             };
 
             let tasks = Tasks::builder(config, verbosity, Arc::clone(&shutdown))
@@ -171,13 +196,13 @@ async fn run_tasks(shutdown: Arc<Shutdown>) -> Result<()> {
 
             // Initialize activity channel for TasksUi
             let (activity_rx, activity_handle) = devenv_activity::init();
-            activity_handle.install();
+            let _activity_guard = activity_handle.install();
 
             let tasks = Arc::new(tasks);
             let tasks_clone = Arc::clone(&tasks);
 
             // Spawn task runner - UI will detect completion via JoinHandle
-            let run_handle = tokio::spawn(async move { tasks_clone.run().await });
+            let run_handle = tokio::spawn(async move { tasks_clone.run(false).await });
 
             // Run UI - processes events and waits for run_handle
             let ui = TasksUi::new(Arc::clone(&tasks), activity_rx, verbosity);
@@ -247,7 +272,9 @@ fn fetch_tasks(task_file: &Option<PathBuf>) -> Result<Vec<TaskConfig>> {
 ///
 /// Returns the raw JSON string and the source it came from, or an error if no source is available.
 fn read_raw_task_source(task_file: &Option<PathBuf>) -> Result<(String, TaskSource)> {
-    if let Ok(raw) = env::var("DEVENV_TASKS") {
+    if let Ok(raw) = env::var("DEVENV_TASKS")
+        && !raw.is_empty()
+    {
         return Ok((raw, TaskSource::EnvVar));
     }
 

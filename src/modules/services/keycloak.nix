@@ -21,6 +21,14 @@ let
     listOf
     attrsOf
     ;
+
+  # Port allocation
+  baseHttpPort = cfg.settings.http-port;
+  baseHttpsPort = cfg.settings.https-port;
+  baseManagementPort = cfg.settings.http-management-port or 9000;
+  allocatedHttpPort = config.processes.keycloak.ports.http.value;
+  allocatedHttpsPort = config.processes.keycloak.ports.https.value;
+  allocatedManagementPort = config.processes.keycloak.ports.management.value;
 in
 {
   options.services.keycloak = {
@@ -324,8 +332,15 @@ in
         ))
         cfg.settings;
 
+      # Overlay allocated ports to avoid infinite recursion (#2490).
+      finalConfig = filteredConfig // {
+        http-port = allocatedHttpPort;
+        https-port = allocatedHttpsPort;
+        http-management-port = allocatedManagementPort;
+      };
+
       # Write the keycloak config file.
-      confFile = pkgs.writeText "keycloak.conf" (keycloakConfig filteredConfig);
+      confFile = pkgs.writeText "keycloak.conf" (keycloakConfig finalConfig);
 
       keycloakBuild = (
         cfg.package.override {
@@ -427,7 +442,7 @@ in
       );
 
       keycloak-health = pkgs.writeShellScriptBin "keycloak-health" ''
-        ${pkgs.curl}/bin/curl -k --head -fsS "https://localhost:${toString cfg.settings.http-management-port}${lib.removeSuffix "/" cfg.settings.http-management-relative-path}/health/ready"
+        ${pkgs.curl}/bin/curl -k --head -fsS "https://localhost:${toString allocatedManagementPort}${lib.removeSuffix "/" cfg.settings.http-management-relative-path}/health/ready"
       '';
     in
     mkIf cfg.enable {
@@ -449,7 +464,6 @@ in
           db = cfg.database.type;
 
           health-enabled = true;
-          http-management-port = 9000;
           http-management-relative-path = "/";
 
           log-console-level = "info";
@@ -475,7 +489,6 @@ in
 
       processes.keycloak =
         let
-
           keycloak-start = pkgs.writeShellScriptBin "keycloak-start" ''
             set -euo pipefail
             mkdir -p "$KC_HOME_DIR"
@@ -500,21 +513,18 @@ in
             echo "Start keycloak:"
             exec ${keycloakBuild}/bin/kc.sh start --optimized --import-realm
           '';
-
         in
         {
+          ports.http.allocate = baseHttpPort;
+          ports.https.allocate = baseHttpsPort;
+          ports.management.allocate = baseManagementPort;
           exec = "${keycloak-start}/bin/keycloak-start";
 
-          process-compose = {
-            description = "The keycloak identity and access management server.";
-            readiness_probe = {
-              exec.command = "${keycloak-health}/bin/keycloak-health";
-              initial_delay_seconds = 20;
-              period_seconds = 10;
-              timeout_seconds = 4;
-              success_threshold = 1;
-              failure_threshold = 20;
-            };
+          ready = {
+            exec = "${keycloak-health}/bin/keycloak-health";
+            initial_delay = 20;
+            probe_timeout = 4;
+            failure_threshold = 20;
           };
         };
 
@@ -536,18 +546,9 @@ in
 
       # Process to start for exporting the above.
       processes.keycloak-realm-export-all = mkIf (realmsExport != [ ]) {
+        start.enable = false;
         exec = "${keycloak-realm-export-all}/bin/keycloak-realm-export-all";
-        process-compose = {
-          description = ''
-            Save the configured realms from keycloak, to back them up. You can run it manually.
-          '';
-          disabled = true;
-          depends_on = {
-            keycloak = {
-              condition = "process_completed";
-            };
-          };
-        };
+        after = [ "devenv:processes:keycloak@completed" ];
       };
     };
 }

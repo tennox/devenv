@@ -4,12 +4,12 @@
 //! when assembling the devenv environment. The struct is serialized to Nix syntax
 //! using the `ser_nix` crate and inserted into the flake template.
 
-use crate::config::{Config, NixpkgsConfig};
+use crate::config::{Input, NixpkgsConfig};
 use miette::{Result, miette};
 use ser_nix::NixLiteral;
 use serde::Serialize;
 use serde::ser::{SerializeMap, Serializer};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// A parsed CLI option with path and typed value
@@ -19,10 +19,13 @@ pub struct CliOption {
     pub path: Vec<String>,
     /// The typed value
     pub value: CliValue,
+    /// Whether to force-replace (true) or append (false) for list types
+    pub force: bool,
 }
 
-/// A CLI option value - always serialized as lib.mkForce <value>
-/// All values use NixLiteral to ensure proper Nix syntax with lib.mkForce wrapper
+/// A CLI option value with typed Nix serialization.
+/// Scalar types always use `lib.mkForce`. List types (`PkgList`) append by
+/// default and only use `lib.mkForce` when the `force` flag is set.
 #[derive(Debug, Clone)]
 pub enum CliValue {
     /// lib.mkForce "string"
@@ -37,32 +40,61 @@ pub enum CliValue {
     Path(String),
     /// lib.mkForce pkgs.hello
     Pkg(String),
-    /// lib.mkForce [ pkgs.hello pkgs.cowsay ]
+    /// Appends by default: config.packages ++ [ pkgs.hello pkgs.cowsay ]
+    /// With force (pkgs!): lib.mkForce [ pkgs.hello pkgs.cowsay ]
     PkgList(Vec<String>),
 }
 
-impl Serialize for CliValue {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let literal = match self {
+/// Escape a string for use inside a Nix double-quoted string.
+/// Handles backslash, double-quote, dollar-brace interpolation, newline, and tab.
+fn escape_nix_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '$' if chars.peek() == Some(&'{') => out.push_str("\\$"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+impl CliValue {
+    /// Render this value as a Nix literal string.
+    ///
+    /// For list types (`PkgList`), `force` controls whether to replace
+    /// (`lib.mkForce`) or append (`config.packages ++ ...`).
+    /// Scalar types always use `lib.mkForce` regardless of the flag.
+    fn to_nix_literal(&self, force: bool) -> String {
+        match self {
             CliValue::String(s) => {
-                // Escape quotes in the string
-                let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+                let escaped = escape_nix_string(s);
                 format!("lib.mkForce \"{}\"", escaped)
             }
             CliValue::Int(n) => format!("lib.mkForce {}", n),
             CliValue::Float(f) => format!("lib.mkForce {}", f),
             CliValue::Bool(b) => format!("lib.mkForce {}", b),
-            CliValue::Path(p) => format!("lib.mkForce ./{}", p),
+            CliValue::Path(p) => {
+                if p.starts_with('/') || p.starts_with("./") || p.starts_with("../") {
+                    format!("lib.mkForce {}", p)
+                } else {
+                    format!("lib.mkForce ./{}", p)
+                }
+            }
             CliValue::Pkg(name) => format!("lib.mkForce pkgs.{}", name),
             CliValue::PkgList(names) => {
                 let pkgs: Vec<String> = names.iter().map(|n| format!("pkgs.{}", n)).collect();
-                format!("lib.mkForce [ {} ]", pkgs.join(" "))
+                if force {
+                    format!("lib.mkForce [ {} ]", pkgs.join(" "))
+                } else {
+                    format!("config.packages ++ [ {} ]", pkgs.join(" "))
+                }
             }
-        };
-        NixLiteral::from(literal).serialize(serializer)
+        }
     }
 }
 
@@ -78,24 +110,29 @@ pub struct CliOptionsConfig(pub Vec<CliOption>);
 /// Recursive structure to build nested attrsets
 #[derive(Debug, Clone)]
 enum NestedValue {
-    Leaf(CliValue),
-    Map(HashMap<String, NestedValue>),
+    Leaf(CliValue, bool),
+    Map(BTreeMap<String, NestedValue>),
 }
 
 impl CliOptionsConfig {
     /// Build nested structure from flat list of options
     fn build_nested(&self) -> NestedValue {
-        let mut root: HashMap<String, NestedValue> = HashMap::new();
+        let mut root: BTreeMap<String, NestedValue> = BTreeMap::new();
 
         for opt in &self.0 {
-            Self::insert_at_path(&mut root, &opt.path, &opt.value);
+            Self::insert_at_path(&mut root, &opt.path, &opt.value, opt.force);
         }
 
         NestedValue::Map(root)
     }
 
     /// Insert a value at a nested path
-    fn insert_at_path(map: &mut HashMap<String, NestedValue>, path: &[String], value: &CliValue) {
+    fn insert_at_path(
+        map: &mut BTreeMap<String, NestedValue>,
+        path: &[String],
+        value: &CliValue,
+        force: bool,
+    ) {
         if path.is_empty() {
             return;
         }
@@ -104,15 +141,15 @@ impl CliOptionsConfig {
 
         if path.len() == 1 {
             // Leaf node - insert the value
-            map.insert(key.clone(), NestedValue::Leaf(value.clone()));
+            map.insert(key.clone(), NestedValue::Leaf(value.clone(), force));
         } else {
             // Intermediate node - ensure it's a map and recurse
             let entry = map
                 .entry(key.clone())
-                .or_insert_with(|| NestedValue::Map(HashMap::new()));
+                .or_insert_with(|| NestedValue::Map(BTreeMap::new()));
 
             if let NestedValue::Map(inner_map) = entry {
-                Self::insert_at_path(inner_map, &path[1..], value);
+                Self::insert_at_path(inner_map, &path[1..], value, force);
             }
         }
     }
@@ -124,14 +161,13 @@ impl Serialize for NestedValue {
         S: Serializer,
     {
         match self {
-            NestedValue::Leaf(value) => value.serialize(serializer),
+            NestedValue::Leaf(value, force) => {
+                NixLiteral::from(value.to_nix_literal(*force)).serialize(serializer)
+            }
             NestedValue::Map(map) => {
                 let mut s = serializer.serialize_map(Some(map.len()))?;
-                // Sort keys for deterministic output
-                let mut keys: Vec<_> = map.keys().collect();
-                keys.sort();
-                for key in keys {
-                    s.serialize_entry(key, &map[key])?;
+                for (key, value) in map {
+                    s.serialize_entry(key, value)?;
                 }
                 s.end()
             }
@@ -168,13 +204,14 @@ impl Serialize for CliOptionsConfig {
 /// Input format: ["key:type", "value", "key2:type2", "value2", ...]
 /// Supported types: string, int, float, bool, path, pkg, pkgs
 pub fn parse_cli_options(raw_options: &[String]) -> Result<Vec<CliOption>> {
-    let mut options = Vec::new();
+    let mut options = Vec::with_capacity(raw_options.len() / 2);
 
     // Process pairs of [key:type, value]
     for chunk in raw_options.chunks(2) {
         if chunk.len() != 2 {
             return Err(miette!(
-                "CLI options must be provided in pairs (key:type value)"
+                "CLI option '{}' is missing its value (options must be key:type value pairs)",
+                chunk[0]
             ));
         }
 
@@ -182,16 +219,19 @@ pub fn parse_cli_options(raw_options: &[String]) -> Result<Vec<CliOption>> {
         let value_str = &chunk[1];
 
         // Split key:type
-        let parts: Vec<&str> = key_with_type.splitn(2, ':').collect();
-        if parts.len() != 2 {
-            return Err(miette!(
+        let (key, raw_type) = key_with_type.split_once(':').ok_or_else(|| {
+            miette!(
                 "CLI option '{}' must include type (e.g., key:string, key:bool)",
                 key_with_type
-            ));
-        }
+            )
+        })?;
 
-        let key = parts[0];
-        let type_name = parts[1];
+        // Check for `!` suffix which forces replacement for list types
+        let (type_name, explicit_force) = if let Some(stripped) = raw_type.strip_suffix('!') {
+            (stripped, true)
+        } else {
+            (raw_type, false)
+        };
 
         // Split the key path by dots
         let path: Vec<String> = key.split('.').map(|s| s.to_string()).collect();
@@ -209,6 +249,13 @@ pub fn parse_cli_options(raw_options: &[String]) -> Result<Vec<CliOption>> {
                 let f: f64 = value_str.parse().map_err(|_| {
                     miette!("Invalid float value '{}' for option '{}'", value_str, key)
                 })?;
+                if !f.is_finite() {
+                    return Err(miette!(
+                        "Float value '{}' for option '{}' must be finite (not NaN or infinity)",
+                        value_str,
+                        key
+                    ));
+                }
                 CliValue::Float(f)
             }
             "bool" => {
@@ -243,7 +290,11 @@ pub fn parse_cli_options(raw_options: &[String]) -> Result<Vec<CliOption>> {
             }
         };
 
-        options.push(CliOption { path, value });
+        // List types (pkgs) append by default; use `!` suffix to force replace.
+        // Scalar types always force.
+        let force = explicit_force || !matches!(value, CliValue::PkgList(_));
+
+        options.push(CliOption { path, value, force });
     }
 
     Ok(options)
@@ -259,7 +310,7 @@ pub struct SecretspecData {
     pub provider: String,
 
     /// Map of secret names to their values
-    pub secrets: HashMap<String, String>,
+    pub secrets: BTreeMap<String, String>,
 }
 
 /// Arguments passed to Nix when assembling the environment
@@ -267,6 +318,9 @@ pub struct SecretspecData {
 pub struct NixArgs<'a> {
     /// The devenv CLI version (e.g., "1.10.1")
     pub version: &'a str,
+
+    /// Whether this is a development build (not from a release tag)
+    pub is_development_version: bool,
 
     /// The system string (e.g., "x86_64-linux", "aarch64-darwin")
     pub system: &'a str,
@@ -324,19 +378,39 @@ pub struct NixArgs<'a> {
     /// SecretSpec resolved data (profile, provider, secrets)
     pub secretspec: Option<&'a SecretspecData>,
 
-    /// devenv.yaml configuration (inputs, imports, nixpkgs settings, etc.)
-    /// Serialized by ser_nix into a Nix attrset
-    pub devenv_config: &'a Config,
+    /// Input specifications from devenv.yaml, used by bootstrapLib.nix for overlay extraction.
+    /// Named `devenv_inputs` (not `inputs`) to avoid collision with the resolved flake inputs
+    /// that bootstrapLib.nix receives via its `{ inputs }` parameter.
+    pub devenv_inputs: &'a BTreeMap<String, Input>,
+
+    /// Import paths from devenv.yaml, used by bootstrapLib.nix for module resolution.
+    pub devenv_imports: &'a [String],
+
+    /// Whether impure mode is enabled (resolved from CLI + Config).
+    /// Included in NixArgs so it participates in the eval-cache key.
+    pub impure: bool,
 
     /// Pre-merged nixpkgs configuration for the target system.
     /// This is computed by Config::nixpkgs_config() in Rust to avoid
     /// duplicating the merging logic in Nix (bootstrapLib.nix).
     pub nixpkgs_config: NixpkgsConfig,
+
+    /// Content fingerprint of the lock file computed from all inputs' narHashes.
+    /// This is used for eval-cache invalidation when local inputs change.
+    /// Unlike the serialized lock file, this includes narHashes for path inputs
+    /// which are normally stripped when writing to disk.
+    pub lock_fingerprint: &'a str,
+
+    /// Optional override for the state directory (DEVENV_STATE).
+    /// When set, overrides the default of devenv_dotfile/state.
+    /// Used during testing to isolate runtime state in a temporary directory.
+    pub devenv_state: Option<&'a Path>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use std::path::PathBuf;
 
     /// Helper function to check key-value pairs in Nix serialized output.
@@ -365,8 +439,10 @@ mod tests {
         let test_config = Config::default();
         let nixpkgs_config = test_config.nixpkgs_config(system);
         let cli_options = CliOptionsConfig::default();
+        let lock_fingerprint = "abc123";
         let args = NixArgs {
             version,
+            is_development_version: false,
             system,
             devenv_root: &root,
             skip_local_src: false,
@@ -383,8 +459,12 @@ mod tests {
             username,                  // Some value
             git_root: Some(&git_root), // Some value with Path type
             secretspec: None,          // None value
-            devenv_config: &test_config,
+            devenv_inputs: &test_config.inputs,
+            devenv_imports: &test_config.imports,
+            impure: false,
             nixpkgs_config,
+            lock_fingerprint,
+            devenv_state: None,
         };
 
         let serialized = ser_nix::to_string(&args).expect("Failed to serialize NixArgs");
@@ -470,6 +550,7 @@ mod tests {
 
         let args = NixArgs {
             version,
+            is_development_version: false,
             system,
             devenv_root: &root,
             skip_local_src: false,
@@ -486,8 +567,12 @@ mod tests {
             username: None,
             git_root: None,
             secretspec: None,
-            devenv_config: &test_config,
+            devenv_inputs: &test_config.inputs,
+            devenv_imports: &test_config.imports,
+            impure: false,
             nixpkgs_config,
+            lock_fingerprint: "",
+            devenv_state: None,
         };
 
         let serialized = ser_nix::to_string(&args).expect("Failed to serialize NixArgs");
@@ -557,15 +642,44 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_value_path_serialization() {
+        let abs = CliValue::Path("/abs/path".to_string());
+        let rel = CliValue::Path("relative/path".to_string());
+        let already = CliValue::Path("./already".to_string());
+        let parent = CliValue::Path("../parent".to_string());
+
+        assert_eq!(
+            abs.to_nix_literal(true),
+            "lib.mkForce /abs/path",
+            "absolute paths should serialize without ./ prefix"
+        );
+        assert_eq!(
+            rel.to_nix_literal(true),
+            "lib.mkForce ./relative/path",
+            "relative paths should be prefixed with ./"
+        );
+        assert_eq!(
+            already.to_nix_literal(true),
+            "lib.mkForce ./already",
+            "already-relative paths should be preserved"
+        );
+        assert_eq!(
+            parent.to_nix_literal(true),
+            "lib.mkForce ../parent",
+            "parent-relative paths should be preserved"
+        );
+    }
+
+    #[test]
     fn test_parse_cli_options_pkg() {
         let raw = vec!["mypackage:pkg".to_string(), "hello".to_string()];
         let options = parse_cli_options(&raw).expect("Failed to parse options");
         assert_eq!(options.len(), 1);
         assert_eq!(options[0].path, vec!["mypackage"]);
-
-        // Verify it serializes as lib.mkForce pkgs.hello
-        let serialized = ser_nix::to_string(&options[0].value).expect("Failed to serialize");
-        assert_eq!(serialized, "lib.mkForce pkgs.hello");
+        assert_eq!(
+            options[0].value.to_nix_literal(true),
+            "lib.mkForce pkgs.hello"
+        );
     }
 
     #[test]
@@ -574,12 +688,38 @@ mod tests {
         let options = parse_cli_options(&raw).expect("Failed to parse options");
         assert_eq!(options.len(), 1);
 
-        // Verify it's a PkgList
+        // Verify it's a PkgList with force=false (append by default)
         assert!(matches!(options[0].value, CliValue::PkgList(_)));
+        assert!(!options[0].force);
 
-        // Verify serialization
-        let serialized = ser_nix::to_string(&options[0].value).expect("Failed to serialize");
-        assert_eq!(serialized, "lib.mkForce [ pkgs.hello pkgs.cowsay ]");
+        // Verify append-mode serialization via to_nix_literal
+        let literal = options[0].value.to_nix_literal(false);
+        assert_eq!(literal, "config.packages ++ [ pkgs.hello pkgs.cowsay ]");
+    }
+
+    #[test]
+    fn test_parse_cli_options_pkgs_force() {
+        let raw = vec!["packages:pkgs!".to_string(), "hello cowsay".to_string()];
+        let options = parse_cli_options(&raw).expect("Failed to parse options");
+        assert_eq!(options.len(), 1);
+
+        // Verify it's a PkgList with force=true
+        assert!(matches!(options[0].value, CliValue::PkgList(_)));
+        assert!(options[0].force);
+
+        // Verify force-mode serialization
+        let literal = options[0].value.to_nix_literal(true);
+        assert_eq!(literal, "lib.mkForce [ pkgs.hello pkgs.cowsay ]");
+    }
+
+    #[test]
+    fn test_parse_cli_options_force_suffix_on_scalar() {
+        // `!` suffix on scalar types is accepted but has no effect (scalars always force)
+        let raw = vec!["name:string!".to_string(), "test".to_string()];
+        let options = parse_cli_options(&raw).expect("Failed to parse options");
+        assert_eq!(options.len(), 1);
+        assert!(options[0].force);
+        assert!(matches!(options[0].value, CliValue::String(ref s) if s == "test"));
     }
 
     #[test]

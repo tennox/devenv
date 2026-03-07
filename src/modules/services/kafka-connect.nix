@@ -7,6 +7,45 @@ let
 
   stateDir = config.env.DEVENV_STATE + "/kafka/connect";
 
+  # Port allocation helpers
+  # Parse listener string like "http://localhost:8083" to extract port
+  parseListenerPort = listener:
+    let
+      # Remove protocol prefix (e.g., "http://")
+      withoutProtocol = lib.last (lib.splitString "://" listener);
+      # Get the port part after ":"
+      parts = lib.splitString ":" withoutProtocol;
+    in
+    lib.toInt (lib.last parts);
+
+  # Parse listener to get host and protocol
+  parseListenerHost = listener:
+    let
+      withoutProtocol = lib.last (lib.splitString "://" listener);
+      parts = lib.splitString ":" withoutProtocol;
+    in
+    lib.head parts;
+
+  parseListenerProtocol = listener:
+    lib.head (lib.splitString "://" listener);
+
+  # Rebuild listener with new port
+  rebuildListener = listener: newPort:
+    let
+      protocol = parseListenerProtocol listener;
+      host = parseListenerHost listener;
+    in
+    "${protocol}://${host}:${toString newPort}";
+
+  # Base port: from listeners if configured, otherwise default 8083
+  basePort =
+    if cfg.settings."listeners" != null && cfg.settings."listeners" != [ ]
+    then parseListenerPort (lib.head cfg.settings."listeners")
+    else 8083;
+
+  # Allocated port
+  allocatedPort = config.processes.kafka-connect.ports.main.value;
+
   mkPropertyString =
     let
       render = {
@@ -163,7 +202,18 @@ in
     let
       pkg = kafkaCfg.package;
 
-      configFile = generator "connect-standalone.properties" stringlySettings;
+      # Overlay allocated port at config file generation to avoid infinite
+      # recursion.  Writing back into cfg.settings would create a cycle
+      # because basePort reads from the same attrs.
+      portOverrides = {
+        "listeners" = mkPropertyString (
+          if cfg.settings."listeners" != null && cfg.settings."listeners" != [ ]
+          then map (l: rebuildListener l allocatedPort) cfg.settings."listeners"
+          else [ "http://localhost:${toString allocatedPort}" ]
+        );
+      };
+
+      configFile = generator "connect-standalone.properties" (stringlySettings // portOverrides);
 
       # TODO: make it work with .properties files?
       # connectorFiles = lib.lists.map (c: generator "connector-${c.name}.properties" (stringlyGeneric c)) cfg.initialConnectors;
@@ -177,22 +227,16 @@ in
     in
     (lib.mkIf cfg.enable (lib.mkIf kafkaCfg.enable {
       processes.kafka-connect = {
+        ports.main.allocate = basePort;
+        after = [ "devenv:processes:kafka" ];
         exec = "${startKafkaConnect}/bin/start-kafka-connect";
 
-        process-compose = {
-          readiness_probe = {
-            initial_delay_seconds = 2;
-            http_get = {
-              path = "/connectors";
-              port = 8083;
-            };
+        ready = {
+          http.get = {
+            path = "/connectors";
+            port = allocatedPort;
           };
-
-          depends_on = {
-            kafka = {
-              condition = "process_healthy";
-            };
-          };
+          initial_delay = 2;
         };
       };
 

@@ -20,6 +20,7 @@ result-*
 
 # Rust
 target/
+proptest-regressions/
 
 # JavaScript
 node_modules/
@@ -27,3 +28,4 @@ node_modules/
 **/.claude/settings.local.json
 .claude
 .mcp.json
+.devcontainer.json

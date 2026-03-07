@@ -5,8 +5,20 @@ with lib;
 let
   cfg = config.services.opensearch;
 
+  # Port allocation
+  baseHttpPort = cfg.settings."http.port";
+  baseTransportPort = cfg.settings."transport.port";
+  allocatedHttpPort = config.processes.opensearch.ports.http.value;
+  allocatedTransportPort = config.processes.opensearch.ports.transport.value;
+
+  # Override settings with allocated ports
+  settingsWithPorts = cfg.settings // {
+    "http.port" = allocatedHttpPort;
+    "transport.port" = allocatedTransportPort;
+  };
+
   settingsFormat = pkgs.formats.yaml { };
-  opensearchYml = settingsFormat.generate "opensearch.yml" cfg.settings;
+  opensearchYml = settingsFormat.generate "opensearch.yml" settingsWithPorts;
 
   loggingConfigFilename = "log4j2.properties";
   loggingConfigFile = pkgs.writeTextFile {
@@ -162,19 +174,15 @@ in
     env.OPENSEARCH_DATA = config.env.DEVENV_STATE + "/opensearch";
 
     processes.opensearch = {
+      ports.http.allocate = baseHttpPort;
+      ports.transport.allocate = baseTransportPort;
       exec = "${startScript}";
 
-      process-compose = {
-        readiness_probe = {
-          exec.command = "${pkgs.curl}/bin/curl -f -k http://${cfg.settings."network.host"}:${toString cfg.settings."http.port"}";
-          initial_delay_seconds = 2;
-          period_seconds = 10;
-          timeout_seconds = 2;
-          success_threshold = 1;
-          failure_threshold = 5;
-        };
-
-        availability.restart = "on_failure";
+      ready = {
+        exec = "${pkgs.curl}/bin/curl -f -k http://${cfg.settings."network.host"}:${toString allocatedHttpPort}";
+        initial_delay = 2;
+        probe_timeout = 2;
+        failure_threshold = 5;
       };
     };
   };

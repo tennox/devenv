@@ -1,12 +1,12 @@
 [package]
 name = "xtask"
-version = "0.1.0"
+version = "2.0.3"
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 clap.workspace = true
-clap_complete = "4.5.58"
-clap_mangen = "0.2.29"
+clap_complete.workspace = true
+clap_mangen.workspace = true
 devenv.workspace = true
 miette.workspace = true

@@ -3,7 +3,7 @@ use std::io::{LineWriter, Write};
 use std::sync::Arc;
 use std::time::Instant;
 
-use devenv_activity::{ActivityEvent, ActivityOutcome, Task as TaskEvent};
+use devenv_activity::{ActivityEvent, ActivityOutcome, Process as ProcessEvent, Task as TaskEvent};
 use tokio::sync::mpsc;
 
 use crate::types::{TaskCompleted, TaskStatus, TasksStatus};
@@ -54,6 +54,7 @@ struct TaskUiState {
 /// Display status for a task
 #[derive(Clone, PartialEq)]
 enum TaskDisplayStatus {
+    Queued,
     Running,
     Succeeded,
     Failed,
@@ -78,7 +79,10 @@ impl TasksUi {
         }
     }
 
-    /// Run the UI, processing activity events until task runner completes
+    /// Run the UI, processing activity events until task runner completes.
+    ///
+    /// If processes are still running after the task runner finishes, continues
+    /// forwarding process output until all processes exit or shutdown is signaled.
     pub async fn run(
         mut self,
         run_handle: tokio::task::JoinHandle<Outputs>,
@@ -89,36 +93,27 @@ impl TasksUi {
             self.console_write_stderr(&format!("{:17} {}\n", "Running tasks", names));
         }
 
-        // Process events until task runner completes
-        let mut run_handle = run_handle;
-        let outputs = loop {
-            tokio::select! {
-                event = self.activity_rx.recv() => {
-                    let Some(event) = event else {
-                        // Channel closed unexpectedly - wait for run_handle
-                        break run_handle.await.map_err(|e| {
-                            Error::IoError(std::io::Error::other(format!("Task runner panicked: {e}")))
-                        })?;
-                    };
-                    match event {
-                        ActivityEvent::Task(task_event) => self.handle_task_event(task_event)?,
-                        // Ignore other activity types (Build, Fetch, etc.)
-                        _ => {}
-                    }
-                }
-                result = &mut run_handle => {
-                    // Task runner completed - drain any remaining events
-                    while let Ok(event) = self.activity_rx.try_recv() {
-                        if let ActivityEvent::Task(task_event) = event {
-                            self.handle_task_event(task_event)?;
-                        }
-                    }
-                    break result.map_err(|e| {
-                        Error::IoError(std::io::Error::other(format!("Task runner panicked: {e}")))
-                    })?;
-                }
+        // Phase 1: Process events until task runner completes
+        let outputs = self.consume_events_until(run_handle).await.map_err(|e| {
+            Error::IoError(std::io::Error::other(format!("Task runner panicked: {e}")))
+        })?;
+
+        // Phase 2: If processes are still running (e.g., devenv-tasks invoked by
+        // process-compose), keep forwarding output and wait for them to exit.
+        if !self.tasks.process_manager.list().await.is_empty() {
+            let cancel = self.tasks.shutdown.cancellation_token();
+            let pm = Arc::clone(&self.tasks.process_manager);
+            let fg_handle = tokio::spawn(async move { pm.run_foreground(cancel, None).await });
+
+            if let Err(e) = self
+                .consume_events_until(fg_handle)
+                .await
+                .map_err(|e| format!("Process manager panicked: {e}"))
+                .and_then(|r| r.map_err(|e| format!("Process manager error: {e}")))
+            {
+                return Err(Error::IoError(std::io::Error::other(e)));
             }
-        };
+        }
 
         // Print summary
         self.print_summary().await?;
@@ -128,27 +123,76 @@ impl TasksUi {
         Ok((status, outputs))
     }
 
+    /// Consume activity events until `done` resolves, then drain remaining events.
+    async fn consume_events_until<T>(
+        &mut self,
+        done: tokio::task::JoinHandle<T>,
+    ) -> Result<T, tokio::task::JoinError> {
+        let mut done = done;
+        loop {
+            tokio::select! {
+                event = self.activity_rx.recv() => {
+                    if let Some(event) = event {
+                        self.dispatch_event(event);
+                    }
+                }
+                result = &mut done => {
+                    self.drain_events();
+                    return result;
+                }
+            }
+        }
+    }
+
+    /// Drain any buffered activity events.
+    fn drain_events(&mut self) {
+        while let Ok(event) = self.activity_rx.try_recv() {
+            self.dispatch_event(event);
+        }
+    }
+
+    /// Route an activity event to the appropriate handler.
+    fn dispatch_event(&mut self, event: ActivityEvent) {
+        match event {
+            ActivityEvent::Task(task_event) => {
+                let _ = self.handle_task_event(task_event);
+            }
+            ActivityEvent::Process(proc_event) => self.handle_process_event(proc_event),
+            _ => {}
+        }
+    }
+
     fn handle_task_event(&mut self, event: TaskEvent) -> Result<(), Error> {
         match event {
-            TaskEvent::Start {
-                id,
-                name,
-                show_output,
-                is_process,
-                ..
-            } => {
-                self.task_states.insert(
-                    id,
-                    TaskUiState {
-                        name: name.clone(),
-                        status: TaskDisplayStatus::Running,
-                        start_time: Instant::now(),
-                        show_output,
-                        is_process,
-                    },
-                );
+            TaskEvent::Hierarchy { tasks, .. } => {
+                // Register all tasks upfront in Queued state
+                for task_info in tasks {
+                    self.task_states.insert(
+                        task_info.id,
+                        TaskUiState {
+                            name: task_info.name,
+                            status: TaskDisplayStatus::Queued,
+                            start_time: Instant::now(),
+                            show_output: task_info.show_output,
+                            is_process: task_info.is_process,
+                        },
+                    );
+                }
+            }
+            TaskEvent::Start { id, .. } => {
+                // Transition from Queued to Running
+                // Extract name first to avoid borrow checker issues
+                let name = if let Some(state) = self.task_states.get_mut(&id) {
+                    state.status = TaskDisplayStatus::Running;
+                    state.start_time = Instant::now();
+                    Some(state.name.clone())
+                } else {
+                    None
+                };
 
-                if self.verbosity != VerbosityLevel::Quiet {
+                if let Some(name) = name
+                    && self.verbosity != VerbosityLevel::Quiet
+                {
                     self.console_write_stderr(&format!(
                         "{:17} {}",
                         console::style("Running").blue().bold(),
@@ -249,6 +293,16 @@ impl TasksUi {
             }
         }
         Ok(())
+    }
+
+    fn handle_process_event(&mut self, event: ProcessEvent) {
+        if let ProcessEvent::Log { line, is_error, .. } = event {
+            if is_error {
+                self.console_write_stderr(&line);
+            } else {
+                self.console_write_stdout(&line);
+            }
+        }
     }
 
     async fn print_summary(&mut self) -> Result<(), Error> {
