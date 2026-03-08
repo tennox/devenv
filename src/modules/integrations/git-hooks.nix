@@ -17,6 +17,9 @@ let
   };
 
   git-hooks = inputs.git-hooks or inputs.pre-commit-hooks or (config.lib.tryGetInput inputArgs);
+  supportedHooksLib =
+    import (git-hooks + "/modules/supported-hooks.nix") { inherit lib; };
+  supportedHooks = lib.remove "manual" supportedHooksLib.supportedHooks;
 
   # Check if any individual hooks are enabled
   anyHookEnabled = builtins.any (hook: hook.enable or false) (lib.attrValues (cfg.hooks or { }));
@@ -148,6 +151,11 @@ in
               if [ "$(${git} config --get core.hooksPath 2>/dev/null)" = ".git/hooks" ]; then
                 ${git} config --unset core.hooksPath
               fi
+
+              # Remove any previously installed hooks to avoid permission errors when files are owned by another user
+              for hook in ${lib.concatStringsSep " " supportedHooks}; do
+                ${executable} uninstall -t $hook 2>/dev/null || true
+              done
 
               # Install hooks for configured stages
               if [ -z "${lib.concatStringsSep " " installStages}" ]; then
