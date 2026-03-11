@@ -8,10 +8,17 @@ use crate::protocol::{ShellCommand, ShellEvent};
 use crate::pty::{Pty, PtyError, get_terminal_size};
 use crate::status_line::{SPINNER_INTERVAL_MS, StatusLine};
 use crate::terminal::RawModeGuard;
+use crate::terminal_commands::{
+    CursorPositionQuery, ORIGIN_MODE, ReportTextAreaSize, ResetDecMode, ResetModifyOtherKeys,
+    ResetScrollRegion, SetKeypadMode, SetScrollRegion,
+};
 use crate::utf8_accumulator::Utf8Accumulator;
 use avt::Vt;
 use crossterm::{
-    cursor, queue,
+    Command, cursor,
+    event::PopKeyboardEnhancementFlags,
+    queue,
+    style::ResetColor,
     terminal::{self, Clear, ClearType},
 };
 use portable_pty::PtySize;
@@ -47,6 +54,10 @@ struct EscapeState {
     /// Set when CSI 3 J is seen — deferred so the caller can emit it *after*
     /// `scroll_region` pushes old TUI content into scrollback.
     clear_scrollback: bool,
+    /// Kitty keyboard protocol stack depth.
+    kitty_keyboard_depth: u32,
+    /// XTMODIFYOTHERKEYS is enabled.
+    modify_other_keys: bool,
 }
 
 impl EscapeState {
@@ -57,6 +68,8 @@ impl EscapeState {
             keypad_application_mode: false,
             erase_display: false,
             clear_scrollback: false,
+            kitty_keyboard_depth: 0,
+            modify_other_keys: false,
         }
     }
 
@@ -156,6 +169,9 @@ fn feed_vt(vt: &mut Vt, text: &str) -> (usize, usize) {
 /// would be interpreted as user input by readline. This filter removes
 /// OSC response sequences (`ESC ] <digits> ; <payload> <terminator>`)
 /// from the stdin stream while passing everything else through.
+///
+/// DCS responses are NOT filtered — they are replies to queries that the
+/// program itself sent (e.g., XTGETTCAP, DECRQSS) and must reach it.
 struct StdinFilter {
     state: StdinFilterState,
     buf: Vec<u8>,
@@ -342,12 +358,18 @@ impl Renderer {
         if count == 0 || content_rows == 0 {
             return Ok(());
         }
-        write!(stdout, "\x1b[1;{}r", content_rows)?;
-        write!(stdout, "\x1b[{};1H", content_rows)?;
+        queue!(
+            stdout,
+            SetScrollRegion {
+                top: 1,
+                bottom: content_rows
+            },
+            cursor::MoveTo(0, content_rows - 1)
+        )?;
         for _ in 0..count {
             stdout.write_all(b"\n")?;
         }
-        write!(stdout, "\x1b[r")
+        queue!(stdout, ResetScrollRegion)
     }
 
     /// Write a single VT line's content (SGR-formatted text + reset) to stdout.
@@ -355,7 +377,7 @@ impl Renderer {
         self.line_buf.clear();
         dump_line(&mut self.line_buf, line);
         stdout.write_all(self.line_buf.as_bytes())?;
-        stdout.write_all(b"\x1b[0m")
+        queue!(stdout, ResetColor)
     }
 
     /// Render changed VT lines to stdout. Skips lines that haven't changed
@@ -402,7 +424,13 @@ impl Renderer {
             let batch_size = self.content_rows as usize;
 
             // Set scroll region to protect the status line row.
-            write!(stdout, "\x1b[1;{}r", self.content_rows)?;
+            queue!(
+                stdout,
+                SetScrollRegion {
+                    top: 1,
+                    bottom: self.content_rows
+                }
+            )?;
 
             // Iterate scrollback lines starting from the first unflushed one.
             // vt.line(n) is viewport-relative, so we must use lines() iterator.
@@ -440,7 +468,7 @@ impl Renderer {
                 }
             }
 
-            write!(stdout, "\x1b[r")?;
+            queue!(stdout, ResetScrollRegion)?;
             self.scrollback_flushed = vt_scrollback;
             self.prev_lines.clear();
         }
@@ -688,7 +716,7 @@ impl ShellSession {
         // Skip when stdin is injected (not a real terminal) — the response comes
         // via stdin, so this would hang if stdin is not a TTY.
         let cursor_row = if !injected_stdin && io::stdin().is_terminal() {
-            write!(stdout, "\x1b[6n")?;
+            queue!(stdout, CursorPositionQuery)?;
             stdout.flush()?;
 
             let mut response = Vec::new();
@@ -730,7 +758,7 @@ impl ShellSession {
         // TUI renderers may leave a non-default scroll region/origin mode.
         // Reset both before we start cursor-addressed rendering, otherwise
         // the first shell draw can land in the wrong area and overlap TUI output.
-        write!(stdout, "\x1b[r\x1b[?6l")?;
+        queue!(stdout, ResetScrollRegion, ResetDecMode(ORIGIN_MODE))?;
         stdout.flush()?;
 
         // Get terminal size.
@@ -991,6 +1019,8 @@ impl ShellSession {
                         &data,
                         &mut esc,
                         stdout,
+                        &pty,
+                        self.pty_size(),
                         &mut esc_events,
                     )?;
 
@@ -1007,6 +1037,8 @@ impl ShellSession {
                                     &more,
                                     &mut esc,
                                     stdout,
+                                    &pty,
+                                    self.pty_size(),
                                     &mut esc_events,
                                 )?;
                                 let text = utf8_acc.accumulate(&more);
@@ -1218,6 +1250,8 @@ impl ShellSession {
         data: &[u8],
         esc: &mut EscapeState,
         stdout: &mut impl Write,
+        pty: &Pty,
+        pty_size: PtySize,
         events_buf: &mut Vec<SequenceEvent>,
     ) -> io::Result<()> {
         events_buf.clear();
@@ -1268,15 +1302,45 @@ impl ShellSession {
                     // pushes old TUI content into scrollback.
                     esc.clear_scrollback = true;
                 }
-                SequenceEvent::PrimaryDA { raw_bytes } => {
-                    // Forward to the real terminal. The terminal's DA1 response
-                    // arrives on stdin, passes through StdinFilter (it's CSI,
-                    // not OSC), gets written to the PTY, and reaches the
-                    // program that sent the query.
+                SequenceEvent::ForwardCsi { raw_bytes } => {
                     stdout.write_all(&raw_bytes)?;
                 }
+                SequenceEvent::ForwardDcs { raw_bytes } => {
+                    stdout.write_all(&raw_bytes)?;
+                }
+                SequenceEvent::KittyKeyboard {
+                    raw_bytes,
+                    stack_delta,
+                } => {
+                    stdout.write_all(&raw_bytes)?;
+                    if stack_delta > 0 {
+                        esc.kitty_keyboard_depth =
+                            esc.kitty_keyboard_depth.saturating_add(stack_delta as u32);
+                    } else if stack_delta < 0 {
+                        esc.kitty_keyboard_depth = esc
+                            .kitty_keyboard_depth
+                            .saturating_sub((-stack_delta) as u32);
+                    }
+                    // stack_delta == 0 is "set" — depth stays the same
+                }
+                SequenceEvent::ModifyOtherKeys { raw_bytes, enabled } => {
+                    stdout.write_all(&raw_bytes)?;
+                    esc.modify_other_keys = enabled;
+                }
+                SequenceEvent::TextAreaSizeQuery => {
+                    // Respond with PTY dimensions so programs see the correct
+                    // size (which excludes the status line row).
+                    let cmd = ReportTextAreaSize {
+                        rows: pty_size.rows,
+                        cols: pty_size.cols,
+                    };
+                    let mut buf = String::new();
+                    cmd.write_ansi(&mut buf).unwrap();
+                    pty.write_all(buf.as_bytes())?;
+                    pty.flush()?;
+                }
                 SequenceEvent::KeypadMode { application } => {
-                    stdout.write_all(if application { b"\x1b=" } else { b"\x1b>" })?;
+                    queue!(stdout, SetKeypadMode { application })?;
                     esc.keypad_application_mode = application;
                 }
             }
@@ -1286,20 +1350,29 @@ impl ShellSession {
 
     /// Reset any forwarded DEC modes on exit so the terminal is left clean.
     fn cleanup_forwarded_modes(esc: &EscapeState, stdout: &mut impl Write) -> io::Result<()> {
+        let mut needs_flush = false;
         if esc.in_alternate_screen {
             queue!(stdout, terminal::LeaveAlternateScreen)?;
+            needs_flush = true;
         }
         for &mode in &esc.forwarded_dec_modes {
-            write!(stdout, "\x1b[?{}l", mode)?;
+            queue!(stdout, ResetDecMode(mode))?;
+            needs_flush = true;
         }
         if esc.keypad_application_mode {
-            // Reset to numeric keypad mode (DECKPNM)
-            stdout.write_all(b"\x1b>")?;
+            queue!(stdout, SetKeypadMode { application: false })?;
+            needs_flush = true;
         }
-        if esc.in_alternate_screen
-            || !esc.forwarded_dec_modes.is_empty()
-            || esc.keypad_application_mode
-        {
+        // Pop all kitty keyboard stack entries
+        for _ in 0..esc.kitty_keyboard_depth {
+            queue!(stdout, PopKeyboardEnhancementFlags)?;
+            needs_flush = true;
+        }
+        if esc.modify_other_keys {
+            queue!(stdout, ResetModifyOtherKeys)?;
+            needs_flush = true;
+        }
+        if needs_flush {
             stdout.flush()?;
         }
         Ok(())
