@@ -14,6 +14,17 @@ let
     let
       lock = builtins.fromJSON (builtins.readFile ./../../flake.lock);
       lockedNixpkgs = lock.nodes.nixpkgs.locked;
+      lockedRustOverlay = lock.nodes.rust-overlay.locked or null;
+      # Fetch rust-overlay if it's in the lock file
+      rustOverlaySource =
+        if lockedRustOverlay != null && lockedRustOverlay.type == "github" then
+          pkgs.fetchFromGitHub
+            {
+              inherit (lockedRustOverlay) owner repo rev;
+              hash = lockedRustOverlay.narHash;
+            }
+        else
+          null;
       devenvPkgs =
         if lockedNixpkgs.type == "github" then
           let
@@ -21,13 +32,25 @@ let
               inherit (lockedNixpkgs) owner repo rev;
               hash = lock.nodes.nixpkgs.locked.narHash;
             };
+            # rust-overlay default.nix returns an overlay function when imported
+            rustOverlay = if rustOverlaySource != null then import rustOverlaySource else null;
+            overlays = lib.optional (rustOverlay != null) rustOverlay;
           in
-          import source { system = pkgs.stdenv.system; }
+          import source { inherit overlays; system = pkgs.stdenv.system; }
         else
           pkgs;
-      workspace = devenvPkgs.callPackage ./../../workspace.nix { };
+      # Use rust-overlay's stable Rust for buildRustCrate
+      rustToolchain =
+        if devenvPkgs ? rust-bin
+        then devenvPkgs.rust-bin.stable.latest.default
+        else devenvPkgs.rustc;
+      workspace = devenvPkgs.callPackage ./../../nix/workspace.nix {
+        pkgs = devenvPkgs;
+        rustc = rustToolchain;
+        cargo = rustToolchain;
+      };
     in
-    workspace.crates.devenv-tasks-fast-build;
+    workspace.crates.devenv-tasks;
 
   taskType = types.submodule
     ({ name, config, ... }:
@@ -45,24 +68,35 @@ let
                 if config.binary != null
                 then config.binary == "bash"
                 else config.package.meta.mainProgram or null == "bash";
-              # Output exports in a format the Rust executor can parse
-              # Format: DEVENV_EXPORT:<base64-encoded-var>=<base64-encoded-value>
-              # Base64 encoding handles special characters safely
-              exportVars = vars: ''
+              # Export env vars from tasks.
+              # CLI 2.0.4+: write name\0base64(value)\0 pairs to $DEVENV_TASK_EXPORTS_FILE
+              # Older: echo DEVENV_EXPORT:<base64-key>=<base64-value> to stdout
+              useFileExports = inputs.config.devenv.cli.version != null
+                && lib.versionAtLeast inputs.config.devenv.cli.version "2.0.4";
+              varLoop = body: vars: ''
                 for _var in ${lib.concatStringsSep " " vars}; do
                   if [ -n "''${!_var+x}" ]; then
-                    _var_b64=$(printf '%s' "$_var" | base64 -w0)
-                    _val_b64=$(printf '%s' "''${!_var}" | base64 -w0)
-                    echo "DEVENV_EXPORT:$_var_b64=$_val_b64"
+                    ${body}
                   fi
                 done
               '';
+              exportVars =
+                if useFileExports then
+                  varLoop ''
+                    _val_b64=$(printf '%s' "''${!_var}" | base64 -w0)
+                    printf '%s\0%s\0' "$_var" "$_val_b64" >> "$DEVENV_TASK_EXPORTS_FILE"
+                  '' else
+                  varLoop ''
+                    _var_b64=$(printf '%s' "$_var" | base64 -w0)
+                    _val_b64=$(printf '%s' "''${!_var}" | base64 -w0)
+                    echo "DEVENV_EXPORT:$_var_b64=$_val_b64"
+                  '';
             in
             pkgs.writeScript name ''
               #!${binary}
               ${lib.optionalString (!isStatus && isBash) "set -e"}
               ${command}
-              ${lib.optionalString (config.exports != [] && !isStatus) (exportVars config.exports)}
+              ${lib.optionalString (config.exports != []) (exportVars config.exports)}
             '';
       in
       {

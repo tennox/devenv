@@ -23,7 +23,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2.0.3"
+version = "2.0.5"
 edition = "2024"
 license = "APACHE-2.0"
 homepage = "https://devenv.sh/"
@@ -105,7 +105,7 @@ schematic = { version = "0.19", features = [
 ] }
 secrecy = "0.10"
 # https://github.com/mikaelmello/inquire/pull/330
-secretspec = { git = "https://github.com/cachix/secretspec", tag = "v0.7.2" }
+secretspec = { git = "https://github.com/cachix/secretspec", tag = "v0.8.0", features = ["cli", "keyring", "gcsm", "awssm", "vault"] }
 serde = { version = "1.0.226", features = ["derive"] }
 serde_json = "1.0.145"
 serde_repr = "0.1.20"
@@ -145,9 +145,11 @@ which = "8.0.0"
 whoami = "2.1.1"
 xdg = "3.0.0"
 walkdir = "2.5"
+globset = "0.4"
 url = "2"
 human-repr = "1.1"
 insta = { version = "1.40", features = ["filters", "json"] }
+notify = { version = "8", default-features = false }
 watchexec = "8.2"
 watchexec-filterer-globset = "8.0"
 watchexec-supervisor = "5.1"
@@ -201,18 +203,13 @@ crossterm = { git = "https://github.com/sandydoo/crossterm", branch = "0.28-cach
 insta.opt-level = 3
 similar.opt-level = 3
 
-# A release build with full link-time optimization (slow)
 [profile.release]
-strip = "symbols"
+strip = true
 lto = "fat"
 
-# A fast release build without LTO
-# TODO: using underscores because of a normalization bug in buildRustPackage
-[profile.release_fast]
+# A profiling release build that retains debug symbols for better backtraces
+[profile.profiling]
 inherits = "release"
-lto = false
-
-# A fast release build that retains debug symbols for better backtraces
-[profile.release_with_debug]
-inherits = "release_fast"
 debug = true
+strip = false
+lto = false

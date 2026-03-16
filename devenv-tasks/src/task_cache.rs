@@ -12,10 +12,12 @@ use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
 use serde_json::Value;
 use sqlx::Row;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tracing::{debug, warn};
+
+const GLOB_SPECIAL_CHARS: &[char] = &['*', '?', '[', '{'];
 
 fn normalize_pattern_for_base_dir(pattern: &str, base_dir: &Path) -> String {
     let (negated, raw_pattern) = match pattern.strip_prefix('!') {
@@ -56,10 +58,7 @@ fn normalize_pattern_for_base_dir(pattern: &str, base_dir: &Path) -> String {
 }
 
 fn is_literal_pattern(pattern: &str) -> bool {
-    !pattern.contains('*')
-        && !pattern.contains('?')
-        && !pattern.contains('[')
-        && !pattern.contains('{')
+    !pattern.contains(GLOB_SPECIAL_CHARS)
 }
 
 fn pattern_explicitly_targets_hidden_path(pattern: &str) -> bool {
@@ -83,10 +82,9 @@ fn has_hidden_component(path: &Path, base_dir: &Path) -> bool {
 /// This is used to determine where to start walking the filesystem.
 fn extract_base_dir(pattern: &str) -> &Path {
     // Find the first occurrence of any glob special character
-    let special_chars = ['*', '?', '[', '{'];
     let first_special = pattern
         .char_indices()
-        .find(|(_, c)| special_chars.contains(c))
+        .find(|(_, c)| GLOB_SPECIAL_CHARS.contains(c))
         .map(|(i, _)| i)
         .unwrap_or(pattern.len());
 
@@ -150,7 +148,7 @@ pub fn expand_glob_patterns(patterns: &[String]) -> Vec<String> {
     let mut results: Vec<String> = Vec::new();
     let mut groups: BTreeMap<PathBuf, Vec<&str>> = BTreeMap::new();
     for pattern in &positive_patterns {
-        if is_literal_pattern(pattern) && negation_patterns.is_empty() {
+        if is_literal_pattern(pattern) {
             let path = Path::new(pattern);
             if path.exists()
                 && let Some(path_str) = path.to_str()
@@ -182,22 +180,28 @@ pub fn expand_glob_patterns(patterns: &[String]) -> Vec<String> {
             }
         }
 
-        let overrides = match overrides_builder.build() {
+        // We build overrides twice: once for the walker (efficient directory pruning)
+        // and once for explicit match checking. The walker yields entries that are
+        // *not ignored* (including directories that match no rule), so we use
+        // overrides_for_match to select only positively matched files.
+        let overrides_for_match = match overrides_builder.build() {
             Ok(overrides) => overrides,
             Err(e) => {
-                warn!("Failed to build ignore overrides: {}", e);
+                warn!("Failed to build ignore overrides: {e}");
                 continue;
             }
         };
-        // We pass overrides to the walker for efficient directory pruning, but also
-        // keep a copy for explicit match checking. The walker yields entries that are
-        // *not ignored* (including directories that match no rule), so we use
-        // overrides_for_match to select only positively matched files.
-        let overrides_for_match = overrides.clone();
-        let hidden_overrides = match hidden_overrides_builder.build() {
-            Ok(hidden_overrides) => hidden_overrides,
+        let overrides_for_walk = match overrides_builder.build() {
+            Ok(overrides) => overrides,
             Err(e) => {
-                warn!("Failed to build hidden ignore overrides: {}", e);
+                warn!("Failed to build ignore overrides: {e}");
+                continue;
+            }
+        };
+        let hidden_overrides = match hidden_overrides_builder.build() {
+            Ok(overrides) => overrides,
+            Err(e) => {
+                warn!("Failed to build hidden ignore overrides: {e}");
                 continue;
             }
         };
@@ -211,7 +215,7 @@ pub fn expand_glob_patterns(patterns: &[String]) -> Vec<String> {
             .git_exclude(false)
             .parents(false)
             .follow_links(true)
-            .overrides(overrides);
+            .overrides(overrides_for_walk);
 
         for entry in walk_builder.build() {
             let Ok(entry) = entry else {
@@ -236,6 +240,27 @@ pub fn expand_glob_patterns(patterns: &[String]) -> Vec<String> {
                     results.push(path_str.to_string());
                 }
             }
+        }
+    }
+
+    // Filter literal paths against negation patterns.
+    // Glob results are already filtered by the walker above.
+    if !negation_patterns.is_empty() {
+        let base = Path::new("/");
+        let mut builder = OverrideBuilder::new(base);
+        for neg in &negation_patterns {
+            let normalized = normalize_pattern_for_base_dir(neg, base);
+            if let Err(e) = builder.add(&normalized) {
+                warn!("Invalid negation pattern '{}': {}", normalized, e);
+            }
+        }
+        if let Ok(overrides) = builder.build() {
+            results.retain(|path_str| {
+                !matches!(
+                    overrides.matched(Path::new(path_str), false),
+                    Match::Ignore(_)
+                )
+            });
         }
     }
 
@@ -302,6 +327,62 @@ impl TaskCache {
         }
 
         Ok(any_modified)
+    }
+
+    /// Check if any previously tracked files for a task are no longer in the current set.
+    pub async fn has_removed_files(
+        &self,
+        task_name: &str,
+        current_paths: &[String],
+    ) -> CacheResult<bool> {
+        let db_paths: Vec<String> =
+            sqlx::query_scalar("SELECT path FROM watched_file WHERE task_name = ?")
+                .bind(task_name)
+                .fetch_all(self.pool())
+                .await?;
+
+        let current_set: HashSet<&str> = current_paths.iter().map(|s| s.as_str()).collect();
+        for db_path in &db_paths {
+            if !current_set.contains(db_path.as_str()) {
+                debug!(
+                    "Previously tracked file '{}' for task '{}' no longer matches glob patterns",
+                    db_path, task_name
+                );
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Remove watched_file entries for a task that are not in the current set of paths.
+    pub async fn cleanup_stale_files(
+        &self,
+        task_name: &str,
+        current_paths: &[String],
+    ) -> CacheResult<()> {
+        let db_paths: Vec<String> =
+            sqlx::query_scalar("SELECT path FROM watched_file WHERE task_name = ?")
+                .bind(task_name)
+                .fetch_all(self.pool())
+                .await?;
+
+        let current_set: HashSet<&str> = current_paths.iter().map(|s| s.as_str()).collect();
+        for db_path in &db_paths {
+            if !current_set.contains(db_path.as_str()) {
+                debug!(
+                    "Removing stale watched_file entry '{}' for task '{}'",
+                    db_path, task_name
+                );
+                sqlx::query("DELETE FROM watched_file WHERE task_name = ? AND path = ?")
+                    .bind(task_name)
+                    .bind(db_path)
+                    .execute(self.pool())
+                    .await?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Get current Unix timestamp
@@ -494,8 +575,8 @@ impl TaskCache {
             }
             Err(e) => {
                 warn!("Failed to check file {}: {}", path, e);
-                // File doesn't exist or is inaccessible, consider unchanged
-                Ok(false)
+                // File doesn't exist or is inaccessible, consider modified to force re-execution
+                Ok(true)
             }
         }
     }
@@ -1137,5 +1218,97 @@ mod tests {
 
         // Pattern with glob in middle
         assert_eq!(extract_base_dir("/foo/*/bar/*.ts"), Path::new("/foo"));
+    }
+
+    #[sqlx::test]
+    async fn test_deleted_file_detected_as_modified() {
+        let db_temp_dir = TempDir::new().unwrap();
+        let db_path = db_temp_dir.path().join("tasks-del.db");
+        let cache = TaskCache::with_db_path(db_path).await.unwrap();
+
+        let test_temp_dir = TempDir::new().unwrap();
+        let file_a = test_temp_dir.path().join("a.ts");
+        let file_b = test_temp_dir.path().join("b.ts");
+        let file_c = test_temp_dir.path().join("c.ts");
+
+        std::fs::write(&file_a, "a").unwrap();
+        std::fs::write(&file_b, "b").unwrap();
+        std::fs::write(&file_c, "c").unwrap();
+
+        let task_name = "test_delete";
+        let pattern = format!("{}/*.ts", test_temp_dir.path().display());
+
+        // First run: all files are new
+        assert!(
+            cache
+                .check_modified_files(task_name, &[pattern.clone()])
+                .await
+                .unwrap()
+        );
+
+        // Store state for all files
+        for path in expand_glob_patterns(&[pattern.clone()]) {
+            cache.update_file_state(task_name, &path).await.unwrap();
+        }
+
+        // Everything is up to date
+        assert!(
+            !cache
+                .check_modified_files(task_name, &[pattern.clone()])
+                .await
+                .unwrap()
+        );
+
+        // Delete c.ts
+        std::fs::remove_file(&file_c).unwrap();
+
+        // check_modified_files alone won't detect the deletion since c.ts
+        // is no longer in the glob expansion
+        assert!(
+            !cache
+                .check_modified_files(task_name, &[pattern.clone()])
+                .await
+                .unwrap()
+        );
+
+        // has_removed_files detects that a previously tracked file is gone
+        let current_paths = expand_glob_patterns(&[pattern.clone()]);
+        assert!(
+            cache
+                .has_removed_files(task_name, &current_paths)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_inaccessible_file_treated_as_modified() {
+        let db_temp_dir = TempDir::new().unwrap();
+        let db_path = db_temp_dir.path().join("tasks-inacc.db");
+        let cache = TaskCache::with_db_path(db_path).await.unwrap();
+
+        let test_temp_dir = TempDir::new().unwrap();
+        let file_path = test_temp_dir.path().join("test.txt");
+        std::fs::write(&file_path, "content").unwrap();
+
+        let task_name = "test_inaccessible";
+        let path_str = file_path.to_str().unwrap().to_string();
+
+        // Store initial state
+        cache.update_file_state(task_name, &path_str).await.unwrap();
+
+        // File is unchanged
+        assert!(
+            !cache
+                .check_modified_files(task_name, &[path_str.clone()])
+                .await
+                .unwrap()
+        );
+
+        // Delete the file so TrackedFile::new will fail
+        std::fs::remove_file(&file_path).unwrap();
+
+        // is_file_modified should treat the error as modified, not unchanged
+        assert!(cache.is_file_modified(task_name, &path_str).await.unwrap());
     }
 }

@@ -228,6 +228,27 @@ inputs:
 
 If you don't use git-hooks, no changes are needed.
 
+The `pre-commit-hooks` to `git-hooks` alias has also been removed.
+If you often switch between devenv v1.x and v2.x, add the `pre-commit-hooks` input as well to prevent lockfile changes when switching versions:
+
+```yaml
+inputs:
+  pre-commit-hooks:
+    follows: git-hooks
+```
+
+## `pre-commit` renamed to `prek`
+
+The `pre-commit` command has been replaced by `prek`, a Rust rewrite. If you invoke `pre-commit` directly in scripts or shell commands, update them to use `prek` instead:
+
+```bash
+# Before
+pre-commit run --all-files
+
+# After
+prek run --all-files
+```
+
 ## `devenv build` returns JSON
 
 `devenv build` now outputs JSON instead of plain store paths:

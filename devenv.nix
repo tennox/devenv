@@ -5,6 +5,10 @@
 , options
 , ...
 }:
+
+let
+  inherit (pkgs.stdenv) system;
+in
 {
   env = {
     # The path to the eval cache database (for migrations)
@@ -21,6 +25,12 @@
   claude.code = {
     enable = true;
     commands = {
+      bump-nix = ''
+        Bump the nix input in both devenv.lock and flake.lock
+
+        1. Run `devenv update nix` and `nix flake update nix` in parallel
+        2. Commit the changes
+      '';
       release = ''
         Release devenv version $ARGUMENTS
 
@@ -37,7 +47,6 @@
         8. Create a GitHub release with `gh release create v$ARGUMENTS --title "v$ARGUMENTS" --latest --notes  "<changelog for this release>"`
         9. At the end, tell the user that the package still needs to be bumped in nixpkgs:
            - The package is at pkgs/by-name/de/devenv/package.nix
-           - Sync with ./package.nix from this repo and bump version
       '';
     };
     permissions = {
@@ -62,7 +71,7 @@
 
   # Project dependencies
   packages = [
-    inputs.nix.packages.${pkgs.stdenv.system}.nix # Required for integration tests
+    inputs.nix.packages.${system}.nix # Required for integration tests
     pkgs.git
     pkgs.xorg.libxcb
     pkgs.yaml2json
@@ -81,6 +90,7 @@
     pkgs.protobuf # snix
     pkgs.dbus # secretspec
     pkgs.nixd # LSP for devenv lsp command
+    inputs.crate2nix.packages.${system}.default # Generate Cargo.nix from Cargo.lock
   ];
 
   languages = {
@@ -117,7 +127,14 @@
     '';
   };
 
+  tasks."devenv:crate2nix" = {
+    description = "Generate Cargo.nix from Cargo.lock";
+    exec = "crate2nix generate -h nix/crate-hashes.json";
+    execIfModified = [ "Cargo.lock" ];
+  };
+
   git-hooks.package = pkgs.prek;
+  git-hooks.excludes = [ "Cargo.nix" ];
   git-hooks.hooks = {
     nixpkgs-fmt.enable = true;
     rustfmt.enable = true;

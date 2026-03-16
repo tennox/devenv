@@ -1,7 +1,7 @@
 use super::{processes, tasks, util};
 use clap::crate_version;
 use cli_table::Table;
-use cli_table::{WithTitle, print_stderr};
+use cli_table::WithTitle;
 use devenv_activity::ActivityInstrument;
 use devenv_activity::{Activity, ActivityLevel, activity, message};
 use devenv_cache_core::compute_string_hash;
@@ -40,7 +40,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process;
 use tokio::sync::{OnceCell, Semaphore};
-use tracing::{Instrument, debug, info, instrument, trace};
+use tracing::{Instrument, debug, info, instrument};
 
 // templates
 // Note: gitignore is stored without the dot to work around include_dir not including dotfiles
@@ -151,7 +151,10 @@ pub enum RunMode {
 /// Error indicating that secrets need to be prompted for interactively.
 /// This is used to signal the CLI to stop the TUI and prompt for secrets.
 #[derive(Debug, miette::Diagnostic)]
-#[diagnostic(code(devenv::secrets_need_prompting))]
+#[diagnostic(
+    code(devenv::secrets_need_prompting),
+    help("Run `devenv shell` to set the missing secrets.")
+)]
 pub struct SecretsNeedPrompting {
     pub provider: Option<String>,
     pub profile: Option<String>,
@@ -226,7 +229,7 @@ pub struct Devenv {
     // Task-exported env vars (e.g., PATH with venv/bin, VIRTUAL_ENV) set by
     // run_enter_shell_tasks(). Injected into the bash script by prepare_shell()
     // so they take effect AFTER the Nix shell env is applied.
-    task_exports: std::sync::Mutex<HashMap<String, String>>,
+    task_exports: std::sync::Mutex<BTreeMap<String, String>>,
 }
 
 /// Sanitize profile name to be filesystem-safe
@@ -394,7 +397,7 @@ impl Devenv {
             port_allocator,
             native_process_manager: Arc::new(OnceCell::new()),
             shutdown: options.shutdown,
-            task_exports: std::sync::Mutex::new(HashMap::new()),
+            task_exports: std::sync::Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -516,7 +519,7 @@ impl Devenv {
         }
 
         for (source_name, target_name) in REQUIRED_FILES {
-            info!("Creating {}", target_name);
+            info!(devenv.is_user_message = true, "Creating {}", target_name);
 
             let path = PROJECT_DIR
                 .get_file(source_name)
@@ -549,10 +552,9 @@ impl Devenv {
         Ok(())
     }
 
-    pub async fn changelogs(&self) -> Result<()> {
+    pub async fn changelogs(&self) -> Result<Option<String>> {
         let changelog = crate::changelog::Changelog::new(&**self.nix, &self.paths());
-        changelog.show_all().await?;
-        Ok(())
+        changelog.show_all().await
     }
 
     /// Invalidate cached state for hot-reload.
@@ -588,13 +590,7 @@ impl Devenv {
             &owned_dev_env.output
         };
 
-        let bash = match self.nix.get_bash(false).await {
-            Err(e) => {
-                trace!("Failed to get bash: {}. Rebuilding.", e);
-                self.nix.get_bash(true).await?
-            }
-            Ok(bash) => bash,
-        };
+        let bash = self.get_bash_path().await?;
 
         let mut shell_cmd = process::Command::new(&bash);
 
@@ -626,13 +622,7 @@ impl Devenv {
         // after the Nix shell env is applied so they aren't overridden.
         {
             let exports = self.task_exports.lock().unwrap();
-            for (key, value) in exports.iter() {
-                script.push_str(&format!(
-                    "export {}={}\n",
-                    shell_escape::escape(std::borrow::Cow::Borrowed(key)),
-                    shell_escape::escape(std::borrow::Cow::Borrowed(value))
-                ));
-            }
+            script.push_str(&Self::format_task_exports_bash(&exports));
         }
 
         // Add command for non-interactive mode
@@ -780,7 +770,7 @@ impl Devenv {
         })
     }
 
-    pub async fn update(&self, input_name: &Option<String>) -> Result<()> {
+    pub async fn update(&self, input_name: &Option<String>) -> Result<Option<String>> {
         let msg = match input_name {
             Some(input_name) => format!("Updating devenv.lock with input {input_name}"),
             None => "Updating devenv.lock".to_string(),
@@ -802,17 +792,20 @@ impl Devenv {
             Ok(_) => {
                 // Show new changelogs (if any)
                 let changelog = crate::changelog::Changelog::new(&**self.nix, &self.paths());
-                if let Err(e) = changelog.show_new().await {
-                    // Don't fail the update if changelogs fail to load
-                    tracing::warn!("Failed to show changelogs: {}", e);
+                match changelog.show_new().await {
+                    Ok(output) => Ok(output),
+                    Err(e) => {
+                        // Don't fail the update if changelogs fail to load
+                        tracing::warn!("Failed to show changelogs: {}", e);
+                        Ok(None)
+                    }
                 }
             }
             Err(e) => {
                 tracing::warn!("Failed to assemble environment, skipping changelog: {}", e);
+                Ok(None)
             }
         }
-
-        Ok(())
     }
 
     #[activity(format!("{name} container"), kind = build)]
@@ -845,7 +838,7 @@ impl Devenv {
                 Some(&gc_root),
             )
             .await?;
-        let container_store_path = paths[0].to_string_lossy().to_string();
+        let container_store_path = paths[0].to_string_lossy().into_owned();
         Ok(container_store_path)
     }
 
@@ -871,7 +864,7 @@ impl Devenv {
                 Some(&gc_root),
             )
             .await?;
-        let copy_script = paths[0].to_string_lossy().to_string();
+        let copy_script = paths[0].to_string_lossy().into_owned();
 
         let envs = self.capture_shell_environment().await?;
 
@@ -908,22 +901,7 @@ impl Devenv {
             .build()
             .await?;
 
-        let (status, _outputs) = if tui {
-            let outputs = tasks.run(false).await;
-            let status = tasks.get_completion_status().await;
-            (status, outputs)
-        } else {
-            let (activity_rx, activity_handle) = devenv_activity::init();
-            let _activity_guard = activity_handle.install();
-
-            let tasks = Arc::new(tasks);
-            let tasks_clone = Arc::clone(&tasks);
-
-            let run_handle = tokio::spawn(async move { tasks_clone.run(false).await });
-
-            let ui = TasksUi::new(Arc::clone(&tasks), activity_rx, verbosity);
-            ui.run(run_handle).await?
-        };
+        let (status, _outputs) = run_tasks_with_ui(tasks, verbosity, tui).await?;
 
         if status.has_failures() {
             bail!("Failed to copy container");
@@ -989,7 +967,7 @@ impl Devenv {
     }
 
     #[activity("Searching options and packages")]
-    pub async fn search(&self, name: &str) -> Result<()> {
+    pub async fn search(&self, name: &str) -> Result<String> {
         self.assemble().await?;
 
         // Run both searches concurrently
@@ -999,18 +977,30 @@ impl Devenv {
         let results_options_count = options_results.len();
         let package_results_count = package_results.len();
 
+        let mut output = String::new();
+
         if !package_results.is_empty() {
-            print_stderr(package_results.with_title()).expect("Failed to print package results");
+            let table_display = package_results
+                .with_title()
+                .table()
+                .display()
+                .expect("Failed to format package results");
+            output.push_str(&format!("{table_display}\n"));
         }
 
         if !options_results.is_empty() {
-            print_stderr(options_results.with_title()).expect("Failed to print options results");
+            let table_display = options_results
+                .with_title()
+                .table()
+                .display()
+                .expect("Failed to format options results");
+            output.push_str(&format!("{table_display}\n"));
         }
 
-        eprintln!(
-            "Found {package_results_count} packages and {results_options_count} options for '{name}'."
-        );
-        Ok(())
+        output.push_str(&format!(
+            "Found {package_results_count} packages and {results_options_count} options for '{name}'.\n"
+        ));
+        Ok(output)
     }
 
     async fn search_options(&self, name: &str) -> Result<Vec<DevenvOptionResult>> {
@@ -1057,10 +1047,7 @@ impl Devenv {
         let results = search_results
             .into_iter()
             .map(|(key, value)| DevenvPackageResult {
-                name: format!(
-                    "pkgs.{}",
-                    key.split('.').skip(2).collect::<Vec<_>>().join(".")
-                ),
+                name: format!("pkgs.{key}"),
                 version: value.version,
                 description: value.description.chars().take(80).collect::<String>(),
             })
@@ -1169,27 +1156,7 @@ impl Devenv {
             .build()
             .await?;
 
-        // In TUI mode, skip TasksUi to avoid corrupting the TUI display
-        // TUI captures activity events directly via the channel initialized in main.rs
-        let (status, outputs) = if tui {
-            let outputs = tasks.run(false).await;
-            let status = tasks.get_completion_status().await;
-            (status, outputs)
-        } else {
-            // Shell mode - initialize activity channel for TasksUi
-            let (activity_rx, activity_handle) = devenv_activity::init();
-            let _activity_guard = activity_handle.install();
-
-            let tasks = Arc::new(tasks);
-            let tasks_clone = Arc::clone(&tasks);
-
-            // Spawn task runner - UI will detect completion via JoinHandle
-            let run_handle = tokio::spawn(async move { tasks_clone.run(false).await });
-
-            // Run UI - processes events and waits for run_handle
-            let ui = TasksUi::new(Arc::clone(&tasks), activity_rx, verbosity);
-            ui.run(run_handle).await?
-        };
+        let (status, outputs) = run_tasks_with_ui(tasks, verbosity, tui).await?;
 
         if status.has_failures() {
             miette::bail!("Some tasks failed");
@@ -1221,7 +1188,7 @@ impl Devenv {
         pre_captured_envs: Option<HashMap<String, String>>,
         verbosity: tasks::VerbosityLevel,
         tui: bool,
-    ) -> Result<HashMap<String, String>> {
+    ) -> Result<BTreeMap<String, String>> {
         self.assemble().await?;
 
         let envs = match pre_captured_envs {
@@ -1242,7 +1209,7 @@ impl Devenv {
         envs: HashMap<String, String>,
         verbosity: tasks::VerbosityLevel,
         tui: bool,
-    ) -> Result<HashMap<String, String>> {
+    ) -> Result<BTreeMap<String, String>> {
         let config = tasks::Config {
             roots: vec!["devenv:enterShell".to_string()],
             tasks: task_configs,
@@ -1259,31 +1226,12 @@ impl Devenv {
             .build()
             .await?;
 
-        // In TUI mode, skip TasksUi to avoid corrupting the TUI display —
-        // the TUI captures activity events directly via the channel in main.rs.
-        let outputs = if tui {
-            tasks.run(false).await
-        } else {
-            // Shell mode - initialize activity channel for TasksUi
-            let (activity_rx, activity_handle) = devenv_activity::init();
-            let _activity_guard = activity_handle.install();
-
-            let tasks = Arc::new(tasks);
-            let tasks_clone = Arc::clone(&tasks);
-
-            // Spawn task runner - UI will detect completion via JoinHandle
-            let run_handle = tokio::spawn(async move { tasks_clone.run(false).await });
-
-            // Run UI - processes events and waits for run_handle
-            let ui = TasksUi::new(Arc::clone(&tasks), activity_rx, verbosity);
-            let (_status, outputs) = ui.run(run_handle).await?;
-            outputs
-        };
+        let (_status, outputs) = run_tasks_with_ui(tasks, verbosity, tui).await?;
 
         // Note: Task failures are shown in the TUI/UI output, no need to bail here.
         // Shell entry proceeds even if some tasks fail (matches interactive reload behavior).
 
-        let exports = Self::collect_task_exports(&outputs);
+        let exports = outputs.collect_env_exports();
         // Store on self so prepare_shell() can inject them into the bash script
         *self.task_exports.lock().unwrap() = exports.clone();
         Ok(exports)
@@ -1376,15 +1324,7 @@ impl Devenv {
             })?;
         let shell_envs = Self::parse_env_null_separated(&content);
 
-        let mut envs: HashMap<String, String> = {
-            let vars = std::env::vars();
-            if self.shell_settings.clean.enabled {
-                let keep = &self.shell_settings.clean.keep;
-                vars.filter(|(key, _)| !keep.contains(key)).collect()
-            } else {
-                vars.collect()
-            }
-        };
+        let mut envs: HashMap<String, String> = self.shell_settings.clean.kept_env_vars();
 
         for (key, value) in shell_envs {
             envs.insert(key, value);
@@ -1393,24 +1333,20 @@ impl Devenv {
         Ok(envs)
     }
 
-    /// Extract env vars exported by tasks (e.g., PATH from Python venv)
-    /// from task outputs into a HashMap.
-    fn collect_task_exports(outputs: &tasks::Outputs) -> HashMap<String, String> {
-        let mut envs = HashMap::new();
-        for value in outputs.values() {
-            if let Some(env_obj) = value
-                .get("devenv")
-                .and_then(|d| d.get("env"))
-                .and_then(|e| e.as_object())
-            {
-                for (env_key, env_value) in env_obj {
-                    if let Some(env_str) = env_value.as_str() {
-                        envs.insert(env_key.clone(), env_str.to_string());
-                    }
-                }
-            }
+    /// Format a map of task exports as bash `export KEY=VALUE` lines.
+    ///
+    /// Keys are already sorted (BTreeMap), giving deterministic output (important for direnv diffing).
+    pub fn format_task_exports_bash(exports: &BTreeMap<String, String>) -> String {
+        use std::borrow::Cow;
+        let mut result = String::with_capacity(exports.len() * 50);
+        for (key, value) in exports {
+            result.push_str("export ");
+            result.push_str(&shell_escape::escape(Cow::Borrowed(key)));
+            result.push('=');
+            result.push_str(&shell_escape::escape(Cow::Borrowed(value)));
+            result.push('\n');
         }
-        envs
+        result
     }
 
     pub async fn test(&self, verbosity: tasks::VerbosityLevel, tui: bool) -> Result<()> {
@@ -1459,7 +1395,7 @@ impl Devenv {
                     .nix
                     .build(&["devenv.config.test"], None, Some(&gc_root))
                     .await?;
-                Ok::<String, miette::Report>(test_script[0].to_string_lossy().to_string())
+                Ok::<String, miette::Report>(test_script[0].to_string_lossy().into_owned())
             }
             .in_activity(&phase3)
             .await?
@@ -1492,7 +1428,7 @@ impl Devenv {
             message(ActivityLevel::Error, "Tests failed :(");
             bail!("Tests failed");
         } else {
-            info!("Tests passed :)");
+            info!(devenv.is_user_message = true, "Tests passed :)");
             Ok(())
         }
     }
@@ -1710,13 +1646,13 @@ impl Devenv {
                 let roots: Vec<String> = if processes.is_empty() {
                     task_configs
                         .iter()
-                        .filter(|t| t.name.starts_with("devenv:processes:"))
+                        .filter(|t| t.name.starts_with(devenv_tasks::PROCESS_TASK_PREFIX))
                         .map(|t| t.name.clone())
                         .collect()
                 } else {
                     processes
                         .iter()
-                        .map(|p| format!("devenv:processes:{}", p))
+                        .map(|p| format!("{}{}", devenv_tasks::PROCESS_TASK_PREFIX, p))
                         .collect()
                 };
 
@@ -1753,19 +1689,24 @@ impl Devenv {
                 .await
                 .map_err(|e| miette!("Failed to build task runner: {}", e))?;
 
-                let command_rx = options.command_rx.take();
+                // Start command processing before task execution so that
+                // Ctrl-R works even while tasks are still running (e.g. when
+                // a process task is waiting on an auto start off dependency).
+                if let Some(rx) = options.command_rx.take() {
+                    tasks_runner.process_manager.start_command_listener(rx);
+                }
 
                 // Run process tasks under the Phase 4 activity.
-                // Disabled processes (start.enable = false) are handled by the
+                // Auto start off processes (start.enable = false) are handled by the
                 // process manager: they appear in the TUI as stopped.
                 debug!("devenv.up: running process tasks (run_with_parent_activity)");
                 let _outputs = tasks_runner
                     .run_with_parent_activity(Arc::new(phase4))
                     .await;
-                debug!("devenv.up: process tasks completed, starting API server");
+                debug!("devenv.up: process tasks completed");
 
-                // Start the API server so process IPC (status, restart, etc.) works
-                tasks_runner.process_manager.start_api_server()?;
+                // API server is started inside run_internal() so it's available
+                // while processes are still starting up.
 
                 let pid_file = tasks_runner.process_manager.manager_pid_file();
                 processes::write_pid(&pid_file, std::process::id())
@@ -1779,7 +1720,7 @@ impl Devenv {
                     );
                     let result = tasks_runner
                         .process_manager
-                        .run_foreground(self.shutdown.cancellation_token(), command_rx)
+                        .run_foreground(self.shutdown.cancellation_token(), None)
                         .await
                         .map_err(|e| miette!("Process manager error: {}", e));
                     debug!("devenv.up: run_foreground returned");
@@ -1952,6 +1893,7 @@ impl Devenv {
             // Log warning when secretspec.toml exists but is not configured
             if !secretspec_enabled && !secretspec_config_exists {
                 info!(
+                    devenv.is_user_message = true,
                     "{}",
                     indoc::formatdoc! {"
                     Found secretspec.toml but secretspec integration is not enabled.
@@ -2051,11 +1993,7 @@ impl Devenv {
                 .map(|resolved| SecretspecData {
                     profile: resolved.profile.clone(),
                     provider: resolved.provider.clone(),
-                    secrets: resolved
-                        .secrets
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect(),
+                    secrets: resolved.secrets.clone().into_iter().collect(),
                 });
 
         let active_profiles = &self.shell_settings.profiles;
@@ -2183,7 +2121,7 @@ impl Devenv {
             self.devenv_dotfile.join("input-paths.txt"),
             env.inputs
                 .iter()
-                .map(|path| path.to_string_lossy().to_string())
+                .map(|path| path.to_string_lossy().into_owned())
                 .collect::<Vec<_>>()
                 .join("\n"),
         )?;
@@ -2198,6 +2136,34 @@ impl Devenv {
     #[activity("Configuring shell")]
     pub async fn get_dev_environment(&self, json: bool) -> Result<DevEnv> {
         self.get_dev_environment_inner(json).await
+    }
+}
+
+/// Run tasks, dispatching to TUI mode (direct run) or shell mode (with TasksUi).
+///
+/// In TUI mode the activity channel is already set up in main.rs, so tasks run
+/// directly and status is read afterwards. In shell mode we initialise a local
+/// activity channel and drive TasksUi for interactive output.
+async fn run_tasks_with_ui(
+    tasks: Tasks,
+    verbosity: tasks::VerbosityLevel,
+    tui: bool,
+) -> Result<(tasks::TasksStatus, tasks::Outputs)> {
+    if tui {
+        let outputs = tasks.run(false).await;
+        let status = tasks.get_completion_status().await;
+        Ok((status, outputs))
+    } else {
+        let (activity_rx, activity_handle) = devenv_activity::init();
+        let _activity_guard = activity_handle.install();
+
+        let tasks = Arc::new(tasks);
+        let tasks_clone = Arc::clone(&tasks);
+
+        let run_handle = tokio::spawn(async move { tasks_clone.run(false).await });
+
+        let ui = TasksUi::new(Arc::clone(&tasks), activity_rx, verbosity);
+        Ok(ui.run(run_handle).await?)
     }
 }
 

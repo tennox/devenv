@@ -9,7 +9,7 @@ use crate::pty::{Pty, PtyError, get_terminal_size};
 use crate::status_line::{SPINNER_INTERVAL_MS, StatusLine};
 use crate::terminal::RawModeGuard;
 use crate::terminal_commands::{
-    CursorPositionQuery, ORIGIN_MODE, ReportTextAreaSize, ResetDecMode, ResetModifyOtherKeys,
+    InBandResizeNotification, ORIGIN_MODE, ReportTextAreaSize, ResetDecMode, ResetModifyOtherKeys,
     ResetScrollRegion, SetKeypadMode, SetScrollRegion,
 };
 use crate::utf8_accumulator::Utf8Accumulator;
@@ -28,7 +28,7 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 /// Keybind byte sequences (ESC + Ctrl key).
 const KEYBIND_TOGGLE_PAUSE: [u8; 2] = [0x1b, 0x04]; // Ctrl-Alt-D
@@ -58,6 +58,8 @@ struct EscapeState {
     kitty_keyboard_depth: u32,
     /// XTMODIFYOTHERKEYS is enabled.
     modify_other_keys: bool,
+    /// Mode 2048 (in-band resize) is enabled by the PTY program.
+    in_band_resize: bool,
 }
 
 impl EscapeState {
@@ -70,6 +72,7 @@ impl EscapeState {
             clear_scrollback: false,
             kitty_keyboard_depth: 0,
             modify_other_keys: false,
+            in_band_resize: false,
         }
     }
 
@@ -77,6 +80,60 @@ impl EscapeState {
     fn reset_batch(&mut self) {
         self.erase_display = false;
         self.clear_scrollback = false;
+    }
+
+    /// Apply a DEC mode event, updating tracked state.
+    /// Returns the raw bytes to forward to stdout (empty if mode isn't forwarded).
+    fn apply_dec_mode<'a>(&mut self, event: &'a DecModeEvent) -> &'a [u8] {
+        if event.enables_in_band_resize() {
+            self.in_band_resize = true;
+        } else if event.disables_in_band_resize() {
+            self.in_band_resize = false;
+        }
+
+        if !event.has_forwarded_mode() {
+            return &[];
+        }
+
+        if event.enters_alt_screen() {
+            self.in_alternate_screen = true;
+        } else if event.exits_alt_screen() {
+            self.in_alternate_screen = false;
+        }
+
+        match event {
+            DecModeEvent::Set { modes, .. } => {
+                for &m in modes {
+                    if CLEANUP_MODES.contains(&m) {
+                        self.forwarded_dec_modes.insert(m);
+                    }
+                }
+            }
+            DecModeEvent::Reset { modes, .. } => {
+                for m in modes {
+                    self.forwarded_dec_modes.remove(m);
+                }
+            }
+        }
+
+        event.raw_bytes()
+    }
+
+    /// Apply a kitty keyboard push/pop/set event.
+    fn apply_kitty_keyboard(&mut self, stack_delta: i8) {
+        if stack_delta > 0 {
+            self.kitty_keyboard_depth =
+                self.kitty_keyboard_depth.saturating_add(stack_delta as u32);
+        } else if stack_delta < 0 {
+            self.kitty_keyboard_depth = self
+                .kitty_keyboard_depth
+                .saturating_sub(stack_delta.unsigned_abs() as u32);
+        }
+    }
+
+    /// Apply an XTMODIFYOTHERKEYS set/reset event.
+    fn apply_modify_other_keys(&mut self, enabled: bool) {
+        self.modify_other_keys = enabled;
     }
 }
 
@@ -550,7 +607,7 @@ pub enum SessionError {
 /// terminal ownership with the TUI.
 pub struct TuiHandoff {
     /// Signal when backend work is done (TUI can exit).
-    pub backend_done_tx: oneshot::Sender<()>,
+    pub backend_done: Arc<Notify>,
     /// Wait for TUI to release terminal. Receives the TUI's final render height.
     pub terminal_ready_rx: oneshot::Receiver<u16>,
 }
@@ -667,13 +724,13 @@ impl ShellSession {
             }
             Some(ShellCommand::Shutdown) | None => {
                 if let Some(h) = handoff {
-                    let _ = h.backend_done_tx.send(());
+                    h.backend_done.notify_one();
                 }
                 return Ok(None);
             }
             Some(other) => {
                 if let Some(h) = handoff {
-                    let _ = h.backend_done_tx.send(());
+                    h.backend_done.notify_one();
                 }
                 return Err(SessionError::UnexpectedCommand(format!("{:?}", other)));
             }
@@ -692,8 +749,8 @@ impl ShellSession {
         // Handle TUI handoff if present
         if let Some(handoff) = handoff {
             // Signal TUI that initial build is complete and we're ready for terminal
-            tracing::trace!("session: sending backend_done_tx");
-            let _ = handoff.backend_done_tx.send(());
+            tracing::trace!("session: sending backend_done");
+            handoff.backend_done.notify_one();
 
             // Wait for TUI to release terminal
             tracing::trace!("session: waiting for terminal_ready_rx");
@@ -715,41 +772,16 @@ impl ShellSession {
         // This tells us where TUI left the cursor after its final render.
         // Skip when stdin is injected (not a real terminal) — the response comes
         // via stdin, so this would hang if stdin is not a TTY.
+        // crossterm::cursor::position() handles the DSR query, parsing, and has a
+        // built-in 2s timeout for environments that don't respond (Docker, CI).
         let cursor_row = if !injected_stdin && io::stdin().is_terminal() {
-            queue!(stdout, CursorPositionQuery)?;
-            stdout.flush()?;
-
-            let mut response = Vec::new();
-            let mut stdin_real = io::stdin();
-            let mut buf = [0u8; 1];
-            loop {
-                match stdin_real.read(&mut buf) {
-                    Ok(0) => break, // EOF
-                    Ok(_) if buf[0] != 0 => {
-                        response.push(buf[0]);
-                        if buf[0] == b'R' {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                    _ => {}
-                }
-                if response.len() > 20 {
-                    break;
+            match crossterm::cursor::position() {
+                Ok((_col, row)) => row + 1, // crossterm returns 0-based, we need 1-based
+                Err(e) => {
+                    tracing::debug!("session: cursor position query failed: {e}, assuming row 1");
+                    1
                 }
             }
-
-            // Parse cursor row from response: ESC [ row ; col R
-            response
-                .iter()
-                .position(|&b| b == b'[')
-                .and_then(|start| {
-                    let s = String::from_utf8_lossy(
-                        &response[start + 1..response.len().saturating_sub(1)],
-                    );
-                    s.split(';').next()?.parse::<u16>().ok()
-                })
-                .unwrap_or(1)
         } else {
             1
         };
@@ -1155,6 +1187,20 @@ impl ShellSession {
                         let pty_size = self.pty_size();
                         renderer.content_rows = pty_size.rows;
                         let _ = pty.resize(pty_size);
+                        // Send a mode 2048 in-band resize notification
+                        // through the PTY, but only if the program has
+                        // enabled mode 2048. Sending it unconditionally
+                        // causes shells that don't understand it to display
+                        // the raw escape sequence as input text.
+                        if esc.in_band_resize {
+                            let cmd = InBandResizeNotification {
+                                rows: pty_size.rows,
+                                cols: pty_size.cols,
+                            };
+                            let mut buf = String::new();
+                            cmd.write_ansi(&mut buf).unwrap();
+                            let _ = pty.write_all(buf.as_bytes());
+                        }
                         vt.resize(pty_size.cols as usize, pty_size.rows as usize);
                         renderer.mark_scrollback_flushed(vt);
                         renderer.render_full(stdout, vt)?;
@@ -1259,30 +1305,9 @@ impl ShellSession {
         for event in events_buf.drain(..) {
             match event {
                 SequenceEvent::DecMode(event) => {
-                    if !event.has_forwarded_mode() {
-                        continue;
-                    }
-                    stdout.write_all(event.raw_bytes())?;
-
-                    if event.enters_alt_screen() {
-                        esc.in_alternate_screen = true;
-                    } else if event.exits_alt_screen() {
-                        esc.in_alternate_screen = false;
-                    }
-
-                    match &event {
-                        DecModeEvent::Set { modes, .. } => {
-                            for &m in modes {
-                                if CLEANUP_MODES.contains(&m) {
-                                    esc.forwarded_dec_modes.insert(m);
-                                }
-                            }
-                        }
-                        DecModeEvent::Reset { modes, .. } => {
-                            for m in modes {
-                                esc.forwarded_dec_modes.remove(m);
-                            }
-                        }
+                    let forward = esc.apply_dec_mode(&event);
+                    if !forward.is_empty() {
+                        stdout.write_all(forward)?;
                     }
                 }
                 SequenceEvent::Osc(event) => {
@@ -1313,19 +1338,11 @@ impl ShellSession {
                     stack_delta,
                 } => {
                     stdout.write_all(&raw_bytes)?;
-                    if stack_delta > 0 {
-                        esc.kitty_keyboard_depth =
-                            esc.kitty_keyboard_depth.saturating_add(stack_delta as u32);
-                    } else if stack_delta < 0 {
-                        esc.kitty_keyboard_depth = esc
-                            .kitty_keyboard_depth
-                            .saturating_sub((-stack_delta) as u32);
-                    }
-                    // stack_delta == 0 is "set" — depth stays the same
+                    esc.apply_kitty_keyboard(stack_delta);
                 }
                 SequenceEvent::ModifyOtherKeys { raw_bytes, enabled } => {
                     stdout.write_all(&raw_bytes)?;
-                    esc.modify_other_keys = enabled;
+                    esc.apply_modify_other_keys(enabled);
                 }
                 SequenceEvent::TextAreaSizeQuery => {
                     // Respond with PTY dimensions so programs see the correct
@@ -1482,5 +1499,125 @@ mod tests {
         let mut f = StdinFilter::new();
         // Text followed by bare Esc at end of chunk
         assert_eq!(f.filter(b"abc\x1b"), &[b'a', b'b', b'c', 0x1b]);
+    }
+
+    /// Feed raw bytes through scanner and apply events to state.
+    /// Returns bytes that would be forwarded to stdout.
+    fn scan_and_apply(scanner: &mut EscapeScanner, esc: &mut EscapeState, input: &[u8]) -> Vec<u8> {
+        let events = scanner.scan(input);
+        let mut forwarded = Vec::new();
+        for event in &events {
+            match event {
+                SequenceEvent::DecMode(ev) => forwarded.extend_from_slice(esc.apply_dec_mode(ev)),
+                SequenceEvent::KittyKeyboard { stack_delta, .. } => {
+                    esc.apply_kitty_keyboard(*stack_delta);
+                }
+                SequenceEvent::ModifyOtherKeys { enabled, .. } => {
+                    esc.apply_modify_other_keys(*enabled);
+                }
+                _ => {}
+            }
+        }
+        forwarded
+    }
+
+    #[test]
+    fn in_band_resize_tracked_on_opt_in() {
+        let mut scanner = EscapeScanner::new();
+        let mut esc = EscapeState::new();
+        let forwarded = scan_and_apply(&mut scanner, &mut esc, b"\x1b[?2048h");
+        assert!(esc.in_band_resize);
+        assert!(forwarded.is_empty(), "mode 2048 should not be forwarded");
+    }
+
+    #[test]
+    fn in_band_resize_cleared_on_opt_out() {
+        let mut scanner = EscapeScanner::new();
+        let mut esc = EscapeState::new();
+        scan_and_apply(&mut scanner, &mut esc, b"\x1b[?2048h");
+        assert!(esc.in_band_resize);
+        scan_and_apply(&mut scanner, &mut esc, b"\x1b[?2048l");
+        assert!(!esc.in_band_resize);
+    }
+
+    #[test]
+    fn in_band_resize_compound_mode() {
+        let mut scanner = EscapeScanner::new();
+        let mut esc = EscapeState::new();
+        // Mode 1 (DECCKM) is forwarded, mode 2048 is not
+        let forwarded = scan_and_apply(&mut scanner, &mut esc, b"\x1b[?1;2048h");
+        assert!(esc.in_band_resize);
+        assert!(!forwarded.is_empty(), "mode 1 should be forwarded");
+    }
+
+    #[test]
+    fn alt_screen_enter_exit() {
+        let mut scanner = EscapeScanner::new();
+        let mut esc = EscapeState::new();
+        scan_and_apply(&mut scanner, &mut esc, b"\x1b[?1049h");
+        assert!(esc.in_alternate_screen);
+        // Alt screen modes are not in CLEANUP_MODES (cleaned up via LeaveAlternateScreen)
+
+        scan_and_apply(&mut scanner, &mut esc, b"\x1b[?1049l");
+        assert!(!esc.in_alternate_screen);
+    }
+
+    #[test]
+    fn alt_screen_all_variants() {
+        for mode in [47, 1047, 1049] {
+            let mut scanner = EscapeScanner::new();
+            let mut esc = EscapeState::new();
+            let seq = format!("\x1b[?{}h", mode);
+            scan_and_apply(&mut scanner, &mut esc, seq.as_bytes());
+            assert!(
+                esc.in_alternate_screen,
+                "mode {} should enter alt screen",
+                mode
+            );
+        }
+    }
+
+    #[test]
+    fn forwarded_modes_accumulate() {
+        let mut scanner = EscapeScanner::new();
+        let mut esc = EscapeState::new();
+        scan_and_apply(&mut scanner, &mut esc, b"\x1b[?1000h");
+        scan_and_apply(&mut scanner, &mut esc, b"\x1b[?2004h");
+        assert!(esc.forwarded_dec_modes.contains(&1000));
+        assert!(esc.forwarded_dec_modes.contains(&2004));
+    }
+
+    #[test]
+    fn non_forwarded_mode_no_stdout() {
+        let mut scanner = EscapeScanner::new();
+        let mut esc = EscapeState::new();
+        let forwarded = scan_and_apply(&mut scanner, &mut esc, b"\x1b[?2048h");
+        assert!(forwarded.is_empty());
+    }
+
+    #[test]
+    fn kitty_keyboard_depth_tracking() {
+        let mut scanner = EscapeScanner::new();
+        let mut esc = EscapeState::new();
+        // Push (CSI > u)
+        scan_and_apply(&mut scanner, &mut esc, b"\x1b[>1u");
+        assert_eq!(esc.kitty_keyboard_depth, 1);
+        scan_and_apply(&mut scanner, &mut esc, b"\x1b[>1u");
+        assert_eq!(esc.kitty_keyboard_depth, 2);
+        // Pop (CSI < u)
+        scan_and_apply(&mut scanner, &mut esc, b"\x1b[<u");
+        assert_eq!(esc.kitty_keyboard_depth, 1);
+    }
+
+    #[test]
+    fn modify_other_keys_tracking() {
+        let mut scanner = EscapeScanner::new();
+        let mut esc = EscapeState::new();
+        // CSI > 4 m — enable
+        scan_and_apply(&mut scanner, &mut esc, b"\x1b[>4m");
+        assert!(esc.modify_other_keys);
+        // CSI > 0 m — disable
+        scan_and_apply(&mut scanner, &mut esc, b"\x1b[>0m");
+        assert!(!esc.modify_other_keys);
     }
 }

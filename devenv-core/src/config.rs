@@ -133,6 +133,23 @@ pub struct Clean {
     // TODO: executables?
 }
 
+impl Clean {
+    /// Return host environment variables filtered by the clean/keep settings.
+    ///
+    /// When `enabled`, only variables whose name appears in `keep` are
+    /// returned. Otherwise every host variable is returned.
+    pub fn kept_env_vars(&self) -> HashMap<String, String> {
+        let vars = std::env::vars();
+        if self.enabled {
+            let keep: HashSet<&str> = self.keep.iter().map(|s| s.as_str()).collect();
+            vars.filter(|(key, _)| keep.contains(key.as_str()))
+                .collect()
+        } else {
+            vars.collect()
+        }
+    }
+}
+
 #[derive(schematic::Config, Clone, Serialize, Debug, JsonSchema)]
 #[config(rename_all = "camelCase", allow_unknown_fields)]
 #[serde(rename_all = "camelCase")]
@@ -189,6 +206,9 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     #[setting(merge = schematic::merge::replace)]
     pub reload: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[setting(merge = schematic::merge::replace)]
+    pub strict_ports: Option<bool>,
     /// Git repository root path (not serialized, computed during load)
     #[serde(skip)]
     pub git_root: Option<PathBuf>,
@@ -1048,6 +1068,40 @@ mod tests {
         // The second value should override the first
         let merged_profile = config2.profile.or(config1.profile);
         assert_eq!(merged_profile, Some("override".to_string()));
+    }
+
+    #[test]
+    fn strict_ports_field_none_by_default() {
+        let config = Config::default();
+        assert_eq!(config.strict_ports, None);
+    }
+
+    #[test]
+    fn strict_ports_field_serializes_as_camel_case() {
+        let mut config = Config::default();
+        config.strict_ports = Some(true);
+
+        let yaml = serde_yaml::to_string(&config).expect("Failed to serialize config");
+        assert!(yaml.contains("strictPorts: true"));
+    }
+
+    #[test]
+    fn strict_ports_field_not_serialized_when_none() {
+        let config = Config::default();
+        let yaml = serde_yaml::to_string(&config).expect("Failed to serialize config");
+        assert!(!yaml.contains("strictPorts"));
+    }
+
+    #[test]
+    fn strict_ports_field_respects_replace_merge_strategy() {
+        let mut config1 = Config::default();
+        config1.strict_ports = Some(false);
+
+        let mut config2 = Config::default();
+        config2.strict_ports = Some(true);
+
+        let merged_strict_ports = config2.strict_ports.or(config1.strict_ports);
+        assert_eq!(merged_strict_ports, Some(true));
     }
 
     #[test]

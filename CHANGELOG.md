@@ -2,15 +2,58 @@
 
 ## X.Y.Z (YYYY-MM-DD)
 
+### Improvements
+
+- Patched Nix to avoid hitting GitHub rate limits when fetching flake inputs (upstreamed as [NixOS/nix#15470](https://github.com/NixOS/nix/pull/15470)).
+- Improved eval performance by caching the initial Nix Value, avoiding re-evaluation of nixpkgs and the module system on subsequent attribute lookups (~2x time-to-shell improvement).
+- `devenv-run-tests`: `--only` and `--exclude` now support glob patterns (e.g. `--only 'python-*'`).
+
 ### Bug Fixes
 
+- Fixed `exec_if_modified` performance when negation patterns were used, avoiding a full walk of the parent directory for literal file paths.
+- Fixed child processes (postgres, redis, etc.) being left running after `devenv up` exits or `devenv processes down` is called. The native manager wrapper now forwards TERM/INT signals to the child process group, and the process-compose backend creates a proper process group for signaling ([#2619](https://github.com/cachix/devenv/issues/2619)).
+- Fixed secretspec prompting for secrets in non-interactive contexts like direnv.
+- Fixed `devenv search` showing truncated package names (e.g. `pkgs.` instead of `pkgs.ncdu`).
+- Fixed TUI hanging when the backend encounters an error in the PTY shell path (e.g. Nix evaluation failure).
+- Fixed `nix run` trying to run `devenv-wrapped` which doesn't exist.
+- Fixed in-band resize events being sent to the shell when the app did not opt-in to receiving them.
+- Fixed a packaging error in nixpkgs that resulted in the macOS builds of devenv to include two conflicting copies of the Boehm GC (#2552, #2576).
+- Fixed `devenv init`, `devenv test`, and secretspec hint messages being silently dropped due to missing user-message marker.
+
+## 2.0.4 (2026-03-11)
+
+### Bug Fixes
+
+- Fixed `files` and other task-based features not working via direnv in devenv v2 because `devenv direnv-export` did not run enterShell tasks ([#2602](https://github.com/cachix/devenv/issues/2602)).
+- Fixed `devenv shell` hanging in certain CI environments by requiring both stdin and stdout to be a real terminal before launching the PTY reload shell ([#2597](https://github.com/cachix/devenv/issues/2597)).
+- Added a timeout to the terminal cursor position query to prevent hangs in PTY environments that don't respond to DSR queries.
+- Fixed process dependencies not being respected in the native process manager ([#2554](https://github.com/cachix/devenv/issues/2554)).
+- Fixed `execIfModified` task cache not invalidating when a previously watched file is deleted, renamed, or moved outside the glob pattern ([#2577](https://github.com/cachix/devenv/issues/2577)).
 - Fixed task exports (e.g. `VIRTUAL_ENV`, `PATH` from venv) not being set in the reload shell.
 - Fixed port allocation not detecting ports bound to `0.0.0.0` or `[::]`, causing multiple devenv instances to allocate the same port ([#2567](https://github.com/cachix/devenv/issues/2567)).
 - Fixed cursor position requests not being passed through in the shell ([#2570](https://github.com/cachix/devenv/issues/2570)).
+- Fixed "Threads explicit registering is not previously enabled" crash on some Nix versions by calling `GC_allow_register_threads()` after `libexpr_init()` ([#2576](https://github.com/cachix/devenv/issues/2576)).
+- Fixed `-O packages:pkgs` causing infinite recursion by using NixOS module system merging instead of self-referencing `config.packages`.
+- Fixed `--clean` shell environment capture keeping all host variables except the keep list (inverted filter).
+- Fixed `devenv search` output being drawn directly to stdout over the TUI.
+- Fixed the shell not forwarding several terminal escape sequences (DA2, DA3, XTVERSION, DCS, DECRQM, Kitty keyboard protocol, XTMODIFYOTHERKEYS, mouse modes, and color scheme reporting), which broke TUI programs like neovim and helix.
+- Fixed the shell not cleaning up Kitty keyboard protocol and XTMODIFYOTHERKEYS state on exit, which left the terminal in a broken state after a program crash.
+- Fixed the shell not sending in-band resize notifications (mode 2048) through the PTY, which caused programs that rely on this protocol to miss resize events.
+- Fixed the shell forwarding text area size queries (CSI 18 t) to the real terminal, which returned incorrect dimensions that included the status line row.
+- Fixed the devenv main thread and REPL thread using the default stack size instead of 64MB, which could cause stack overflows during deep Nix evaluations.
+- Fixed TUI sometimes overwriting the shell prompt/command line after commands like `devenv update`, caused by cancelling iocraft's render loop mid-frame.
 
 ### Improvements
 
+- Added `strictPorts` option to `devenv.yaml` for configuring strict port mode as a project default, along with `--no-strict-ports` CLI flag to override it ([#2606](https://github.com/cachix/devenv/issues/2606)).
+- Bumped secretspec to 0.8.0 and enabled all provider features (Google Cloud Secret Manager, AWS Secrets Manager, HashiCorp Vault).
+- Replaced stdout based `DEVENV_EXPORT:` protocol in tasks with file based exports (`$DEVENV_TASK_EXPORTS_FILE`), simplifying the encoding and moving JSON construction into Rust.
+- Task exports are now always produced, including when a task is skipped via its `status` command.
+- Validation errors for `@ready` process dependencies now include a link to the documentation.
+
 ### Breaking Changes
+
+- Removed `devenv-tasks export` subcommand, replaced by file-based exports via `$DEVENV_TASK_EXPORTS_FILE`.
 
 ## 2.0.3 (2026-03-06)
 
