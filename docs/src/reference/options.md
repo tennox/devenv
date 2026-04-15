@@ -3969,6 +3969,30 @@ null
 
 
 
+## git.lfs.enable
+
+
+
+Enable Git Large File Storage (LFS).
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+
+```nix
+false
+```
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/integrations/git.nix](https://github.com/cachix/devenv/blob/main/src/modules/integrations/git.nix)
+
+
+
 ## git.root
 
 
