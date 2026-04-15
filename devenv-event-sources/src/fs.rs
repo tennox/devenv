@@ -8,6 +8,10 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 use watchexec::{Config, WatchedPath};
+use watchexec_events::{
+    Tag,
+    filekind::{FileEventKind, ModifyKind},
+};
 use watchexec_filterer_globset::GlobsetFilterer;
 
 #[derive(Debug, Clone)]
@@ -65,10 +69,59 @@ impl WatcherHandle {
 
         {
             let mut paths = self.watched_paths.lock().unwrap();
-            if !paths.insert(canonical) {
+            if !paths.insert(canonical.clone()) {
                 return;
             }
 
+            if let Some(ref config) = self.config {
+                config.pathset(
+                    paths
+                        .iter()
+                        .map(|p| WatchedPath::non_recursive(p.as_path())),
+                );
+            }
+        }
+
+        if let Some(ref mut rx) = ready {
+            let _ = rx.changed().await;
+        }
+    }
+
+    /// Force all watched paths to be re-registered with the OS.
+    ///
+    /// On Linux, inotify watches track file inodes. When an editor does an
+    /// atomic save (write temp + rename), the inode changes and the old watch
+    /// becomes stale. The watchexec fs worker's diff logic skips paths already
+    /// in its pathset, so stale watches are never refreshed.
+    ///
+    /// This method forces a full refresh by briefly clearing the pathset
+    /// (causing the fs worker to drop all watches) and then re-setting it
+    /// (causing fresh watches to be created on current inodes).
+    pub async fn rewatch_all(&self) {
+        let mut ready = self.config.as_ref().map(|c| c.fs_ready());
+
+        {
+            let paths = self.watched_paths.lock().unwrap();
+            if paths.is_empty() {
+                return;
+            }
+
+            if let Some(ref config) = self.config {
+                // Clear forces the fs worker to unwatch everything
+                config.pathset(std::iter::empty::<WatchedPath>());
+            }
+        }
+
+        // Wait for the clear to be processed
+        if let Some(ref mut rx) = ready {
+            let _ = rx.changed().await;
+        }
+
+        // Now re-subscribe for the re-add
+        let mut ready = self.config.as_ref().map(|c| c.fs_ready());
+
+        {
+            let paths = self.watched_paths.lock().unwrap();
             if let Some(ref config) = self.config {
                 config.pathset(
                     paths
@@ -262,9 +315,20 @@ impl FileWatcher {
                     if !filterer.check_event(event, *priority).unwrap_or(true) {
                         continue;
                     }
+                    if !is_restart_worthy_event(event) {
+                        continue;
+                    }
                     for (path, _) in event.paths() {
                         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-                        let _ = watch_tx.try_send(FileChangeEvent { path: canonical });
+                        // Use send().await instead of try_send to apply backpressure
+                        // rather than silently dropping events when the channel is full.
+                        if watch_tx
+                            .send(FileChangeEvent { path: canonical })
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
                     }
                 }
             }
@@ -290,17 +354,81 @@ impl FileWatcher {
     pub async fn recv(&mut self) -> Option<FileChangeEvent> {
         self.rx.recv().await
     }
+
+    pub fn try_recv(&mut self) -> Result<FileChangeEvent, tokio::sync::mpsc::error::TryRecvError> {
+        self.rx.try_recv()
+    }
+}
+
+fn is_restart_worthy_event(event: &watchexec_events::Event) -> bool {
+    event.tags.iter().any(|tag| match tag {
+        Tag::FileEventKind(kind) => is_restart_worthy_kind(kind),
+        _ => false,
+    })
+}
+
+fn is_restart_worthy_kind(kind: &FileEventKind) -> bool {
+    match kind {
+        FileEventKind::Create(_)
+        | FileEventKind::Remove(_)
+        | FileEventKind::Any
+        | FileEventKind::Other => true,
+        FileEventKind::Modify(ModifyKind::Any | ModifyKind::Data(_) | ModifyKind::Name(_)) => true,
+        FileEventKind::Access(_) | FileEventKind::Modify(_) => false,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::fs::File;
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::time::Duration;
     use tempfile::TempDir;
 
     const WATCH_TIMEOUT: Duration = Duration::from_secs(30);
+    const NO_EVENT_TIMEOUT: Duration = Duration::from_millis(500);
+
+    async fn assert_no_event(watcher: &mut FileWatcher, context: &str) {
+        let result = tokio::time::timeout(NO_EVENT_TIMEOUT, watcher.recv()).await;
+        assert!(
+            result.is_err(),
+            "unexpected file watcher event for {context}"
+        );
+    }
+
+    #[test]
+    fn test_restart_worthy_kind_filter() {
+        use watchexec_events::filekind::{
+            AccessKind, AccessMode, CreateKind, DataChange, MetadataKind, RemoveKind, RenameMode,
+        };
+
+        assert!(is_restart_worthy_kind(&FileEventKind::Create(
+            CreateKind::File
+        )));
+        assert!(is_restart_worthy_kind(&FileEventKind::Remove(
+            RemoveKind::File
+        )));
+        assert!(is_restart_worthy_kind(&FileEventKind::Modify(
+            ModifyKind::Data(DataChange::Any,)
+        )));
+        assert!(is_restart_worthy_kind(&FileEventKind::Modify(
+            ModifyKind::Name(RenameMode::Any,)
+        )));
+        assert!(is_restart_worthy_kind(&FileEventKind::Modify(
+            ModifyKind::Any
+        )));
+        assert!(is_restart_worthy_kind(&FileEventKind::Any));
+        assert!(is_restart_worthy_kind(&FileEventKind::Other));
+
+        assert!(!is_restart_worthy_kind(&FileEventKind::Access(
+            AccessKind::Open(AccessMode::Read,)
+        )));
+        assert!(!is_restart_worthy_kind(&FileEventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::Any),
+        )));
+    }
 
     #[tokio::test]
     async fn test_detects_file_modification() {
@@ -533,5 +661,145 @@ mod tests {
                 Err(_) => panic!("timeout waiting for runtime file change event"),
             }
         }
+    }
+
+    /// Reproduces the devenv hot-reload scenario:
+    /// watcher starts with NO initial paths, ALL paths added via handle,
+    /// then a file is modified in-place (preserving inode).
+    #[tokio::test]
+    async fn test_empty_watcher_with_handle_paths() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let base = temp_dir.path().canonicalize().expect("canonicalize");
+
+        let file1 = base.join("devenv.nix");
+        let file2 = base.join("devenv.lock");
+
+        File::create(&file1)
+            .expect("create")
+            .write_all(b"initial content")
+            .expect("write");
+        File::create(&file2)
+            .expect("create")
+            .write_all(b"lock content")
+            .expect("write");
+
+        // Create watcher with NO initial paths (like devenv reload does)
+        let mut watcher = FileWatcher::new(
+            FileWatcherConfig {
+                paths: &[],
+                recursive: false,
+                ..Default::default()
+            },
+            "test-empty",
+        )
+        .await;
+
+        let handle = watcher.handle();
+
+        // Add paths via handle (like add_watch_paths_from_cache does)
+        handle.watch(&file1).await;
+        handle.watch(&file2).await;
+
+        // Modify file in-place (like swap.sh does with > redirection)
+        std::fs::write(&file1, "modified content").expect("write");
+
+        let event = tokio::time::timeout(WATCH_TIMEOUT, watcher.recv())
+            .await
+            .expect("timeout waiting for event")
+            .expect("event");
+
+        assert_eq!(event.path, file1);
+    }
+
+    #[tokio::test]
+    async fn test_read_only_access_does_not_emit_change_event() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let base = temp_dir.path().canonicalize().expect("canonicalize");
+        let file_path = base.join("artifact.jar");
+
+        fs::write(&file_path, b"pretend jar bytes").expect("write file");
+
+        let paths = vec![file_path.clone()];
+        let mut watcher = FileWatcher::new(
+            FileWatcherConfig {
+                paths: &paths,
+                recursive: false,
+                ..Default::default()
+            },
+            "read-only-access",
+        )
+        .await;
+
+        let mut contents = Vec::new();
+        File::open(&file_path)
+            .expect("open file")
+            .read_to_end(&mut contents)
+            .expect("read file");
+        assert_eq!(contents, b"pretend jar bytes");
+
+        assert_no_event(&mut watcher, "read-only file access").await;
+    }
+
+    #[tokio::test]
+    async fn test_directory_listing_does_not_emit_change_event_for_children() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let watch_dir = temp_dir.path().canonicalize().expect("canonicalize");
+        let jar1 = watch_dir.join("app.jar");
+        let jar2 = watch_dir.join("lib.jar");
+
+        fs::write(&jar1, b"jar one").expect("write jar1");
+        fs::write(&jar2, b"jar two").expect("write jar2");
+
+        let paths = vec![watch_dir.clone()];
+        let mut watcher = FileWatcher::new(
+            FileWatcherConfig {
+                paths: &paths,
+                recursive: true,
+                ..Default::default()
+            },
+            "directory-listing",
+        )
+        .await;
+
+        let entries: Vec<_> = fs::read_dir(&watch_dir)
+            .expect("read dir")
+            .map(|entry| entry.expect("dir entry").file_name())
+            .collect();
+        assert_eq!(entries.len(), 2);
+
+        assert_no_event(&mut watcher, "directory listing").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_metadata_only_chmod_does_not_emit_change_event() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let base = temp_dir.path().canonicalize().expect("canonicalize");
+        let file_path = base.join("artifact.jar");
+
+        fs::write(&file_path, b"pretend jar bytes").expect("write file");
+
+        let paths = vec![file_path.clone()];
+        let mut watcher = FileWatcher::new(
+            FileWatcherConfig {
+                paths: &paths,
+                recursive: false,
+                ..Default::default()
+            },
+            "chmod-only",
+        )
+        .await;
+
+        let mut perms = fs::metadata(&file_path).expect("metadata").permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(&file_path, perms).expect("set perms 600");
+
+        let mut perms = fs::metadata(&file_path).expect("metadata").permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&file_path, perms).expect("set perms 644");
+
+        assert_no_event(&mut watcher, "metadata-only chmod").await;
     }
 }

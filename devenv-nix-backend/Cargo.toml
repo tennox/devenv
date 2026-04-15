@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-blake3.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
 cstr.workspace = true
@@ -36,6 +35,7 @@ nix-bindings-fetchers.workspace = true
 nix-bindings-bindgen-raw.workspace = true
 nix-cmd.workspace = true
 tempfile.workspace = true
+which.workspace = true
 
 [dev-dependencies]
 devenv-nix-backend-macros.workspace = true

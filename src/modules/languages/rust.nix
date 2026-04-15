@@ -81,6 +81,62 @@ in
       '';
     };
 
+    lld.enable = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Use [lld](https://lld.llvm.org/) as the linker.
+
+        lld is LLVM's linker and is the recommended fast linker for Darwin.
+        Works on both Linux and macOS.
+      '';
+    };
+
+    wild.enable = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Use [wild](https://github.com/wild-linker/wild) as the linker.
+
+        wild is a very fast linker for Linux.
+      '';
+    };
+
+    cranelift = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Use [Cranelift](https://cranelift.dev/) as the codegen backend for dev builds.
+
+          Cranelift compiles significantly faster than LLVM at the cost of less optimized output.
+          Requires the nightly channel.
+        '';
+      };
+
+      forceBuildScriptsLlvm = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Force build scripts and proc macros to use the LLVM backend.
+
+          Some build scripts may not work with Cranelift. Enable this to fall back to
+          LLVM for build scripts while keeping Cranelift for regular code.
+        '';
+      };
+
+      excludePackages = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        description = ''
+          List of crate names that should use the LLVM backend instead of Cranelift.
+
+          Generates per-package overrides in `.cargo/config.toml`.
+        '';
+        example = [ "aws-lc-sys" "aws-lc-rs" "rustls" ];
+      };
+    };
+
     lsp = {
       enable = lib.mkEnableOption "Rust Language Server" // { default = true; };
       package = lib.mkOption {
@@ -220,6 +276,29 @@ in
       {
         assertions = [
           {
+            assertion = cfg.cranelift.enable -> cfg.channel == "nightly";
+            message = ''
+              `languages.rust.cranelift.enable` requires `languages.rust.channel = "nightly"`.
+
+              Cranelift is an unstable codegen backend that is only available on the nightly channel.
+            '';
+          }
+          {
+            assertion = lib.count lib.id [ cfg.mold.enable cfg.lld.enable cfg.wild.enable ] <= 1;
+            message = ''
+              Only one linker can be enabled at a time.
+
+              You have enabled multiple linkers among mold, lld, and wild.
+              Please enable at most one.
+            '';
+          }
+          {
+            assertion = cfg.wild.enable -> pkgs.stdenv.isLinux;
+            message = ''
+              `languages.rust.wild.enable` is only supported on Linux.
+            '';
+          }
+          {
             assertion = cfg.channel == "nixpkgs" -> (cfg.targets == [ ]);
             message = ''
               Cannot use `languages.rust.channel = "nixpkgs"` with `languages.rust.targets`.
@@ -279,6 +358,8 @@ in
 
         packages =
           lib.optional cfg.mold.enable pkgs.mold-wrapped
+          ++ lib.optional cfg.lld.enable pkgs.llvmPackages.bintools
+          ++ lib.optional cfg.wild.enable pkgs.wild
           ++ lib.optional pkgs.stdenv.isDarwin pkgs.libiconv
           ++ lib.optional cfg.lsp.enable cfg.lsp.package;
 
@@ -288,6 +369,12 @@ in
         env =
           let
             moldFlags = lib.optionalString cfg.mold.enable "-C link-arg=-fuse-ld=mold";
+            lldFlags = lib.optionalString cfg.lld.enable "-C link-arg=-fuse-ld=lld";
+            # TODO: Work around rustc's default lld selection and missing native GCC Wild support;
+            # use `-C linker-features=-lld -C link-arg=-B${pkgs.wild}/bin` for now, then switch to
+            # `-C link-arg=-fuse-ld=wild` once a released GCC supports it.
+            wildFlags = lib.optionalString cfg.wild.enable "-C linker-features=-lld -C link-arg=-B${pkgs.wild}/bin";
+            linkerFlags = lib.concatStringsSep " " (lib.filter (x: x != "") [ moldFlags lldFlags wildFlags ]);
             optionalEnv = cond: str: if cond then str else null;
           in
           {
@@ -297,8 +384,12 @@ in
               if cfg.toolchain ? rust-src
               then "${cfg.toolchain.rust-src}/lib/rustlib/src/rust/library"
               else pkgs.rustPlatform.rustLibSrc;
-            RUSTFLAGS = optionalEnv (moldFlags != "" || cfg.rustflags != "") (lib.concatStringsSep " " (lib.filter (x: x != "") [ moldFlags cfg.rustflags ]));
-            RUSTDOCFLAGS = optionalEnv (moldFlags != "") moldFlags;
+
+            CARGO_UNSTABLE_CODEGEN_BACKEND = optionalEnv cfg.cranelift.enable "true";
+            CARGO_PROFILE_DEV_CODEGEN_BACKEND = optionalEnv cfg.cranelift.enable "cranelift";
+            CARGO_PROFILE_DEV_BUILD_OVERRIDE_CODEGEN_BACKEND = optionalEnv cfg.cranelift.forceBuildScriptsLlvm "llvm";
+            RUSTFLAGS = optionalEnv (linkerFlags != "" || cfg.rustflags != "") (lib.concatStringsSep " " (lib.filter (x: x != "") [ linkerFlags cfg.rustflags ]));
+            RUSTDOCFLAGS = optionalEnv (linkerFlags != "") linkerFlags;
           };
 
         git-hooks.tools = {
@@ -309,8 +400,21 @@ in
 
         # Allow clippy to access the internet to fetch dependencies.
         git-hooks.hooks.clippy.settings.offline = lib.mkDefault false;
+
+        languages.rust.components = lib.mkIf cfg.cranelift.enable (lib.mkAfter [ "rustc-codegen-cranelift-preview" ]);
       }
     )
+
+    (lib.mkIf (cfg.cranelift.excludePackages != [ ]) {
+      files.".cargo/config.toml".toml = {
+        profile.dev.package = lib.listToAttrs (map
+          (pkg: {
+            name = pkg;
+            value = { codegen-backend = "llvm"; };
+          })
+          cfg.cranelift.excludePackages);
+      };
+    })
 
     (lib.mkIf (cfg.toolchainFile != null) (
       let

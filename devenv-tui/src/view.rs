@@ -79,7 +79,15 @@ pub fn view(
                 NixActivityState::Completed { success: false, .. }
             )
         );
+        let evaluate_failed = matches!(
+            (&activity.variant, &activity.state),
+            (
+                ActivityVariant::Evaluating(_),
+                NixActivityState::Completed { success: false, .. }
+            )
+        );
         let show_activity_logs = devenv_failed
+            || evaluate_failed
             || match &activity.variant {
                 ActivityVariant::Task(task_data) => task_data.show_output || task_failed,
                 ActivityVariant::Process(_) => true,
@@ -144,6 +152,7 @@ pub fn view(
             showing_logs: selected_logs.is_some(),
             can_go_up,
             can_go_down,
+            interrupt_prompt_active: ui_state.interrupt_prompt_active(),
         })) {
             SummaryView
         }
@@ -329,7 +338,7 @@ fn ActivityItem(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                 .render(terminal_width, *depth, prefix);
 
                 return ExpandedContentComponent::new(logs.as_deref())
-                    .with_empty_message("  → no build logs yet (press '^e' to expand)")
+                    .with_empty_message("  → no build logs yet (press Ctrl-E to expand)")
                     .render_with_main_line(main_line);
             }
 
@@ -530,28 +539,9 @@ fn ActivityItem(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                 activity.detail.clone()
             };
 
-            // For selected evaluation activities, show expandable file list
-            if *is_selected && logs.is_some() {
-                let prefix = build_activity_prefix(*depth, *completed, true);
-
-                let main_line = ActivityTextComponent::name_only(
-                    activity.name.clone(),
-                    elapsed_str,
-                    activity.variant.clone(),
-                )
-                .with_suffix(suffix)
-                .with_completed(completed.is_some())
-                .with_selection(*is_selected)
-                .render(terminal_width, *depth, prefix);
-
-                return ExpandedContentComponent::new(logs.as_deref())
-                    .with_empty_message("  → no files evaluated yet (press '^e' to expand)")
-                    .render_with_main_line(main_line);
-            }
-
             let prefix = build_activity_prefix(*depth, *completed, true);
 
-            return ActivityTextComponent::name_only(
+            let main_line = ActivityTextComponent::name_only(
                 activity.name.clone(),
                 elapsed_str,
                 activity.variant.clone(),
@@ -560,6 +550,19 @@ fn ActivityItem(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
             .with_completed(completed.is_some())
             .with_selection(*is_selected)
             .render(terminal_width, *depth, prefix);
+
+            // Show logs when selected or when failed (so error details are visible)
+            let failed = *completed == Some(false);
+            if (failed || *is_selected) && logs.is_some() {
+                let mut component = ExpandedContentComponent::new(logs.as_deref())
+                    .with_empty_message("  → no files evaluated yet (press Ctrl-E to expand)");
+                if failed {
+                    component = component.with_max_lines(LOG_VIEWPORT_FAILED);
+                }
+                return component.render_with_main_line(main_line);
+            }
+
+            return main_line;
         }
         ActivityVariant::UserOperation => {
             let prefix = build_activity_prefix(*depth, *completed, true);
@@ -644,6 +647,7 @@ fn ActivityItem(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                 }
                 ProcessStatus::Ready => "ready".into(),
                 ProcessStatus::Restarting => "restarting".into(),
+                ProcessStatus::Stopping => "stopping".into(),
                 ProcessStatus::Stopped if *completed == Some(false) => "failed".into(),
                 ProcessStatus::Stopped => "stopped".into(),
             };
@@ -889,6 +893,7 @@ struct SummaryViewContext {
     showing_logs: bool,
     can_go_up: bool,
     can_go_down: bool,
+    interrupt_prompt_active: bool,
 }
 
 /// Summary view component that adapts to terminal width
@@ -902,6 +907,7 @@ fn SummaryView(hooks: Hooks) -> impl Into<AnyElement<'static>> {
         showing_logs,
         can_go_up,
         can_go_down,
+        interrupt_prompt_active,
     } = &*ctx;
 
     build_summary_view_impl(
@@ -910,6 +916,7 @@ fn SummaryView(hooks: Hooks) -> impl Into<AnyElement<'static>> {
         *showing_logs,
         *can_go_up,
         *can_go_down,
+        *interrupt_prompt_active,
         terminal_width,
     )
 }
@@ -921,8 +928,36 @@ fn build_summary_view_impl(
     showing_logs: bool,
     can_go_up: bool,
     can_go_down: bool,
+    interrupt_prompt_active: bool,
     terminal_width: u16,
 ) -> AnyElement<'static> {
+    if interrupt_prompt_active {
+        let prompt_text = if terminal_width < 72 {
+            "Quit devenv? Nothing stopped."
+        } else {
+            "Quit devenv? Nothing has been stopped yet."
+        };
+
+        return element!(View(
+            flex_direction: FlexDirection::Row,
+            justify_content: JustifyContent::SpaceBetween,
+            width: 100pct
+        ) {
+            View(flex_grow: 1.0, min_width: 0, overflow: Overflow::Hidden) {
+                Text(content: prompt_text, color: Color::Yellow, weight: Weight::Bold)
+            }
+            View(flex_direction: FlexDirection::Row, flex_shrink: 0.0, margin_left: 2) {
+                Text(content: "c", color: COLOR_INTERACTIVE)
+                Text(content: " keep running • ")
+                Text(content: "q", color: COLOR_INTERACTIVE)
+                Text(content: " quit • ")
+                Text(content: "Ctrl-C", color: COLOR_INTERACTIVE)
+                Text(content: " quit")
+            }
+        })
+        .into_any();
+    }
+
     let mut children = vec![];
     let mut has_content = false;
 
@@ -930,6 +965,10 @@ fn build_summary_view_impl(
     let has_selection = selected.is_some();
     let is_process =
         matches!(selected, Some(a) if matches!(a.variant, ActivityVariant::Process(_)));
+    let is_stoppable = matches!(
+        selected,
+        Some(a) if matches!(&a.variant, ActivityVariant::Process(p) if p.status.is_stoppable())
+    );
 
     // Determine display mode based on terminal width
     let use_symbols = terminal_width < 60; // Use unicode symbols for very narrow terminals
@@ -1139,7 +1178,7 @@ fn build_summary_view_impl(
         } else {
             help_children.push(element!(Text(content: " • ")).into_any());
         }
-        help_children.push(element!(Text(content: "^e", color: COLOR_INTERACTIVE)).into_any());
+        help_children.push(element!(Text(content: if use_short_text { "^E" } else { "Ctrl-E" }, color: COLOR_INTERACTIVE)).into_any());
         if use_symbols {
             help_children.push(element!(Text(content: " ▼ • ")).into_any());
         } else if use_short_text {
@@ -1148,11 +1187,20 @@ fn build_summary_view_impl(
             help_children.push(element!(Text(content: " expand logs • ")).into_any());
         }
         if is_process {
-            help_children.push(element!(Text(content: "^r", color: COLOR_INTERACTIVE)).into_any());
+            if is_stoppable {
+                help_children
+                    .push(element!(Text(content: if use_short_text { "^X" } else { "Ctrl-X" }, color: COLOR_INTERACTIVE)).into_any());
+                if use_short_text {
+                    help_children.push(element!(Text(content: " stop • ")).into_any());
+                } else {
+                    help_children.push(element!(Text(content: " stop process • ")).into_any());
+                }
+            }
+            help_children.push(element!(Text(content: if use_short_text { "^R" } else { "Ctrl-R" }, color: COLOR_INTERACTIVE)).into_any());
             if use_short_text {
-                help_children.push(element!(Text(content: " restart • ")).into_any());
+                help_children.push(element!(Text(content: " (re)start • ")).into_any());
             } else {
-                help_children.push(element!(Text(content: " restart process • ")).into_any());
+                help_children.push(element!(Text(content: " (re)start process • ")).into_any());
             }
         }
         help_children.push(element!(Text(content: "Esc", color: COLOR_INTERACTIVE)).into_any());
@@ -1169,7 +1217,7 @@ fn build_summary_view_impl(
             help_children.push(element!(Text(content: " clear")).into_any());
         }
     } else {
-        // Show navigate hint only when no selection (^e requires selection)
+        // Show navigate hint only when no selection (Ctrl-E requires selection)
         help_children.push(element!(Text(content: "↑", color: up_arrow_color)).into_any());
         help_children.push(element!(Text(content: "↓", color: down_arrow_color)).into_any());
         if !use_symbols {
@@ -1198,4 +1246,28 @@ pub fn format_duration(duration: Duration) -> String {
         return "[TIME]".to_string();
     }
     duration.human_duration().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_summary_interrupt_prompt_renders() {
+        let mut element = build_summary_view_impl(
+            &ActivitySummary::default(),
+            None,
+            false,
+            false,
+            false,
+            true,
+            100,
+        );
+        let output = element.render(Some(100)).to_string();
+
+        assert!(output.contains("Quit devenv?"));
+        assert!(output.contains("stopped"));
+        assert!(output.contains("keep running"));
+        assert!(output.contains("quit"));
+    }
 }

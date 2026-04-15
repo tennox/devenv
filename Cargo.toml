@@ -23,7 +23,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2.0.5"
+version = "2.0.7"
 edition = "2024"
 license = "APACHE-2.0"
 homepage = "https://devenv.sh/"
@@ -50,13 +50,13 @@ nix-conf-parser = { path = "nix-conf-parser" }
 tokio-shutdown = { path = "tokio-shutdown" }
 xtask = { path = "xtask" }
 
-nix-bindings-flake = { git = "https://github.com/cachix/nix-bindings-rust.git", branch = "for-upstream" }
-nix-bindings-expr = { git = "https://github.com/cachix/nix-bindings-rust.git", branch = "for-upstream" }
-nix-bindings-store = { git = "https://github.com/cachix/nix-bindings-rust.git", branch = "for-upstream" }
-nix-bindings-util = { git = "https://github.com/cachix/nix-bindings-rust.git", branch = "for-upstream" }
-nix-bindings-fetchers = { git = "https://github.com/cachix/nix-bindings-rust.git", branch = "for-upstream" }
-nix-cmd = { git = "https://github.com/cachix/nix-bindings-rust.git", branch = "for-upstream" }
-nix-bindings-bindgen-raw = { git = "https://github.com/cachix/nix-bindings-rust.git", branch = "for-upstream" }
+nix-bindings-flake = { git = "https://github.com/cachix/nix-bindings-rust.git", branch = "2.34" }
+nix-bindings-expr = { git = "https://github.com/cachix/nix-bindings-rust.git", branch = "2.34" }
+nix-bindings-store = { git = "https://github.com/cachix/nix-bindings-rust.git", branch = "2.34" }
+nix-bindings-util = { git = "https://github.com/cachix/nix-bindings-rust.git", branch = "2.34" }
+nix-bindings-fetchers = { git = "https://github.com/cachix/nix-bindings-rust.git", branch = "2.34" }
+nix-cmd = { git = "https://github.com/cachix/nix-bindings-rust.git", branch = "2.34" }
+nix-bindings-bindgen-raw = { git = "https://github.com/cachix/nix-bindings-rust.git", branch = "2.34" }
 
 avt = "0.17"
 base64 = "0.22"
@@ -72,7 +72,6 @@ clap = { version = "4.5.48", features = ["derive", "cargo", "env"] }
 clap_complete = { version = "4.5.58", features = ["unstable-dynamic"] }
 clap_mangen = "0.2.29"
 cstr = "0.2"
-daemonize = "0.5"
 cli-table = "0.5.0"
 console = "0.16.1"
 dotlock = "0.5.0"
@@ -105,7 +104,14 @@ schematic = { version = "0.19", features = [
 ] }
 secrecy = "0.10"
 # https://github.com/mikaelmello/inquire/pull/330
-secretspec = { git = "https://github.com/cachix/secretspec", tag = "v0.8.0", features = ["cli", "keyring", "gcsm", "awssm", "vault"] }
+secretspec = { git = "https://github.com/cachix/secretspec", tag = "v0.8.0", features = [
+  "cli",
+  "keyring",
+  "gcsm",
+  "awssm",
+  "vault",
+] }
+semver = "1"
 serde = { version = "1.0.226", features = ["derive"] }
 serde_json = "1.0.145"
 serde_repr = "0.1.20"
@@ -178,6 +184,12 @@ rmcp = { version = "1.1", features = [
 rmcp-macros = "1.1"
 sd-notify = "0.4"
 
+# Optional OpenTelemetry dependencies
+opentelemetry = "0.31"
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace"] }
+tracing-opentelemetry = "0.32"
+
 # Optional snix dependencies
 snix-eval = { git = "https://github.com/cachix/snix", rev = "50b41ae7e05b423a7525b4dda53d372a71931506" }
 snix-glue = { git = "https://github.com/cachix/snix", rev = "50b41ae7e05b423a7525b4dda53d372a71931506" }
@@ -188,15 +200,15 @@ nix-compat = { git = "https://github.com/cachix/snix", rev = "50b41ae7e05b423a75
 nix-compat-derive = { git = "https://github.com/cachix/snix", rev = "50b41ae7e05b423a7525b4dda53d372a71931506" }
 
 # Ensure crossterm versions match between these
-iocraft = "0.7.18"
-crossterm = "0.28.1"
+iocraft = { version = "0.7.18", features = ["unstable-output-streams"] }
+crossterm = "0.29.0"
 
 [patch.crates-io]
-# Patched TUI dependencies to supported rendering to stderr
+# Waiting on iocraft release with stderr rendering support
 # https://github.com/ccbrown/iocraft/pull/157
 iocraft = { git = "https://github.com/cachix/iocraft", branch = "cachix" }
 # https://github.com/crossterm-rs/crossterm/pull/1026
-crossterm = { git = "https://github.com/sandydoo/crossterm", branch = "0.28-cachix" }
+crossterm = { git = "https://github.com/cachix/crossterm", branch = "0.29-cachix" }
 
 # Improve performance of test runs
 [profile.dev.package]

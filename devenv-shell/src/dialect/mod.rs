@@ -8,6 +8,7 @@ mod bash;
 
 pub use bash::BashDialect;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Shell-specific behavior for interactive sessions.
@@ -26,7 +27,7 @@ pub trait ShellDialect: Send + Sync {
     /// Generate environment diff helper functions (for hot-reload tracking).
     fn env_diff_helpers(&self) -> &str;
 
-    /// Generate the hot-reload hook script (keybinding + prompt hook).
+    /// Generate the hot-reload hook script (prompt hook).
     fn reload_hook(&self, reload_file: &Path) -> String;
 
     /// Path to the user's shell rc file (e.g., ~/.bashrc, ~/.zshrc).
@@ -34,6 +35,14 @@ pub trait ShellDialect: Send + Sync {
 
     /// Generate a shell-specific PS1/prompt prefix for "(devenv)".
     fn prompt_prefix(&self) -> &str;
+
+    /// Format task exports as shell export statements.
+    ///
+    /// Keys are already sorted (BTreeMap), giving deterministic output (important for direnv diffing).
+    fn format_task_exports(&self, exports: &BTreeMap<String, String>) -> String;
+
+    /// Format task messages as shell print statements.
+    fn format_task_messages(&self, messages: &[String]) -> String;
 }
 
 /// Arguments for launching an interactive shell with a custom init script.

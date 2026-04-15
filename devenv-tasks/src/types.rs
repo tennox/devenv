@@ -70,7 +70,7 @@ impl std::fmt::Display for VerbosityLevel {
 }
 
 /// Current status counters for all tasks in execution
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TasksStatus {
     pub pending: usize,
     pub running: usize,
@@ -85,26 +85,10 @@ pub struct TasksStatus {
     pub soft_dependency_failed: usize,
 }
 
-impl Default for TasksStatus {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl TasksStatus {
     /// Create a new empty TasksStatus
     pub fn new() -> Self {
-        Self {
-            pending: 0,
-            running: 0,
-            succeeded: 0,
-            failed: 0,
-            skipped: 0,
-            dependency_failed: 0,
-            cancelled: 0,
-            soft_failed: 0,
-            soft_dependency_failed: 0,
-        }
+        Self::default()
     }
 
     /// Check if all tasks are complete (no pending or running tasks)
@@ -137,14 +121,28 @@ impl TasksStatus {
 /// Output data from tasks
 pub type TaskOutputs = serde_json::Value;
 
+/// Navigate to `value["devenv"][field]`.
+fn get_devenv_field<'a>(
+    value: &'a serde_json::Value,
+    field: &str,
+) -> Option<&'a serde_json::Value> {
+    value.get("devenv").and_then(|d| d.get(field))
+}
+
 /// Read the `devenv.env` object from a task output JSON value.
 pub fn get_devenv_env(
     value: &serde_json::Value,
 ) -> Option<&serde_json::Map<String, serde_json::Value>> {
-    value
-        .get("devenv")
-        .and_then(|d| d.get("env"))
-        .and_then(|e| e.as_object())
+    get_devenv_field(value, "env").and_then(|e| e.as_object())
+}
+
+/// Iterate over the `devenv.messages` strings in a task output JSON value.
+fn iter_devenv_messages(value: &serde_json::Value) -> impl Iterator<Item = &str> {
+    get_devenv_field(value, "messages")
+        .and_then(|m| m.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
 }
 
 /// Get or create the mutable `devenv.env` object in a task output JSON value.
@@ -226,6 +224,19 @@ impl Outputs {
         }
         envs
     }
+
+    /// Extract all `devenv.messages` strings from task outputs.
+    ///
+    /// Each task's JSON output may contain `{"devenv": {"messages": ["msg1", "msg2"]}}`.
+    /// Messages are collected in task name order (BTreeMap iteration), preserving
+    /// array order within each task.
+    pub fn collect_messages(&self) -> Vec<String> {
+        self.0
+            .values()
+            .flat_map(|v| iter_devenv_messages(v))
+            .map(String::from)
+            .collect()
+    }
 }
 
 impl Default for Outputs {
@@ -304,14 +315,18 @@ pub fn is_process_dep_satisfied(
         // Waiting: nothing satisfied yet
         (ProcessPhase::Waiting, _) => DepSatisfaction::NotYet,
 
-        // NotStarted (auto start off): @completed is satisfied immediately,
+        // NotStarted (auto start off) or Stopped (explicitly stopped by user):
+        // @completed is satisfied immediately,
         // @started/@ready keep waiting (the process can be started manually later),
         // @succeeded is never satisfiable without actual execution.
-        (ProcessPhase::NotStarted, DependencyKind::Completed) => DepSatisfaction::Satisfied,
-        (ProcessPhase::NotStarted, DependencyKind::Started | DependencyKind::Ready) => {
-            DepSatisfaction::NotYet
+        (ProcessPhase::NotStarted | ProcessPhase::Stopped, DependencyKind::Completed) => {
+            DepSatisfaction::Satisfied
         }
-        (ProcessPhase::NotStarted, _) => DepSatisfaction::NeverSatisfiable,
+        (
+            ProcessPhase::NotStarted | ProcessPhase::Stopped,
+            DependencyKind::Started | DependencyKind::Ready,
+        ) => DepSatisfaction::NotYet,
+        (ProcessPhase::NotStarted | ProcessPhase::Stopped, _) => DepSatisfaction::NeverSatisfiable,
 
         // Starting: @started is satisfied, everything else not yet
         (ProcessPhase::Starting, DependencyKind::Started) => DepSatisfaction::Satisfied,
@@ -322,6 +337,12 @@ pub fn is_process_dep_satisfied(
             DepSatisfaction::Satisfied
         }
         (ProcessPhase::Ready, _) => DepSatisfaction::NotYet,
+
+        // Exited: process exited and won't restart; @completed and @started are satisfied
+        (ProcessPhase::Exited, DependencyKind::Completed | DependencyKind::Started) => {
+            DepSatisfaction::Satisfied
+        }
+        (ProcessPhase::Exited, _) => DepSatisfaction::NeverSatisfiable,
 
         // GaveUp: @completed is satisfied, others are never satisfiable
         (ProcessPhase::GaveUp, DependencyKind::Completed) => DepSatisfaction::Satisfied,
@@ -453,11 +474,13 @@ mod tests {
         DependencyKind::Completed,
     ];
 
-    const ALL_PHASES: [ProcessPhase; 5] = [
+    const ALL_PHASES: [ProcessPhase; 7] = [
         ProcessPhase::NotStarted,
+        ProcessPhase::Stopped,
         ProcessPhase::Waiting,
         ProcessPhase::Starting,
         ProcessPhase::Ready,
+        ProcessPhase::Exited,
         ProcessPhase::GaveUp,
     ];
 
@@ -512,6 +535,11 @@ mod tests {
             (ProcessPhase::NotStarted, ready, NotYet),
             (ProcessPhase::NotStarted, succeeded, NeverSatisfiable),
             (ProcessPhase::NotStarted, completed, Satisfied),
+            // Stopped (same as NotStarted)
+            (ProcessPhase::Stopped, started, NotYet),
+            (ProcessPhase::Stopped, ready, NotYet),
+            (ProcessPhase::Stopped, succeeded, NeverSatisfiable),
+            (ProcessPhase::Stopped, completed, Satisfied),
             // Starting
             (ProcessPhase::Starting, started, Satisfied),
             (ProcessPhase::Starting, ready, NotYet),
@@ -522,6 +550,11 @@ mod tests {
             (ProcessPhase::Ready, ready, Satisfied),
             (ProcessPhase::Ready, succeeded, NotYet),
             (ProcessPhase::Ready, completed, NotYet),
+            // Exited
+            (ProcessPhase::Exited, started, Satisfied),
+            (ProcessPhase::Exited, ready, NeverSatisfiable),
+            (ProcessPhase::Exited, succeeded, NeverSatisfiable),
+            (ProcessPhase::Exited, completed, Satisfied),
             // GaveUp
             (ProcessPhase::GaveUp, started, NeverSatisfiable),
             (ProcessPhase::GaveUp, ready, NeverSatisfiable),

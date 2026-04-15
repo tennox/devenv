@@ -1,5 +1,8 @@
 use clap::Parser;
-use devenv::{Config, Devenv, DevenvOptions, NixSettings, tracing as devenv_tracing};
+use devenv::{
+    Config, Devenv, DevenvOptions, NixSettings, SecretOptions, SecretSettings,
+    tracing as devenv_tracing,
+};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use serde::{Deserialize, Serialize};
@@ -404,7 +407,7 @@ async fn run_tests_in_directory(args: &RunArgs) -> Result<Vec<TestResult>> {
         config
             .add_input(
                 "devenv",
-                &format!("path:{}?dir=src/modules", cwd.display()),
+                &format!("git+file:{}?dir=src/modules", cwd.display()),
                 &[],
             )
             .wrap_err("Failed to add devenv input")?;
@@ -414,12 +417,14 @@ async fn run_tests_in_directory(args: &RunArgs) -> Result<Vec<TestResult>> {
             ..NixSettings::default()
         };
         let nixpkgs_config = config.nixpkgs_config(&nix_settings.system);
+        let secret_settings = SecretSettings::resolve(SecretOptions::default(), &config);
         let options = DevenvOptions {
             inputs: config.inputs,
             imports: config.imports,
             git_root: config.git_root,
             nixpkgs_config,
             nix_settings,
+            secret_settings,
             devenv_root: Some(devenv_root.clone()),
             devenv_dotfile: Some(devenv_dotfile),
             ..Default::default()
@@ -509,7 +514,7 @@ async fn run_tests_in_directory(args: &RunArgs) -> Result<Vec<TestResult>> {
 
 #[tokio::main]
 async fn main() -> Result<ExitCode> {
-    devenv_tracing::init_tracing_default();
+    let _tracing_guard = devenv_tracing::init_tracing_default();
 
     // If DEVENV_RUN_TESTS is set, run the tests.
     if env::var("DEVENV_RUN_TESTS") == Ok("1".to_string()) {
@@ -561,7 +566,7 @@ done
 
 # Execute devenv with our devenv override first, then user overrides, then other arguments
 exec '{bin_dir}/devenv' \
-  --override-input devenv 'path:{cwd}?dir=src/modules' \
+  --override-input devenv 'git+file:{cwd}?dir=src/modules' \
   "${{override_inputs[@]}}" \
   "${{other_args[@]}}"
 "#,
@@ -619,7 +624,9 @@ exec '{bin_dir}/devenv' \
     if let Ok(tzdir) = env::var("TZDIR") {
         env.push(("TZDIR", tzdir));
     }
-    // RUST_LOG is needed for tests that verify environment variable handling
+    // Only pass through RUST_LOG if explicitly set in the parent environment.
+    // Do not default it — setting RUST_LOG=info would suppress debug-level trace
+    // output from devenv --verbose, breaking tests that grep trace logs.
     if let Ok(rust_log) = env::var("RUST_LOG") {
         env.push(("RUST_LOG", rust_log));
     }

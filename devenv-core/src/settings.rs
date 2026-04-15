@@ -69,11 +69,35 @@ pub fn default_system() -> String {
 ///
 /// The logical default lives in `.unwrap_or(default)` at the call site,
 /// not in clap's `default_value_t`.
-pub fn flag(yes: bool, no: bool) -> Option<bool> {
-    match (yes, no) {
+/// Convert a CLI flag value into an `Option<bool>`.
+///
+/// - Bare `bool`: `false` means "not passed" → `None`, `true` → `Some(true)`.
+/// - `Option<bool>`: passed through as-is, so `Some(false)` is an explicit choice.
+pub trait IntoFlag {
+    fn into_flag(self) -> Option<bool>;
+}
+
+impl IntoFlag for bool {
+    fn into_flag(self) -> Option<bool> {
+        if self { Some(true) } else { None }
+    }
+}
+
+impl IntoFlag for Option<bool> {
+    fn into_flag(self) -> Option<bool> {
+        self
+    }
+}
+
+/// Resolve a pair of positive/negative CLI flags into an `Option<bool>`.
+///
+/// `--no-*` always wins. Otherwise the positive flag is interpreted via
+/// [`IntoFlag`]: bare `false` is "unset", `Some(false)` is "explicitly off".
+pub fn flag(yes: impl IntoFlag, no: bool) -> Option<bool> {
+    match (yes.into_flag(), no) {
         (_, true) => Some(false),
-        (true, _) => Some(true),
-        (false, false) => None,
+        (Some(v), _) => Some(v),
+        (None, false) => None,
     }
 }
 
@@ -123,6 +147,9 @@ pub struct NixSettings {
     pub nix_options: Vec<String>,
     pub nix_debugger: bool,
     pub backend: NixBackendType,
+    /// When true, bypass Nix's fetcher cache (equivalent to `nix --refresh`).
+    /// Sets `tarball-ttl` to 0 so inputs resolve to the latest revision.
+    pub refresh_fetchers: bool,
 }
 
 impl Default for NixSettings {
@@ -137,6 +164,7 @@ impl Default for NixSettings {
             nix_options: Vec::new(),
             nix_debugger: false,
             backend: NixBackendType::default(),
+            refresh_fetchers: false,
         }
     }
 }
@@ -157,6 +185,7 @@ impl NixSettings {
             nix_options: options.nix_options,
             nix_debugger: options.nix_debugger.unwrap_or(false),
             backend: options.backend.unwrap_or_else(|| config.backend.clone()),
+            refresh_fetchers: false,
         }
     }
 }
@@ -309,6 +338,46 @@ pub struct InputOverrides {
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    #[test]
+    fn flag_both_unset() {
+        assert_eq!(flag(false, false), None);
+    }
+
+    #[test]
+    fn flag_yes_set() {
+        assert_eq!(flag(true, false), Some(true));
+    }
+
+    #[test]
+    fn flag_no_set() {
+        assert_eq!(flag(false, true), Some(false));
+    }
+
+    #[test]
+    fn flag_no_wins_over_yes() {
+        assert_eq!(flag(true, true), Some(false));
+    }
+
+    #[test]
+    fn flag_option_none() {
+        assert_eq!(flag(None::<bool>, false), None);
+    }
+
+    #[test]
+    fn flag_option_some_true() {
+        assert_eq!(flag(Some(true), false), Some(true));
+    }
+
+    #[test]
+    fn flag_option_some_false() {
+        assert_eq!(flag(Some(false), false), Some(false));
+    }
+
+    #[test]
+    fn flag_option_no_wins_over_some_true() {
+        assert_eq!(flag(Some(true), true), Some(false));
+    }
 
     #[test]
     fn nix_settings_defaults() {

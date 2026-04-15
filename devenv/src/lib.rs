@@ -1,6 +1,10 @@
+// SecretsNeedPrompting fields trigger unused_assignments due to cross-crate usage (rustc 1.93)
+#![allow(unused_assignments)]
+
 pub mod changelog;
 pub mod cli;
 mod devenv;
+pub mod hook;
 pub mod lsp;
 pub mod mcp;
 pub mod nix_log_bridge;
@@ -22,7 +26,7 @@ pub use devenv_tasks as tasks;
 // Re-export core types from devenv-core for convenience
 pub use devenv_core::{
     CachixCacheInfo, CachixManager, CachixPaths, Config, DevenvPaths, NixArgs, NixBackend,
-    NixSettings, Options, SecretspecData, default_system,
+    NixSettings, Options, SecretOptions, SecretSettings, SecretspecData, default_system,
 };
 
 /// Returns true if this binary was NOT built from a release.

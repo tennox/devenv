@@ -20,7 +20,7 @@ enum Command {
         #[clap()]
         roots: Vec<String>,
 
-        #[clap(long, value_enum, default_value_t = RunMode::Single, help = "The execution mode for tasks (affects dependency resolution)")]
+        #[clap(long, value_enum, default_value_t = RunMode::Before, help = "The execution mode for tasks (affects dependency resolution)")]
         mode: RunMode,
 
         #[clap(
@@ -101,10 +101,7 @@ async fn main() -> Result<()> {
     let shutdown = Shutdown::new();
     shutdown.install_signals().await;
 
-    tokio::select! {
-        result = run_tasks(shutdown.clone()) => result?,
-        _ = shutdown.wait_for_shutdown() => {}
-    };
+    run_tasks(shutdown.clone()).await?;
 
     Ok(())
 }
@@ -202,9 +199,10 @@ async fn run_tasks(shutdown: Arc<Shutdown>) -> Result<()> {
 
             // Run UI - processes events and waits for run_handle
             let ui = TasksUi::new(Arc::clone(&tasks), activity_rx, verbosity);
-            let (status, _) = ui.run(run_handle).await?;
+            let (status, _) = ui.run(run_handle, false).await?;
 
             if shutdown.last_signal().is_some() {
+                let _ = tasks.process_manager().stop_all().await;
                 shutdown.exit_process();
             }
 

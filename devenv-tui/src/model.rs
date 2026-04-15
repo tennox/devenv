@@ -172,6 +172,7 @@ pub struct UiState {
     pub scroll: ScrollState,
     pub view_options: ViewOptions,
     pub terminal_size: TerminalSize,
+    pub interrupt_prompt_active: bool,
     pub view_mode: ViewMode,
 }
 
@@ -195,6 +196,7 @@ impl UiState {
                 show_details: false,
             },
             terminal_size: TerminalSize { width, height },
+            interrupt_prompt_active: false,
             view_mode: ViewMode::Main,
         }
     }
@@ -204,39 +206,41 @@ impl UiState {
         self.terminal_size = TerminalSize { width, height };
     }
 
-    /// Select the next activity from the list of selectable IDs.
-    pub fn select_next_activity(&mut self, selectable: &[u64]) {
-        if selectable.is_empty() {
-            return;
-        }
-        match self.selected_activity {
-            None => {
-                self.selected_activity = selectable.first().copied();
-            }
-            Some(current_id) => {
-                if let Some(current_pos) = selectable.iter().position(|&id| id == current_id) {
-                    if current_pos + 1 < selectable.len() {
-                        self.selected_activity = Some(selectable[current_pos + 1]);
-                    }
-                } else {
-                    self.selected_activity = selectable.first().copied();
-                }
-            }
-        }
+    pub fn show_interrupt_prompt(&mut self) {
+        self.interrupt_prompt_active = true;
     }
 
-    /// Select the previous activity from the list of selectable IDs.
-    pub fn select_previous_activity(&mut self, selectable: &[u64]) {
+    pub fn clear_interrupt_prompt(&mut self) {
+        self.interrupt_prompt_active = false;
+    }
+
+    pub fn interrupt_prompt_active(&self) -> bool {
+        self.interrupt_prompt_active
+    }
+
+    /// Select the next or previous activity from the list of selectable IDs.
+    ///
+    /// When `forward` is true, selects the next activity (or first if none selected).
+    /// When `forward` is false, selects the previous activity (or last if none selected).
+    pub fn select_activity(&mut self, selectable: &[u64], forward: bool) {
         if selectable.is_empty() {
             return;
         }
         match self.selected_activity {
             None => {
-                self.selected_activity = selectable.last().copied();
+                self.selected_activity = if forward {
+                    selectable.first().copied()
+                } else {
+                    selectable.last().copied()
+                };
             }
             Some(current_id) => {
                 if let Some(current_pos) = selectable.iter().position(|&id| id == current_id) {
-                    if current_pos > 0 {
+                    if forward {
+                        if current_pos + 1 < selectable.len() {
+                            self.selected_activity = Some(selectable[current_pos + 1]);
+                        }
+                    } else if current_pos > 0 {
                         self.selected_activity = Some(selectable[current_pos - 1]);
                     }
                 } else {
@@ -998,6 +1002,7 @@ impl ActivityModel {
             let id = msg.id;
             let level = msg.level;
             let has_details = msg.details.is_some();
+            let text = msg.text.clone();
             let variant = ActivityVariant::Message(MessageActivity {
                 level,
                 details: msg.details.clone(),
@@ -1013,9 +1018,22 @@ impl ActivityModel {
             );
 
             // Store details as lines in build_logs for expansion
-            if let Some(details) = msg.details {
+            if let Some(details) = &msg.details {
                 let lines: VecDeque<String> = details.lines().map(String::from).collect();
                 self.build_logs.insert(id, Arc::new(lines));
+            }
+
+            // Propagate error details to parent's build_logs so the parent
+            // activity can show them inline when it fails (e.g. Evaluate errors).
+            if level == ActivityLevel::Error {
+                if let Some(parent_id) = msg.parent {
+                    self.log_to_activity(parent_id, text);
+                    if let Some(details) = &msg.details {
+                        for line in details.lines() {
+                            self.log_to_activity(parent_id, line.to_string());
+                        }
+                    }
+                }
             }
 
             // Mark message activities as immediately completed (they're just informational)
@@ -1538,5 +1556,18 @@ mod tests {
         let summary = model.calculate_summary();
         assert_eq!(summary.expected_builds, Some(7));
         assert_eq!(summary.expected_downloads, Some(12));
+    }
+
+    #[test]
+    fn test_ui_state_interrupt_prompt_can_be_toggled() {
+        let mut ui = UiState::new();
+
+        assert!(!ui.interrupt_prompt_active());
+
+        ui.show_interrupt_prompt();
+        assert!(ui.interrupt_prompt_active());
+
+        ui.clear_interrupt_prompt();
+        assert!(!ui.interrupt_prompt_active());
     }
 }

@@ -1,7 +1,7 @@
 //! Stateful byte-level scanner for escape sequences in raw PTY output.
 //!
 //! Detects DEC private mode sequences, CSI queries, DCS sequences, and
-//! OSC queries so they can be forwarded to the real terminal (avt consumes
+//! OSC sequences so they can be forwarded to the real terminal (avt consumes
 //! them internally).
 
 mod dec_mode;
@@ -116,7 +116,7 @@ pub enum SequenceEvent {
     },
     /// CSI sequence that should be forwarded verbatim to the real terminal.
     /// Covers terminal queries (DA1, DA2, DA3, DSR, CPR, DECRQM, XTVERSION,
-    /// XTWINOPS, etc.).
+    /// XTWINOPS, etc.) and pass-through commands (DECSCUSR cursor shape).
     ForwardCsi {
         raw_bytes: Vec<u8>,
     },
@@ -216,6 +216,16 @@ fn classify_csi(
         // CSI > n → reset to default
         ([b'>'], b'n') => CsiClass::ModifyOtherKeys { enabled: false },
 
+        // DECSCUSR — cursor shape (block, bar, underline).
+        // Must be forwarded to the real terminal so programs like
+        // neovim can change cursor shape between modes.
+        ([b' '], b'q') => CsiClass::Forward,
+
+        // XTSHIFTESCAPE — configure whether shift modifier is reported
+        // in mouse events. Must be forwarded alongside mouse tracking
+        // DEC modes (1000, 1002, etc.).
+        ([b'>'], b's') => CsiClass::Forward,
+
         _ => CsiClass::Ignore,
     }
 }
@@ -294,17 +304,15 @@ impl CsiParamState {
                 }
                 None
             }
-            b'$' => {
+            // Intermediate bytes (0x20-0x2F, includes space and $).
+            // Stored for use in classification.
+            0x20..=0x2F => {
                 if self.intermediate_count < MAX_CSI_INTERMEDIATES {
                     self.intermediates[self.intermediate_count] = byte;
                     self.intermediate_count += 1;
                 }
                 None
             }
-            // Intermediate bytes (space, ", etc.) — not stored since
-            // we don't match on them in the classifier. Sequences using
-            // them (DECSCUSR, DECSCA) are category E (AVT handles).
-            0x20..=0x2F => None,
             // Final byte (0x40-0x7E)
             0x40..=0x7E => {
                 // Finalize the last parameter
@@ -874,10 +882,31 @@ mod tests {
     }
 
     #[test]
-    fn osc_non_query_ignored() {
+    fn osc_non_query_forwarded() {
         let mut scanner = EscapeScanner::new();
         let events = scanner.scan(b"\x1b]0;my title\x07");
-        assert!(events.is_empty());
+        assert_eq!(events.len(), 1);
+        let SequenceEvent::Osc(ref ev) = events[0] else {
+            panic!("expected Osc");
+        };
+        assert_eq!(ev.raw_bytes, b"\x1b]0;my title\x07");
+    }
+
+    #[test]
+    fn osc_hyperlink_forwarded() {
+        let mut scanner = EscapeScanner::new();
+        let events = scanner.scan(b"\x1b]8;;https://example.com\x07link\x1b]8;;\x07");
+        assert_eq!(events.len(), 2);
+
+        let SequenceEvent::Osc(ref open) = events[0] else {
+            panic!("expected opening Osc");
+        };
+        assert_eq!(open.raw_bytes, b"\x1b]8;;https://example.com\x07");
+
+        let SequenceEvent::Osc(ref close) = events[1] else {
+            panic!("expected closing Osc");
+        };
+        assert_eq!(close.raw_bytes, b"\x1b]8;;\x07");
     }
 
     #[test]
@@ -1538,5 +1567,84 @@ mod tests {
             panic!("expected DecMode");
         };
         assert!(ev.has_forwarded_mode());
+    }
+
+    // -- DECSCUSR (cursor shape) tests --
+
+    #[test]
+    fn detects_decscusr_block_cursor() {
+        let mut scanner = EscapeScanner::new();
+        // CSI 2 SP q — steady block cursor
+        let events = scanner.scan(b"\x1b[2 q");
+        assert_eq!(events.len(), 1);
+        let SequenceEvent::ForwardCsi { ref raw_bytes } = events[0] else {
+            panic!("expected ForwardCsi, got {:?}", events[0]);
+        };
+        assert_eq!(raw_bytes, b"\x1b[2 q");
+    }
+
+    #[test]
+    fn detects_decscusr_bar_cursor() {
+        let mut scanner = EscapeScanner::new();
+        // CSI 6 SP q — steady bar cursor
+        let events = scanner.scan(b"\x1b[6 q");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], SequenceEvent::ForwardCsi { .. }));
+    }
+
+    #[test]
+    fn detects_decscusr_default_cursor() {
+        let mut scanner = EscapeScanner::new();
+        // CSI 0 SP q — default cursor shape
+        let events = scanner.scan(b"\x1b[0 q");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], SequenceEvent::ForwardCsi { .. }));
+    }
+
+    #[test]
+    fn decscusr_split_across_buffers() {
+        let mut scanner = EscapeScanner::new();
+
+        let events1 = scanner.scan(b"\x1b[2");
+        assert!(events1.is_empty());
+
+        let events2 = scanner.scan(b" ");
+        assert!(events2.is_empty());
+
+        let events3 = scanner.scan(b"q");
+        assert_eq!(events3.len(), 1);
+        assert!(matches!(events3[0], SequenceEvent::ForwardCsi { .. }));
+    }
+
+    #[test]
+    fn decscusr_interleaved_with_alt_screen() {
+        let mut scanner = EscapeScanner::new();
+        let events = scanner.scan(b"\x1b[?1049h\x1b[2 q");
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], SequenceEvent::DecMode(_)));
+        assert!(matches!(events[1], SequenceEvent::ForwardCsi { .. }));
+    }
+
+    // -- XTSHIFTESCAPE tests --
+
+    #[test]
+    fn forwards_xtshiftescape() {
+        let mut scanner = EscapeScanner::new();
+
+        // CSI > 1 s — enable shift reporting
+        let events = scanner.scan(b"\x1b[>1s");
+        assert_eq!(events.len(), 1);
+        let SequenceEvent::ForwardCsi { ref raw_bytes } = events[0] else {
+            panic!("expected ForwardCsi, got {:?}", events[0]);
+        };
+        assert_eq!(raw_bytes, b"\x1b[>1s");
+
+        // CSI > 0 s — disable shift reporting
+        let events = scanner.scan(b"\x1b[>0s");
+        assert_eq!(events.len(), 1);
+        let SequenceEvent::ForwardCsi { ref raw_bytes } = events[0] else {
+            panic!("expected ForwardCsi, got {:?}", events[0]);
+        };
+        assert_eq!(raw_bytes, b"\x1b[>0s");
     }
 }

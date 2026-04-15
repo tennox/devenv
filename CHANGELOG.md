@@ -1,19 +1,116 @@
 # Changelog
 
-## X.Y.Z (YYYY-MM-DD)
+## X.Y.Z (unreleased)
+
+### Bug Fixes
+
+- Fixed MCP server segfault on exit by waiting for the cache init thread to finish before exiting ([#2699](https://github.com/cachix/devenv/issues/2699)).
+- Fixed independent oneshot tasks (e.g. `devenv:files` and `devenv:python:virtualenv`) running sequentially instead of in parallel, causing unnecessary waterfall delays during `devenv shell` startup.
+- Fixed `processes.<name>.watch` restarting processes multiple times for a single burst of queued file watcher events by draining the watch queue before restart ([#2735](https://github.com/cachix/devenv/pull/2735)).
+- Fixed `processes.<name>.watch` restarting processes on read-only access, directory listing, and metadata-only file events ([#2734](https://github.com/cachix/devenv/pull/2734)).
+- Fixed `imports` overriding the base project's `inputs` (e.g. `inputs.nixpkgs.url`) instead of the base config taking precedence ([#2728](https://github.com/cachix/devenv/issues/2728)).
+- Fixed Boehm GC "Repeated allocation of very large block" warnings being printed to stderr during `devenv shell`.
+- Fixed `devenv hook` not changing directory when `cd`ing out of a devenv project. The shell would deactivate but remain in the project directory instead of following the user to the target directory.
+- Fixed `devenv hook fish` causing infinite recursion / hang when entering a devenv project, because the nested `fish -c` invocation re-sourced `~/.config/fish/config.fish` which re-ran the hook. The nested fish now uses `--no-config` ([#2741](https://github.com/cachix/devenv/issues/2741)).
+- Fixed cachix daemon failing to start because the evaluated store path for the cachix binary was never realized. Now uses the cachix bundled with devenv via PATH, falling back to evaluating `cachix.binary` only when needed.
+- Fixed warning messages from Nix not being forwarded and displayed during evaluation.
+- Fixed `devenv test` leaving orphaned processes after test failures by ensuring processes are always stopped before propagating errors.
+- Fixed adding a new input to `devenv.yaml` causing all existing inputs to be re-fetched instead of only resolving the new one ([#2688](https://github.com/cachix/devenv/issues/2688)).
+- Fixed `processes.<name>.watch.paths` not triggering process restarts because Nix paths were serialized as store paths instead of source directory paths ([#2657](https://github.com/cachix/devenv/issues/2657)).
+- Fixed cursor shape escape sequences (DECSCUSR) not being forwarded to the terminal in `devenv shell`, which caused programs like neovim to not change cursor shape between modes (e.g. block in normal mode, bar in insert mode).
+- Fixed shift+mouse configuration (XTSHIFTESCAPE) not being forwarded to the terminal in `devenv shell`.
+- Fixed `devenv shell` hanging indefinitely when exiting the shell during a hot-reload build by interrupting the lingering Nix evaluation on shutdown.
+- Fixed `devenv repl` broken TUI output and hanging evaluation by adding proper TUI handoff support, showing evaluation progress in the TUI before handing the terminal to the interactive REPL.
+- Fixed Ghostty shell integration not working in `devenv shell` by sourcing `ghostty.bash` from the rcfile when `GHOSTTY_RESOURCES_DIR` is set.
+- Fixed TUI panic when expanding error details containing multi-byte UTF-8 characters (e.g. miette underlines) by using character-based truncation instead of byte-based slicing.
+- Fixed `devenv processes stop` removing the process from the manager state, making it impossible to start or restart afterwards.
+- Fixed process exec probes failing with "No such file or directory" during `devenv test` when a task depends on a process (e.g. `after = [ "devenv:processes:postgres" ]`), because the bash path was not resolved for the enterTest task runner ([#2713](https://github.com/cachix/devenv/issues/2713)).
+- Fixed processes with `restart = "never"` not satisfying `@completed` task dependencies, causing a hot loop and dependencies to never resolve ([#2712](https://github.com/cachix/devenv/issues/2712)).
+- Fixed TUI hiding Nix evaluation error details, showing only a failure mark without the actual error message ([#2720](https://github.com/cachix/devenv/issues/2720)). Failed Evaluating activities now auto-fetch and display their propagated error logs.
 
 ### Improvements
 
+- Fixed port allocation values (`config.processes.<name>.ports.<port>.value`) resolving to the base `allocate` port in `devenv shell`, `devenv tasks run`, and other commands. When the native process manager is running, port values now match the ports allocated by `devenv up` ([#2710](https://github.com/cachix/devenv/issues/2710)).
+- Standardized keyboard shortcut notation across `devenv up` TUI and `devenv shell` to use consistent `Ctrl-E` format instead of mixed `^e`/`Ctrl-Alt-E` styles. macOS now shows `Opt` instead of `Alt` ([#2736](https://github.com/cachix/devenv/issues/2736)).
+- Auto-detect AI coding agents (via `CLAUDECODE`, `OPENCODE_CLIENT`, and `AI_AGENT` environment variables) and enable quiet mode to avoid wasting LLM tokens on TUI progress output. Override with `--verbose` or `--tui` ([#2723](https://github.com/cachix/devenv/issues/2723)).
+- Always enable Nix's `show-trace` setting so full evaluation stack traces are shown on error, instead of a truncated trace suggesting the nonexistent `--show-trace` flag ([#2725](https://github.com/cachix/devenv/issues/2725)).
+- Upgraded Nix to 2.34, bringing multithreaded tarball unpacking, evaluator performance improvements, and REPL enhancements.
+- Added `require_version` field to `devenv.yaml` to enforce a devenv CLI version. Set to `true` to match the modules version, or use a constraint string like `">=2.1"` ([#2391](https://github.com/cachix/devenv/issues/2391)).
+- Added Ctrl-X keybinding to stop individual processes from the TUI while keeping them visible and restartable.
+- Tasks can now display messages when entering the shell by writing `{"devenv":{"messages":["..."]}}` to `$DEVENV_TASK_OUTPUT_FILE` ([#2500](https://github.com/cachix/devenv/issues/2500)).
+- Added `devenv hook <shell>` for native directory based auto-activation without direnv. Supports bash, zsh, fish, and nushell. Automatically deactivates when you leave the project directory. Add `eval "$(devenv hook bash)"` to your shell config to activate. Use `devenv allow` and `devenv revoke` to manage trust ([#2488](https://github.com/cachix/devenv/issues/2488)).
+- Shell environment now auto-reloads at the next prompt when watched files change, instead of requiring a manual Ctrl-Alt-R keybind ([#2595](https://github.com/cachix/devenv/issues/2595)).
+- Added `nixpkgs.rocmSupport` option to enable ROCm support in nixpkgs configuration.
+- Added process management subcommands and MCP tools: `devenv processes list`, `status`, `logs`, `restart`, `start`, `stop` for interacting with running native processes ([#2621](https://github.com/cachix/devenv/issues/2621)).
+- Added `--mode` flag to `devenv up` / `devenv processes up` to control dependency resolution for process tasks. Supports `single`, `before`, `after`, and `all` modes, matching `devenv tasks run --mode`. Defaults to `all`, so `devenv up` starts all processes by default ([#2721](https://github.com/cachix/devenv/issues/2721)).
+- Added OpenTelemetry OTLP trace export support via `--trace-to` (`otlp-grpc`, `otlp-http-protobuf`, `otlp-http-json`) with configurable endpoints or standard `OTEL_*` environment variables. OTLP spans include rich attributes (`devenv.activity.kind`, `devenv.derivation_path`, `devenv.url`, `devenv.fetch.kind`) and outcome tracking (`devenv.outcome`, `otel.status_code`). Enabled by default with the `otlp-grpc` cargo feature; `otlp-http-protobuf` and `otlp-http-json` are opt-in ([#2415](https://github.com/cachix/devenv/issues/2415)).
+- Added OTEL trace context propagation to subprocesses: tasks, shell commands, and processes automatically receive `TRACEPARENT`/`TRACESTATE` environment variables when OTLP export is enabled, allowing instrumented child processes to join the same trace ([#2415](https://github.com/cachix/devenv/issues/2415)).
+- Added `--trace-to` unified tracing flag with `[format:]destination` syntax, supporting multiple simultaneous outputs (e.g. `--trace-to pretty:stderr --trace-to json:file:/tmp/trace.json`). Also available as `DEVENV_TRACE_TO` env var (comma-separated). Legacy `--trace-output`/`--trace-format` flags are still supported but hidden.
+
+### Breaking Changes
+
+- **`devenv tasks run`**: The default execution mode is now `before` instead of `single`, so task dependencies declared via `before`/`after` are respected by default. Running `devenv tasks run admin:deploy` now also runs any tasks that `admin:deploy` depends on. Use `--mode single` to restore the previous behavior of running only the specified task ([#2551](https://github.com/cachix/devenv/issues/2551)).
+
+## 2.0.6 (2026-03-22)
+
+### Bug Fixes
+
+- Fixed task cache initialization failing with "unable to open database file" when the state directory does not yet exist.
+- Fixed cachix daemon log output leaking into and corrupting the TUI display by capturing daemon stderr and forwarding it through the push activity ([#2648](https://github.com/cachix/devenv/issues/2648)).
+- Fixed `devenv test` hanging when a process outputs non-UTF-8 bytes by using lossy UTF-8 decoding instead of closing the pipe, which caused a deadlock between the parent waiting for the child to exit and the child blocking on a full stdout pipe ([#2590](https://github.com/cachix/devenv/issues/2590)).
+- Fixed hot reload sometimes picking up stale configuration or crashing due to the old Nix evaluator not being fully cleaned up before creating a new one. Errors during reload are now reported instead of silently breaking subsequent evaluations.
+- Fixed `DEVENV_TUI=false` and `DEVENV_TUI=0` not disabling the TUI ([#2646](https://github.com/cachix/devenv/issues/2646)).
+- Migrated `certificates` and `hosts` modules to use tasks instead of `process.manager.before`/`process.manager.after` for the native process manager ([#2569](https://github.com/cachix/devenv/issues/2569)).
+- Fixed stale shell eval cache entries causing `devenv shell` and `direnv` activation to ignore changes to `devenv.nix` config such as `languages`, `env`, `packages`, and `scripts` ([#2643](https://github.com/cachix/devenv/pull/2643)).
+- Fixed services failing to start with E2BIG when the shell environment is large by moving env/cwd/stdio setup from the bash wrapper script to the spawned process directly ([#2638](https://github.com/cachix/devenv/issues/2638)).
+- Fixed processes failing to start when exported bash functions are present in the environment ([#2587](https://github.com/cachix/devenv/issues/2587)).
+- Fixed eval cache storing inconsistent port allocations across different cached attributes ([#2631](https://github.com/cachix/devenv/issues/2631)).
+- Fixed stale eval cache invalidation for `devenv up` process config changes caused by overlapping evaluations clearing each other's file dependency observers ([#2632](https://github.com/cachix/devenv/pull/2632)).
+- Fixed strict port restarts failing with "port already in use" when the kernel hasn't released the socket yet after process shutdown, by distinguishing ownerless transient conflicts from real ones and retrying accordingly ([#2647](https://github.com/cachix/devenv/pull/2647)).
+- Fixed false-positive `--strict-ports` failures on macOS when IPv6 loopback binding returns a benign error after a clean shutdown and cache invalidation ([#2640](https://github.com/cachix/devenv/pull/2640)).
+- Fixed child processes being left running on shutdown when using non-native process managers like process-compose ([#2586](https://github.com/cachix/devenv/issues/2586)).
+- Fixed `devenv update` resolving stale revisions when Nix's fetcher cache contains outdated entries by setting `tarball-ttl` to 0 during update, equivalent to `nix --refresh` ([#2616](https://github.com/cachix/devenv/issues/2616)).
+- Fixed Nix backend initialization crash when `impure: true` by removing use of nonexistent `impure` Nix setting; impure mode now works by skipping `pure-eval` (which defaults to false).
+- Fixed `execIfModified` glob walker entering gitignored directories, causing extreme slowdowns in repos with large ignored trees ([#2588](https://github.com/cachix/devenv/issues/2588)).
+- Fixed `devenv up -d` not keeping processes running with the native process manager by spawning a daemon via re-exec instead of fork, which is unsafe in multithreaded programs ([#2630](https://github.com/cachix/devenv/issues/2630)).
+- Fixed environment variable precedence in process manager: per-process env now correctly wins over global env.
+- Fixed hot reload triggering a fork bomb by ignoring file change events while a build is already in progress, preventing cascading zombie builds.
+
+### Improvements
+
+- The TUI now shows a "stopping" status during graceful process shutdown ([#2647](https://github.com/cachix/devenv/pull/2647)).
+- Process `stop_all()` now stops processes concurrently instead of serially ([#2647](https://github.com/cachix/devenv/pull/2647)).
+- `--quiet` now disables the TUI and suppresses all output except warnings and errors ([#2617](https://github.com/cachix/devenv/issues/2617)).
+- Bumped Nix input to fix `devenv shell` failing with "suspicious ownership or permission" on single user Nix installations where umask causes store outputs to have incorrect permissions ([#2585](https://github.com/cachix/devenv/issues/2585)).
+- Bumped iocraft to use row level diff rendering ([ccbrown/iocraft#179](https://github.com/ccbrown/iocraft/pull/179)), reducing TUI flicker.
+- Containers now report all missing inputs at once instead of one at a time ([#2598](https://github.com/cachix/devenv/issues/2598)).
+- Extracted container, search, and gc methods from `devenv.rs` into separate submodule files for better code organization.
+- Added `allowUnsupportedSystem` option for `devenv.yaml` to allow packages not supported on the current system. Can be set at the top level, under `nixpkgs`, or per platform via `nixpkgs.per-platform.<system>` ([#2639](https://github.com/cachix/devenv/pull/2639)).
+- Added new nixpkgs config options to `devenv.yaml`: `allowNonSource`, `allowlistedLicenses`, `blocklistedLicenses`, and `androidSdk.acceptLicense` ([#2634](https://github.com/cachix/devenv/issues/2634)).
+- Added `allowInsecurePredicate` generation from `permittedInsecurePackages` so insecure package allowlisting works correctly.
+
+### Breaking Changes
+
+- **`process.manager.before`/`process.manager.after`**: These options are no longer supported with the native process manager. Use tasks with `before`/`after` dependencies instead. See https://devenv.sh/tasks/
+
+## 2.0.5 (2026-03-16)
+
+### Improvements
+
+- Show a quit prompt on first Ctrl+C in the TUI instead of immediately terminating ([#2607](https://github.com/cachix/devenv/pull/2607)).
 - Patched Nix to avoid hitting GitHub rate limits when fetching flake inputs (upstreamed as [NixOS/nix#15470](https://github.com/NixOS/nix/pull/15470)).
 - Improved eval performance by caching the initial Nix Value, avoiding re-evaluation of nixpkgs and the module system on subsequent attribute lookups (~2x time-to-shell improvement).
 - `devenv-run-tests`: `--only` and `--exclude` now support glob patterns (e.g. `--only 'python-*'`).
 
 ### Bug Fixes
 
+- Fixed `devenv test` not running `enterTest` tasks (e.g., `git-hooks:run`) in devenv 2.0+. Also: `devenv test` now fails early when enterTest tasks fail, and skips redundant `load_tasks()` when tasks are already handled.
+- Fixed file watcher dropping change events during the initial bootstrap file flood by switching from `try_send` to backpressure, which caused `devenv.nix` changes to go undetected during hot reload.
 - Fixed `exec_if_modified` performance when negation patterns were used, avoiding a full walk of the parent directory for literal file paths.
 - Fixed child processes (postgres, redis, etc.) being left running after `devenv up` exits or `devenv processes down` is called. The native manager wrapper now forwards TERM/INT signals to the child process group, and the process-compose backend creates a proper process group for signaling ([#2619](https://github.com/cachix/devenv/issues/2619)).
 - Fixed secretspec prompting for secrets in non-interactive contexts like direnv.
 - Fixed `devenv search` showing truncated package names (e.g. `pkgs.` instead of `pkgs.ncdu`).
+- Fixed runtime directory path (`devenv-<hash>`) being inconsistent on macOS when paths contain symlinks (e.g. `/tmp` vs `/private/tmp`), which could cause processes to look for sockets in the wrong directory.
 - Fixed TUI hanging when the backend encounters an error in the PTY shell path (e.g. Nix evaluation failure).
 - Fixed `nix run` trying to run `devenv-wrapped` which doesn't exist.
 - Fixed in-band resize events being sent to the shell when the app did not opt-in to receiving them.

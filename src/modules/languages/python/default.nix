@@ -54,6 +54,10 @@ let
 
   # Write a .pth file into a venv's site-packages so that Nix profile
   # packages are importable, but venv-installed packages take priority.
+  # Note: this is a secondary mechanism; NIX_PYTHONPATH in env also makes
+  # profile packages available via sitecustomize.py (which uses site.addsitedir
+  # to append after venv site-packages). The .pth file is kept for environments
+  # where sitecustomize.py may not run (e.g. python -S).
   writePthFile = venvPath: ''
     echo "$DEVENV_PROFILE/${cfg.package.sitePackages}" > "${venvPath}/${cfg.package.sitePackages}/devenv-profile.pth"
   '';
@@ -152,7 +156,7 @@ let
         return 1
       fi
 
-      local UV_SYNC_COMMAND=(${cfg.uv.package}/bin/uv sync ${lib.escapeShellArgs cfg.uv.sync.arguments})
+      local UV_SYNC_COMMAND=(${cfg.uv.package}/bin/uv sync -p ${cfg.package.interpreter} ${lib.escapeShellArgs cfg.uv.sync.arguments})
 
       # Add extras if specified
       ${lib.concatMapStrings (extra: ''
@@ -186,7 +190,7 @@ let
 
       # Avoid running "uv sync" for every shell.
       # Only run it when the "pyproject.toml" file or Python interpreter has changed.
-      local ACTUAL_UV_CHECKSUM="${cfg.package.interpreter}:$(${pkgs.nix}/bin/nix-hash --type sha256 pyproject.toml):''${UV_SYNC_COMMAND[@]}"
+      local ACTUAL_UV_CHECKSUM="${cfg.package.interpreter}:${config.lib._fileChecksum "pyproject.toml"}:''${UV_SYNC_COMMAND[@]}"
       local UV_CHECKSUM_FILE="$VENV_PATH/uv.sync.checksum"
       if [ -f "$UV_CHECKSUM_FILE" ]
       then
@@ -214,7 +218,7 @@ let
 
     if [ ! -f "pyproject.toml" ]
     then
-      echo "No pyproject.toml found. Make sure you have a pyproject.toml file in your project." >&2
+      echo "No pyproject.toml found in ${cfg.directory}. Set languages.python.directory to the path containing your pyproject.toml." >&2
       exit 1
     else
       _devenv_uv_sync
@@ -246,7 +250,7 @@ let
       # Avoid running "poetry install" for every shell.
       # Only run it when the "poetry.lock" file or Python interpreter has changed.
       # We do this by storing the interpreter path and a hash of "poetry.lock" in venv.
-      local ACTUAL_POETRY_CHECKSUM="${cfg.package.interpreter}:$(${pkgs.nix}/bin/nix-hash --type sha256 pyproject.toml):$(${pkgs.nix}/bin/nix-hash --type sha256 poetry.lock):''${POETRY_INSTALL_COMMAND[@]}"
+      local ACTUAL_POETRY_CHECKSUM="${cfg.package.interpreter}:${config.lib._fileChecksum "pyproject.toml"}:${config.lib._fileChecksum "poetry.lock"}:''${POETRY_INSTALL_COMMAND[@]}"
       local POETRY_CHECKSUM_FILE=".venv/poetry.lock.checksum"
       if [ -f "$POETRY_CHECKSUM_FILE" ]
       then
@@ -269,7 +273,8 @@ let
 
     if [ ! -f "pyproject.toml" ]
     then
-      echo "No pyproject.toml found. Run 'poetry init' to create one." >&2
+      echo "No pyproject.toml found in ${cfg.directory}. Set languages.python.directory to the path containing your pyproject.toml." >&2
+      echo "Run 'poetry init' to create one." >&2
       exit 1
     else
       _devenv_init_poetry_venv
@@ -307,7 +312,7 @@ in
           ]
           ++ lib.optionals pkgs.stdenv.isDarwin [
             "--prefix"
-            "DYLD_LIBRARY_PATH"
+            "DYLD_FALLBACK_LIBRARY_PATH"
             ":"
             (lib.makeLibraryPath libraries)
           ];
@@ -706,15 +711,22 @@ in
         # Prevent nixpkgs setup hooks from adding individual package store
         # paths to PYTHONPATH. PYTHONPATH is prepended to sys.path before
         # site-packages, breaking venv package priority. Nix-provided
-        # packages are made available via .pth files instead.
+        # packages are made available via NIX_PYTHONPATH instead.
         dontAddPythonPath = "1";
+        # Make profile packages (including transitive deps from packages added
+        # via `packages = [ pkgs.python3Packages.foo ]`) importable. Nix's
+        # sitecustomize.py processes this using site.addsitedir(), which appends
+        # paths after venv site-packages, preserving venv package priority.
+        NIX_PYTHONPATH = "${config.devenv.profile}/${cfg.package.sitePackages}";
       }
       // (lib.optionalAttrs cfg.uv.enable {
         UV_PROJECT_ENVIRONMENT = "${config.env.DEVENV_STATE}/venv";
-        # Force uv not to download a Python binary when the version in pyproject.toml does not match the one installed by devenv
+        # Force uv to use the Nix-provided Python and never download its own
         UV_PYTHON_DOWNLOADS = "never";
-        # Configure uv to use the python interpreter from the profile
-        UV_PYTHON = toString cfg.package.interpreter;
+        UV_PYTHON_PREFERENCE = "only-system";
+        # Do not set UV_PYTHON here. It overrides VIRTUAL_ENV resolution
+        # and causes `uv pip install` to target the immutable Nix store
+        # prefix instead of the venv. See https://github.com/cachix/devenv/issues/2663
       })
       // (lib.optionalAttrs cfg.poetry.enable {
         # Make poetry use DEVENV_ROOT/.venv

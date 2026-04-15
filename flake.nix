@@ -26,7 +26,7 @@
     };
   };
   inputs.nix = {
-    url = "github:cachix/nix/devenv-2.32";
+    url = "github:cachix/nix/devenv-2.34";
     inputs = {
       nixpkgs.follows = "nixpkgs";
       flake-compat.follows = "flake-compat";
@@ -53,7 +53,8 @@
     };
   };
   inputs.crate2nix = {
-    url = "github:nix-community/crate2nix";
+    # https://github.com/nix-community/crate2nix/issues/439
+    url = "github:rossng/crate2nix/ba5dd398e31ee422fbe021767eb83b0650303a6e";
     inputs.nixpkgs.follows = "nixpkgs";
   };
   inputs.rust-overlay = {
@@ -86,7 +87,10 @@
             inputs.rust-overlay.overlays.default
             (final: prev: {
               inherit (inputs.cachix.packages.${system}) cachix;
-              nix = inputs.nix.packages.${system}.nix;
+              # Use nix-cli to skip building nix-manual, but keep libs for C bindings
+              nix = inputs.nix.packages.${system}.nix-cli // {
+                inherit (inputs.nix.packages.${system}.nix) libs;
+              };
               nixd = inputs.nixd.packages.${system}.nixd;
               crate2nix = inputs.crate2nix.packages.${system}.default;
             })

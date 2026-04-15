@@ -93,52 +93,58 @@ impl ShellManager {
 
         // Spawn stdin reader thread
         let stdin_tx = event_tx.clone();
-        std::thread::spawn(move || {
-            let mut stdin = io::stdin();
-            let mut buf = [0u8; 1024];
-            loop {
-                match stdin.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if stdin_tx
-                            .blocking_send(Event::Stdin(buf[..n].to_vec()))
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        // Spawn PTY reader thread
-        let pty_tx = event_tx.clone();
-        let spawn_pty_reader = |pty: Arc<Pty>, generation: u64, pty_tx: mpsc::Sender<Event>| {
-            std::thread::spawn(move || {
-                let mut buf = [0u8; 4096];
+        std::thread::Builder::new()
+            .name("reload-stdin".into())
+            .spawn(move || {
+                let mut stdin = io::stdin();
+                let mut buf = [0u8; 1024];
                 loop {
-                    let result = pty.read(&mut buf);
-                    match result {
-                        Ok(0) => {
-                            let _ = pty_tx.blocking_send(Event::PtyExit(generation));
-                            break;
-                        }
+                    match stdin.read(&mut buf) {
+                        Ok(0) => break,
                         Ok(n) => {
-                            if pty_tx
-                                .blocking_send(Event::PtyOutput(generation, buf[..n].to_vec()))
+                            if stdin_tx
+                                .blocking_send(Event::Stdin(buf[..n].to_vec()))
                                 .is_err()
                             {
                                 break;
                             }
                         }
-                        Err(_) => {
-                            let _ = pty_tx.blocking_send(Event::PtyExit(generation));
-                            break;
-                        }
+                        Err(_) => break,
                     }
                 }
-            });
+            })
+            .expect("failed to spawn reload-stdin thread");
+
+        // Spawn PTY reader thread
+        let pty_tx = event_tx.clone();
+        let spawn_pty_reader = |pty: Arc<Pty>, generation: u64, pty_tx: mpsc::Sender<Event>| {
+            std::thread::Builder::new()
+                .name("reload-pty".into())
+                .spawn(move || {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let result = pty.read(&mut buf);
+                        match result {
+                            Ok(0) => {
+                                let _ = pty_tx.blocking_send(Event::PtyExit(generation));
+                                break;
+                            }
+                            Ok(n) => {
+                                if pty_tx
+                                    .blocking_send(Event::PtyOutput(generation, buf[..n].to_vec()))
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Err(_) => {
+                                let _ = pty_tx.blocking_send(Event::PtyExit(generation));
+                                break;
+                            }
+                        }
+                    }
+                })
+                .expect("failed to spawn reload-pty thread");
         };
         spawn_pty_reader(initial_pty.clone(), pty_generation, pty_tx);
 
@@ -183,13 +189,17 @@ impl ShellManager {
                 }
 
                 Event::FileChange(path) => {
+                    // If a build is already running, drop the event.
+                    // spawn_blocking tasks cannot actually be cancelled, so
+                    // aborting and restarting would accumulate zombie builds
+                    // that can cascade into more file changes (fork bomb).
+                    if current_build.is_some() {
+                        tracing::debug!("Build in progress, ignoring file change: {:?}", path);
+                        continue;
+                    }
+
                     // Track the file that triggered this rebuild
                     pending_changes.push(path.clone());
-
-                    // Cancel any running build
-                    if let Some(handle) = current_build.take() {
-                        handle.abort();
-                    }
 
                     let ctx = BuildContext {
                         cwd: cwd.clone(),

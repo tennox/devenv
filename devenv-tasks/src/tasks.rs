@@ -1,6 +1,5 @@
 use crate::config::{Config, RunMode, parse_dependency};
 use crate::error::Error;
-use crate::executor::SubprocessExecutor;
 use crate::task_cache::TaskCache;
 use crate::task_state::TaskState;
 use crate::types::{
@@ -60,25 +59,18 @@ impl TasksBuilder {
     /// Build the Tasks instance
     pub async fn build(self) -> Result<Tasks, Error> {
         let cache = if let Some(db_path) = self.db_path {
-            TaskCache::with_db_path(db_path).await.map_err(|e| {
-                Error::IoError(std::io::Error::other(format!(
-                    "Failed to initialize task cache: {e}"
-                )))
-            })?
+            TaskCache::with_db_path(db_path)
+                .await
+                .map_err(|e| Error::io(format!("Failed to initialize task cache: {e}")))?
         } else {
-            TaskCache::new(&self.config.cache_dir).await.map_err(|e| {
-                Error::IoError(std::io::Error::other(format!(
-                    "Failed to initialize task cache: {e}"
-                )))
-            })?
+            TaskCache::new(&self.config.cache_dir)
+                .await
+                .map_err(|e| Error::io(format!("Failed to initialize task cache: {e}")))?
         };
 
         // Create process manager for long-running process tasks
-        let mut pm = NativeProcessManager::new(self.config.runtime_dir.clone()).map_err(|e| {
-            Error::IoError(std::io::Error::other(format!(
-                "Failed to initialize process manager: {e}"
-            )))
-        })?;
+        let mut pm = NativeProcessManager::new(self.config.runtime_dir.clone())
+            .map_err(|e| Error::io(format!("Failed to initialize process manager: {e}")))?;
 
         let notify_finished = Arc::new(Notify::new());
         pm.set_task_notify(Arc::clone(&notify_finished));
@@ -86,11 +78,8 @@ impl TasksBuilder {
 
         let mut graph = DiGraph::new();
         let mut task_indices = HashMap::new();
-        let mut longest_task_name = 0;
-
         for task in self.config.tasks {
             let name = task.name.clone();
-            longest_task_name = longest_task_name.max(name.len());
             if !task.name.contains(':')
                 || task.name.split(':').count() < 2
                 || task.name.starts_with(':')
@@ -118,7 +107,6 @@ impl TasksBuilder {
         let mut tasks = Tasks {
             roots,
             root_names: self.config.roots,
-            longest_task_name,
             graph,
             notify_finished,
             notify_ui: Arc::new(Notify::new()),
@@ -129,7 +117,6 @@ impl TasksBuilder {
             process_manager,
             env: self.config.env,
             bash: self.config.bash,
-            executor: SubprocessExecutor::new(),
             refresh_task_cache: self.refresh_task_cache,
             ignore_process_deps: self.config.ignore_process_deps,
         };
@@ -151,28 +138,26 @@ impl std::fmt::Debug for Tasks {
 }
 
 pub struct Tasks {
-    pub roots: Vec<NodeIndex>,
+    pub(crate) roots: Vec<NodeIndex>,
     // Stored for reporting
-    pub root_names: Vec<String>,
-    pub longest_task_name: usize,
-    pub graph: DiGraph<Arc<RwLock<TaskState>>, DependencyKind>,
-    pub tasks_order: Vec<NodeIndex>,
-    pub notify_finished: Arc<Notify>,
-    pub notify_ui: Arc<Notify>,
-    pub run_mode: RunMode,
-    pub cache: TaskCache,
-    pub shutdown: Arc<tokio_shutdown::Shutdown>,
+    pub(crate) root_names: Vec<String>,
+    pub(crate) graph: DiGraph<Arc<RwLock<TaskState>>, DependencyKind>,
+    pub(crate) tasks_order: Vec<NodeIndex>,
+    pub(crate) notify_finished: Arc<Notify>,
+    pub(crate) notify_ui: Arc<Notify>,
+    pub(crate) run_mode: RunMode,
+    pub(crate) cache: TaskCache,
+    pub(crate) shutdown: Arc<tokio_shutdown::Shutdown>,
     /// Process manager for running long-lived process tasks
-    pub process_manager: Arc<NativeProcessManager>,
+    pub(crate) process_manager: Arc<NativeProcessManager>,
     /// Environment variables to pass to processes
-    pub env: HashMap<String, String>,
+    pub(crate) env: HashMap<String, String>,
     /// Path to the bash binary to use for probe commands
-    pub bash: String,
-    pub executor: SubprocessExecutor,
+    pub(crate) bash: String,
     /// Force a refresh of the task cache, skipping cache reads
-    pub refresh_task_cache: bool,
+    pub(crate) refresh_task_cache: bool,
     /// When true, exclude non-root process-type tasks from the scheduled subgraph
-    pub ignore_process_deps: bool,
+    pub(crate) ignore_process_deps: bool,
 }
 
 impl Tasks {
@@ -185,6 +170,11 @@ impl Tasks {
         TasksBuilder::new(config, verbosity, shutdown)
     }
 
+    /// Returns a reference to the process manager used for long-lived process tasks.
+    pub fn process_manager(&self) -> &Arc<NativeProcessManager> {
+        &self.process_manager
+    }
+
     /// Get the current task completion status
     pub async fn get_completion_status(&self) -> TasksStatus {
         let mut status = TasksStatus::new();
@@ -195,7 +185,8 @@ impl Tasks {
                 TaskStatus::Pending => status.pending += 1,
                 TaskStatus::Oneshot(OneshotStatus::Running(_)) => status.running += 1,
                 TaskStatus::Process(ps) => match ps.phase {
-                    ProcessPhase::NotStarted => status.skipped += 1,
+                    ProcessPhase::NotStarted | ProcessPhase::Stopped => status.skipped += 1,
+                    ProcessPhase::Exited => status.succeeded += 1,
                     ProcessPhase::GaveUp => status.failed += 1,
                     ProcessPhase::Waiting | ProcessPhase::Starting | ProcessPhase::Ready => {
                         status.running += 1
@@ -578,17 +569,14 @@ impl Tasks {
         } else {
             ("Running tasks", "tasks")
         };
-        let orchestration_activity = Arc::new(
-            Activity::operation(label)
-                .detail(format!(
-                    "{} {}, roots: {:?}",
-                    self.tasks_order.len(),
-                    item_type,
-                    self.root_names
-                ))
-                .parent(None)
-                .start(),
-        );
+        let orchestration_activity = Arc::new(devenv_activity::start!(
+            Activity::operation(label).parent(None).detail(format!(
+                "{} {}, roots: {:?}",
+                self.tasks_order.len(),
+                item_type,
+                self.root_names
+            ))
+        ));
 
         self.run_internal(orchestration_activity).await
     }
@@ -633,7 +621,9 @@ impl Tasks {
             TaskCompleted::DependencyFailed
         };
 
-        let skip_activity = Activity::task_with_id(task_activity_id);
+        let task_name = task_state.read().await.task.name.clone();
+        let skip_activity =
+            devenv_activity::start!(Activity::task(&task_name).id(task_activity_id));
         if cancelled {
             skip_activity.cancel();
         } else {
@@ -809,25 +799,11 @@ impl Tasks {
                 ts.task.r#type == TaskType::Process
             };
 
-            let mut cancelled = self.shutdown.is_cancelled();
-            let mut dependency_failed = false;
-
-            // Only block the main loop for oneshot task dependencies.
-            // Process tasks check dependencies in their background spawn.
-            if !cancelled && !is_process_task {
-                let deps = self.collect_deps(*index);
-
-                let (c, f) =
-                    Self::wait_for_task_deps(&deps, &self.notify_finished, &self.shutdown).await;
-                cancelled = c;
-                dependency_failed = f;
-            }
-
-            if cancelled || dependency_failed {
+            if self.shutdown.is_cancelled() {
                 Self::mark_task_skipped(
                     task_state,
                     task_activity_id,
-                    cancelled,
+                    true,
                     &completed_tasks,
                     total_tasks,
                     &orchestration_activity,
@@ -968,12 +944,16 @@ impl Tasks {
                                 if let Some(status_rx) =
                                     process_manager_clone.subscribe_status(&process_name).await
                                 {
-                                    watch_status_until(
+                                    let _ = watch_status_until(
                                         &task_state_clone,
                                         &notify_finished_clone,
                                         &shutdown_clone,
                                         status_rx,
-                                        &[ProcessPhase::Ready, ProcessPhase::GaveUp],
+                                        &[
+                                            ProcessPhase::Ready,
+                                            ProcessPhase::GaveUp,
+                                            ProcessPhase::Exited,
+                                        ],
                                     )
                                     .await;
                                 }
@@ -1007,7 +987,6 @@ impl Tasks {
                         let watcher_pm = Arc::clone(&process_manager_clone);
                         let watcher_shutdown = Arc::clone(&shutdown_clone);
                         let watcher_name = process_name;
-                        let is_auto_start_off = launch_info.auto_start_off;
 
                         tokio::spawn(async move {
                             process_status_watcher(
@@ -1016,7 +995,6 @@ impl Tasks {
                                 watcher_pm,
                                 watcher_shutdown,
                                 watcher_name,
-                                is_auto_start_off,
                             )
                             .await;
                         });
@@ -1027,17 +1005,9 @@ impl Tasks {
                 continue;
             }
 
-            // Oneshot task: run once and complete
-            // Reset the timer
-            let now = Instant::now();
-
-            {
-                let mut task_state = task_state.write().await;
-                task_state.status = TaskStatus::Oneshot(OneshotStatus::Running(now));
-            };
-
-            // Notify UI that task is starting
-            self.notify_ui.notify_one();
+            // Oneshot task: spawn into background with dependency checking,
+            // so independent tasks can run in parallel.
+            let deps = self.collect_deps(*index);
 
             // TODO: consider Arc-ing self at this point
             let task_state_clone = Arc::clone(task_state);
@@ -1056,9 +1026,37 @@ impl Tasks {
                 // Clone for use inside the async block; the original is borrowed by in_activity
                 let orchestration_activity_inner = Arc::clone(&orchestration_activity_clone);
 
-                // Run the task within the orchestration activity's parent context
-                // so child task activities have proper parent-child relationships and tracing spans
                 async move {
+                    // Wait for dependencies in background
+                    let (dep_cancelled, dep_failed) =
+                        Self::wait_for_task_deps(&deps, &notify_finished_clone, &shutdown_clone)
+                            .await;
+
+                    if dep_cancelled || dep_failed {
+                        Self::mark_task_skipped(
+                            &task_state_clone,
+                            task_activity_id,
+                            dep_cancelled,
+                            &completed_tasks_clone,
+                            total_tasks,
+                            &orchestration_activity_inner,
+                            &notify_finished_clone,
+                            &notify_ui_clone,
+                        )
+                        .await;
+                        return;
+                    }
+
+                    // Reset the timer
+                    let now = Instant::now();
+
+                    {
+                        let mut task_state = task_state_clone.write().await;
+                        task_state.status = TaskStatus::Oneshot(OneshotStatus::Running(now));
+                    };
+
+                    // Notify UI that task is starting
+                    notify_ui_clone.notify_one();
                     let completed = {
                         let outputs = outputs_clone.lock().await.clone();
                         match task_state_clone
@@ -1070,7 +1068,6 @@ impl Tasks {
                                 &cache,
                                 shutdown_clone.cancellation_token(),
                                 task_activity_id,
-                                &SubprocessExecutor,
                                 refresh_task_cache,
                                 &shell_env,
                             )
@@ -1214,66 +1211,70 @@ async fn process_status_watcher(
     manager: Arc<NativeProcessManager>,
     shutdown: Arc<tokio_shutdown::Shutdown>,
     name: String,
-    initially_auto_start_off: bool,
 ) {
-    if initially_auto_start_off {
-        // For auto start off processes, wait for manual start (Ctrl-R).
-        // Use the enable() pattern to prevent missed wakeups: register the
-        // Notified future before checking phase so a notification that fires
-        // between the check and the await is not lost.
-        loop {
-            let notified = notify_finished.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
+    // Wait for the process to become active, subscribe to its status channel,
+    // and watch indefinitely until the channel closes (process stopped) or
+    // shutdown is requested. When the channel closes we set Stopped and loop
+    // back so a subsequent start/restart re-subscribes automatically.
+    loop {
+        let notified = notify_finished.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
 
-            if let Some(phase) = manager.get_phase(&name).await
-                && phase != ProcessPhase::NotStarted
-                && phase != ProcessPhase::Waiting
-            {
-                // Process was started externally, begin tracking
-                set_process_phase(&task_state, &notify_finished, ProcessPhase::Starting).await;
+        match manager.get_phase(&name).await {
+            Some(
+                ProcessPhase::NotStarted
+                | ProcessPhase::Stopped
+                | ProcessPhase::Waiting
+                | ProcessPhase::Exited,
+            )
+            | None => {
+                // Process is not active yet (auto start off, stopped, or waiting).
+                // Wait for a lifecycle notification before re-checking.
+                tokio::select! {
+                    _ = notified => { continue; }
+                    _ = shutdown.wait_for_shutdown() => { return; }
+                }
+            }
+            Some(ProcessPhase::Starting | ProcessPhase::Ready | ProcessPhase::GaveUp) => {
                 if let Some(status_rx) = manager.subscribe_status(&name).await {
-                    watch_status_until(
+                    set_process_phase(&task_state, &notify_finished, ProcessPhase::Starting).await;
+                    // Watch until Exited (process won't restart). GaveUp is not
+                    // terminal because the process can be restarted explicitly.
+                    let reached_terminal = watch_status_until(
                         &task_state,
                         &notify_finished,
                         &shutdown,
                         status_rx,
-                        &[ProcessPhase::GaveUp],
+                        &[ProcessPhase::Exited],
                     )
                     .await;
+                    if reached_terminal {
+                        // Process exited and won't restart; phase already set.
+                        continue;
+                    }
                 }
-                return;
+                // Channel closed (process was stopped) or could not subscribe.
+                // Update phase to Stopped and loop back to wait for restart.
+                set_process_phase(&task_state, &notify_finished, ProcessPhase::Stopped).await;
+                tokio::task::yield_now().await;
             }
-
-            tokio::select! {
-                _ = notified => {}
-                _ = shutdown.wait_for_shutdown() => { return; }
-            }
-        }
-    } else {
-        // Already active, watch for ongoing status changes (crash -> restart -> ready)
-        if let Some(status_rx) = manager.subscribe_status(&name).await {
-            watch_status_until(
-                &task_state,
-                &notify_finished,
-                &shutdown,
-                status_rx,
-                &[ProcessPhase::GaveUp],
-            )
-            .await;
         }
     }
 }
 
 /// Watch a process's status channel and update the task phase on each transition.
 /// Stops when the phase matches one of the `terminal_phases` or the channel/shutdown closes.
+///
+/// Returns `true` if a terminal phase was reached, `false` if the channel was closed
+/// (e.g. the process was stopped) or shutdown was requested.
 async fn watch_status_until(
     task_state: &Arc<RwLock<TaskState>>,
     notify: &Arc<tokio::sync::Notify>,
     shutdown: &Arc<tokio_shutdown::Shutdown>,
     mut status_rx: tokio::sync::watch::Receiver<devenv_processes::JobStatus>,
     terminal_phases: &[ProcessPhase],
-) {
+) -> bool {
     // Check the current value first to avoid missing a transition that
     // already happened before we subscribed. `borrow_and_update` marks
     // the current value as seen so the subsequent `changed()` call only
@@ -1282,19 +1283,19 @@ async fn watch_status_until(
         let phase: ProcessPhase = status_rx.borrow_and_update().phase.into();
         set_process_phase(task_state, notify, phase).await;
         if terminal_phases.contains(&phase) {
-            return;
+            return true;
         }
     }
 
     loop {
         tokio::select! {
             changed = status_rx.changed() => {
-                if changed.is_err() { break; }
-                let phase: ProcessPhase = status_rx.borrow().phase.into();
+                if changed.is_err() { return false; }
+                let phase: ProcessPhase = status_rx.borrow_and_update().phase.into();
                 set_process_phase(task_state, notify, phase).await;
-                if terminal_phases.contains(&phase) { break; }
+                if terminal_phases.contains(&phase) { return true; }
             }
-            _ = shutdown.wait_for_shutdown() => { break; }
+            _ = shutdown.wait_for_shutdown() => { return false; }
         }
     }
 }

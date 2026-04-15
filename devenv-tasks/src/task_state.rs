@@ -1,6 +1,6 @@
 use crate::SudoContext;
 use crate::config::TaskConfig;
-use crate::executor::{ExecutionContext, OutputCallback, SubprocessExecutor};
+use crate::executor::{ExecutionContext, OutputCallback};
 use crate::task_cache::{TaskCache, expand_glob_patterns};
 use crate::types::{
     Output, Outputs, ProcessPhase, ProcessTaskStatus, Skipped, TaskCompleted, TaskFailure,
@@ -133,9 +133,20 @@ impl TaskState {
         }
     }
 
-    /// Handle file modification checking with centralized error handling.
-    /// Returns a Result with a boolean indicating if files were modified.
-    async fn check_files_modified_result(
+    /// Check if any files specified in exec_if_modified have been modified.
+    #[tracing::instrument(
+        name = "exec_if_modified",
+        skip(self, cache),
+        fields(
+            task.name = %self.task.name,
+            task.cached,
+            exec_if_modified.pattern_count,
+            exec_if_modified.include_pattern_count,
+            exec_if_modified.exclude_pattern_count,
+            exec_if_modified.matched_file_count,
+        )
+    )]
+    async fn check_files_modified(
         &self,
         cache: &TaskCache,
     ) -> Result<bool, devenv_cache_core::error::CacheError> {
@@ -143,10 +154,22 @@ impl TaskState {
             return Ok(false);
         }
 
+        let patterns = &self.task.exec_if_modified;
+        let include_count = patterns.iter().filter(|p| !p.starts_with('!')).count();
+        let exclude_count = patterns.len() - include_count;
+        let mut matched_files = expand_glob_patterns(patterns);
+
+        let span = tracing::Span::current();
+        span.record("exec_if_modified.pattern_count", patterns.len());
+        span.record("exec_if_modified.include_pattern_count", include_count);
+        span.record("exec_if_modified.exclude_pattern_count", exclude_count);
+        span.record("exec_if_modified.matched_file_count", matched_files.len());
+
         let patterns_modified = cache
             .check_modified_files(&self.task.name, &self.task.exec_if_modified)
             .await?;
         if patterns_modified {
+            span.record("task.cached", false);
             return Ok(true);
         }
 
@@ -157,6 +180,7 @@ impl TaskState {
                 .check_modified_files(&self.task.name, std::slice::from_ref(cmd))
                 .await?;
             if cmd_modified {
+                span.record("task.cached", false);
                 return Ok(true);
             }
         }
@@ -164,31 +188,15 @@ impl TaskState {
         // Check for files previously tracked in the DB that no longer match the globs
         // (deleted, renamed, or moved outside the pattern). Build the full set of
         // currently expected paths so we don't false-positive on command paths.
-        let mut all_current_paths = expand_glob_patterns(&self.task.exec_if_modified);
         if let Some(cmd) = &self.task.command {
-            all_current_paths.push(cmd.clone());
+            matched_files.push(cmd.clone());
         }
-        cache
-            .has_removed_files(&self.task.name, &all_current_paths)
-            .await
-            .map_err(Into::into)
-    }
+        let removed = cache
+            .has_removed_files(&self.task.name, &matched_files)
+            .await?;
 
-    /// Check if any files specified in exec_if_modified have been modified.
-    /// Returns true if any files have been modified or if there was an error checking.
-    async fn check_modified_files(&self, cache: &TaskCache) -> bool {
-        match self.check_files_modified_result(cache).await {
-            Ok(modified) => modified,
-            Err(e) => {
-                // Log the error and default to running the task if there's an error
-                tracing::warn!(
-                    "Failed to check modified files for task {}: {}",
-                    self.task.name,
-                    e
-                );
-                true
-            }
-        }
+        span.record("task.cached", !removed);
+        Ok(removed)
     }
 
     /// Prepare environment variables for task execution.
@@ -430,12 +438,12 @@ impl TaskState {
         cache: &TaskCache,
         cancellation: CancellationToken,
         activity_id: u64,
-        executor: &SubprocessExecutor,
         refresh_task_cache: bool,
         shell_env: &std::collections::HashMap<String, String>,
     ) -> Result<TaskCompleted> {
         // Create the Activity with the pre-assigned ID - this emits Task::Start
-        let task_activity = Activity::task_with_id(activity_id);
+        let task_activity =
+            devenv_activity::start!(Activity::task(&self.task.name).id(activity_id));
 
         // Run the entire task within the activity's scope for proper parent-child nesting
         self.run_inner(
@@ -444,7 +452,6 @@ impl TaskState {
             cache,
             cancellation,
             &task_activity,
-            executor,
             refresh_task_cache,
             shell_env,
         )
@@ -459,7 +466,6 @@ impl TaskState {
         cache: &TaskCache,
         cancellation: CancellationToken,
         task_activity: &Activity,
-        executor: &SubprocessExecutor,
         refresh_task_cache: bool,
         shell_env: &std::collections::HashMap<String, String>,
     ) -> Result<TaskCompleted> {
@@ -492,10 +498,11 @@ impl TaskState {
                 let mut command = ctx.build_command();
 
                 // Create a Command activity for the status check (automatically parented to task_activity)
-                let status_activity = Activity::command(&self.task.name)
-                    .command(cmd)
-                    .level(ActivityLevel::Debug)
-                    .start();
+                let status_activity = devenv_activity::start!(
+                    Activity::command("check status")
+                        .command(cmd)
+                        .level(ActivityLevel::Debug)
+                );
 
                 match command.output().await {
                     Ok(output) => {
@@ -540,18 +547,17 @@ impl TaskState {
                     }
                 }
             } else if !self.task.exec_if_modified.is_empty() {
-                tracing::debug!(
-                    "Task '{}' has exec_if_modified files: {:?}",
-                    self.task.name,
-                    self.task.exec_if_modified
-                );
-
-                let files_modified = self.check_modified_files(cache).await;
-                tracing::debug!(
-                    "Task '{}' files modified check result: {}",
-                    self.task.name,
-                    files_modified
-                );
+                let files_modified = match self.check_files_modified(cache).await {
+                    Ok(modified) => modified,
+                    Err(e) => {
+                        tracing::warn!(
+                            task.name = %self.task.name,
+                            error = %e,
+                            "Failed to check modified files, assuming modified",
+                        );
+                        true
+                    }
+                };
 
                 if !files_modified {
                     // First check if we have outputs in the current run's outputs map,
@@ -578,10 +584,11 @@ impl TaskState {
         };
 
         // Create a Command activity for the main execution (automatically parented to task_activity)
-        let cmd_activity = Activity::command(&self.task.name)
-            .command(cmd)
-            .level(ActivityLevel::Debug)
-            .start();
+        let cmd_activity = devenv_activity::start!(
+            Activity::command("execute command")
+                .command(cmd)
+                .level(ActivityLevel::Debug)
+        );
 
         self.validate_cwd()?;
 
@@ -606,7 +613,7 @@ impl TaskState {
 
         // Execute using the provided executor
         let callback = ActivityCallback::new(task_activity);
-        let result = executor.execute(ctx, &callback, cancellation).await;
+        let result = crate::executor::execute(ctx, &callback, cancellation).await;
 
         // Only update file states on success - failed tasks should not be cached
         if result.success {

@@ -14,7 +14,6 @@ use serde_json::Value;
 use sqlx::Row;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 use tracing::{debug, warn};
 
 const GLOB_SPECIAL_CHARS: &[char] = &['*', '?', '[', '{'];
@@ -209,11 +208,11 @@ pub fn expand_glob_patterns(patterns: &[String]) -> Vec<String> {
         let mut walk_builder = WalkBuilder::new(&base_dir);
         walk_builder
             .hidden(false)
-            .ignore(false)
-            .git_ignore(false)
-            .git_global(false)
-            .git_exclude(false)
-            .parents(false)
+            .ignore(true)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
+            .parents(true)
             .follow_links(true)
             .overrides(overrides_for_walk);
 
@@ -385,15 +384,10 @@ impl TaskCache {
         Ok(())
     }
 
-    /// Get current Unix timestamp
-    fn now() -> i64 {
-        time::system_time_to_unix_seconds(SystemTime::now())
-    }
-
     /// Store task output in the cache.
     pub async fn store_task_output(&self, task_name: &str, output: &Value) -> CacheResult<()> {
         let output_json = serde_json::to_string(output)?;
-        let now = Self::now();
+        let now = time::now_as_unix_seconds();
 
         sqlx::query(
             r#"
@@ -1192,6 +1186,40 @@ mod tests {
         let explicit_dot_matches = expand_glob_patterns(&[explicit_dot_pattern]);
         assert_eq!(explicit_dot_matches.len(), 1);
         assert!(explicit_dot_matches[0].ends_with("/src/.hidden.ts"));
+    }
+
+    #[test]
+    fn test_expand_glob_patterns_respects_gitignore() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+
+        // Initialize a git repo so the ignore crate picks up .gitignore
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(base)
+            .output()
+            .unwrap();
+
+        // Create .gitignore that ignores repos/
+        std::fs::write(base.join(".gitignore"), "repos/\n").unwrap();
+
+        // Create directory structure:
+        // src/main.ts
+        // repos/deep/ignored.ts
+        let src_dir = base.join("src");
+        let repos_dir = base.join("repos").join("deep");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&repos_dir).unwrap();
+
+        std::fs::write(src_dir.join("main.ts"), "main").unwrap();
+        std::fs::write(repos_dir.join("ignored.ts"), "ignored").unwrap();
+
+        let pattern = format!("{}/**/*.ts", base.display());
+        let matches = expand_glob_patterns(&[pattern]);
+
+        // Should only find src/main.ts, not repos/deep/ignored.ts
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].ends_with("/src/main.ts"));
     }
 
     #[test]

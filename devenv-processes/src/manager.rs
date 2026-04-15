@@ -1,10 +1,11 @@
 use async_trait::async_trait;
-use devenv_activity::{Activity, ProcessStatus};
+use devenv_activity::{Activity, ProcessStatus, activity};
 use miette::{IntoDiagnostic, Result, WrapErr, bail};
 use nix::sys::signal::{self, Signal as NixSignal};
 use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,6 +21,8 @@ use tracing::{debug, info, warn};
 pub enum ProcessCommand {
     /// Restart a running process, or start a stopped process
     Restart(String),
+    /// Stop a running process but keep it visible and restartable
+    Stop(String),
 }
 
 /// Request sent by a client to the native manager API socket.
@@ -31,6 +34,36 @@ pub enum ProcessCommand {
 pub enum ApiRequest {
     /// Block until every managed process is ready, then respond.
     Wait,
+    /// List all managed processes and their status.
+    List,
+    /// Get the status of a single process.
+    Status { name: String },
+    /// Get the last N lines of stdout/stderr logs for a process.
+    Logs { name: String, lines: Option<usize> },
+    /// Restart a process (or start it if not started).
+    Restart { name: String },
+    /// Start a process that has `start.enable = false`.
+    Start { name: String },
+    /// Stop a running process.
+    Stop { name: String },
+    /// Query all port allocations from running processes.
+    Ports,
+}
+
+/// Port allocation info from a running process.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortInfo {
+    pub process_name: String,
+    pub port_name: String,
+    pub port: u16,
+}
+
+/// Summary information about a managed process.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessInfo {
+    pub name: String,
+    pub phase: ProcessPhase,
+    pub restart_count: usize,
 }
 
 /// Response sent by the native manager API socket.
@@ -41,6 +74,16 @@ pub enum ApiResponse {
     Ready,
     /// An error occurred.
     Error { message: String },
+    /// List of all managed processes.
+    ProcessList { processes: Vec<ProcessInfo> },
+    /// Detailed info about a single process.
+    ProcessDetail { info: ProcessInfo },
+    /// Log output for a process.
+    ProcessLogs { stdout: String, stderr: String },
+    /// Operation completed successfully.
+    Ok,
+    /// All port allocations from managed processes.
+    PortAllocations { ports: Vec<PortInfo> },
 }
 
 use watchexec_supervisor::{
@@ -93,18 +136,37 @@ pub struct JobHandle {
 ///
 /// Shared between the process manager and the task system to avoid
 /// duplicate enum definitions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProcessPhase {
     /// Process has `start.enable = false`; not yet launched.
     NotStarted,
+    /// Process was explicitly stopped by the user.
+    Stopped,
     /// Registered, waiting for dependencies before starting.
     Waiting,
     /// Launched, readiness not yet confirmed.
     Starting,
     /// Readiness probe passed.
     Ready,
+    /// Process exited and will not be restarted.
+    Exited,
     /// Supervisor gave up (crash loop).
     GaveUp,
+}
+
+impl std::fmt::Display for ProcessPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotStarted => write!(f, "not_started"),
+            Self::Stopped => write!(f, "stopped"),
+            Self::Waiting => write!(f, "waiting"),
+            Self::Starting => write!(f, "starting"),
+            Self::Ready => write!(f, "ready"),
+            Self::Exited => write!(f, "exited"),
+            Self::GaveUp => write!(f, "gave_up"),
+        }
+    }
 }
 
 impl From<crate::supervisor_state::SupervisorPhase> for ProcessPhase {
@@ -112,6 +174,7 @@ impl From<crate::supervisor_state::SupervisorPhase> for ProcessPhase {
         match phase {
             crate::supervisor_state::SupervisorPhase::Starting => Self::Starting,
             crate::supervisor_state::SupervisorPhase::Ready => Self::Ready,
+            crate::supervisor_state::SupervisorPhase::Exited => Self::Exited,
             crate::supervisor_state::SupervisorPhase::GaveUp => Self::GaveUp,
         }
     }
@@ -123,7 +186,9 @@ fn active_names(processes: &HashMap<String, ProcessEntry>) -> Vec<String> {
         .iter()
         .filter_map(|(name, entry)| match entry {
             ProcessEntry::Active(_) => Some(name.clone()),
-            ProcessEntry::NotStarted { .. } | ProcessEntry::Waiting { .. } => None,
+            ProcessEntry::NotStarted { .. }
+            | ProcessEntry::Stopped { .. }
+            | ProcessEntry::Waiting { .. } => None,
         })
         .collect()
 }
@@ -132,6 +197,11 @@ fn active_names(processes: &HashMap<String, ProcessEntry>) -> Vec<String> {
 enum ProcessEntry {
     /// Process has `start.enable = false`: visible in TUI but not yet launched.
     NotStarted {
+        config: ProcessConfig,
+        activity: Activity,
+    },
+    /// Process was explicitly stopped by the user; can be started again.
+    Stopped {
         config: ProcessConfig,
         activity: Activity,
     },
@@ -173,6 +243,190 @@ fn probe_description(config: &ProcessConfig) -> Option<String> {
     None
 }
 
+const PORT_RELEASE_TIMEOUT: Duration = Duration::from_secs(15);
+const PORT_RELEASE_INITIAL_DELAY: Duration = Duration::from_millis(25);
+const PORT_RELEASE_MAX_DELAY: Duration = Duration::from_millis(250);
+
+fn declared_ports(config: &ProcessConfig) -> Vec<u16> {
+    config
+        .ports
+        .values()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+#[cfg(test)]
+fn can_bind_exact_port(port: u16) -> bool {
+    bind_no_reuse(socket2::Domain::IPV4, "0.0.0.0", port).is_ok()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PortReleaseState {
+    Free,
+    Ownerless,
+    Owned(String),
+    Unknown(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PortOwnerLookup {
+    Ownerless,
+    Owned(String),
+    Unknown(String),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PortReleaseStatus {
+    ownerless: Vec<u16>,
+    owned: Vec<(u16, String)>,
+    unknown: Vec<(u16, String)>,
+}
+
+impl PortReleaseStatus {
+    fn blocking_ports(&self) -> Vec<u16> {
+        self.owned
+            .iter()
+            .map(|(port, _)| *port)
+            .chain(self.unknown.iter().map(|(port, _)| *port))
+            .collect()
+    }
+
+    fn ownerless_ports(&self) -> &[u16] {
+        &self.ownerless
+    }
+
+    fn has_only_ownerless_conflicts(&self) -> bool {
+        !self.ownerless.is_empty() && self.owned.is_empty() && self.unknown.is_empty()
+    }
+}
+
+fn lookup_process_using_port(port: u16) -> PortOwnerLookup {
+    use netstat2::{AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo, get_sockets_info};
+
+    let af_flags = AddressFamilyFlags::IPV4 | AddressFamilyFlags::IPV6;
+    let proto_flags = ProtocolFlags::TCP;
+
+    let sockets = match get_sockets_info(af_flags, proto_flags) {
+        Ok(sockets) => sockets,
+        Err(err) => {
+            return PortOwnerLookup::Unknown(format!("socket inspection failed: {}", err));
+        }
+    };
+
+    for socket in sockets {
+        let local_port = match &socket.protocol_socket_info {
+            ProtocolSocketInfo::Tcp(tcp) => tcp.local_port,
+            ProtocolSocketInfo::Udp(udp) => udp.local_port,
+        };
+
+        if local_port == port
+            && let Some(&pid) = socket.associated_pids.first()
+        {
+            #[cfg(target_os = "linux")]
+            if let Ok(name) = std::fs::read_to_string(format!("/proc/{}/comm", pid)) {
+                return PortOwnerLookup::Owned(format!(" by {} (PID {})", name.trim(), pid));
+            }
+
+            return PortOwnerLookup::Owned(format!(" (PID {})", pid));
+        }
+    }
+
+    PortOwnerLookup::Ownerless
+}
+
+/// Bind a TCP socket without `SO_REUSEADDR` to reliably detect port conflicts.
+///
+/// Mirrors the implementation in `devenv-core::ports` but kept local to avoid
+/// adding a cross-crate dependency for a single helper.
+fn bind_no_reuse(
+    domain: socket2::Domain,
+    addr: &str,
+    port: u16,
+) -> Result<TcpListener, std::io::Error> {
+    use std::net::SocketAddr;
+
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    let sock_addr: SocketAddr = format!("{}:{}", addr, port)
+        .parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    socket.bind(&socket2::SockAddr::from(sock_addr))?;
+    socket.listen(1)?;
+    Ok(TcpListener::from(socket))
+}
+
+fn probe_port_release(port: u16) -> PortReleaseState {
+    match bind_no_reuse(socket2::Domain::IPV4, "0.0.0.0", port) {
+        Ok(listener) => {
+            drop(listener);
+            PortReleaseState::Free
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
+            match lookup_process_using_port(port) {
+                PortOwnerLookup::Ownerless => PortReleaseState::Ownerless,
+                PortOwnerLookup::Owned(owner) => PortReleaseState::Owned(owner),
+                PortOwnerLookup::Unknown(reason) => PortReleaseState::Unknown(reason),
+            }
+        }
+        Err(err) => PortReleaseState::Unknown(err.to_string()),
+    }
+}
+
+fn probe_port_release_status_with<Probe>(ports: &[u16], mut probe: Probe) -> PortReleaseStatus
+where
+    Probe: FnMut(u16) -> PortReleaseState,
+{
+    let mut status = PortReleaseStatus::default();
+
+    for port in ports.iter().copied() {
+        match probe(port) {
+            PortReleaseState::Free => {}
+            PortReleaseState::Ownerless => status.ownerless.push(port),
+            PortReleaseState::Owned(owner) => status.owned.push((port, owner)),
+            PortReleaseState::Unknown(reason) => status.unknown.push((port, reason)),
+        }
+    }
+
+    status
+}
+
+async fn wait_for_port_conflicts_to_settle_with<Probe, Sleep, Fut>(
+    ports: &[u16],
+    timeout: Duration,
+    mut probe: Probe,
+    mut sleep: Sleep,
+) -> PortReleaseStatus
+where
+    Probe: FnMut(u16) -> PortReleaseState,
+    Sleep: FnMut(Duration) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let started = std::time::Instant::now();
+    let mut delay = PORT_RELEASE_INITIAL_DELAY;
+
+    loop {
+        let status = probe_port_release_status_with(ports, &mut probe);
+
+        if status.blocking_ports().is_empty()
+            || status.has_only_ownerless_conflicts()
+            || started.elapsed() >= timeout
+        {
+            return status;
+        }
+
+        sleep(delay).await;
+        delay = Duration::from_secs_f64(
+            (delay.as_secs_f64() * 2.0).min(PORT_RELEASE_MAX_DELAY.as_secs_f64()),
+        );
+    }
+}
+
+async fn wait_for_port_conflicts_to_settle(ports: &[u16], timeout: Duration) -> PortReleaseStatus {
+    wait_for_port_conflicts_to_settle_with(ports, timeout, probe_port_release, tokio::time::sleep)
+        .await
+}
+
 impl NativeProcessManager {
     /// Create a new native process manager
     pub fn new(state_dir: PathBuf) -> Result<Self> {
@@ -198,6 +452,7 @@ impl NativeProcessManager {
         let processes = self.processes.read().await;
         match processes.get(name) {
             Some(ProcessEntry::NotStarted { .. }) => Some(ProcessPhase::NotStarted),
+            Some(ProcessEntry::Stopped { .. }) => Some(ProcessPhase::Stopped),
             Some(ProcessEntry::Waiting { .. }) => Some(ProcessPhase::Waiting),
             Some(ProcessEntry::Active(handle)) => Some(handle.status_rx.borrow().phase.into()),
             None => None,
@@ -229,7 +484,7 @@ impl NativeProcessManager {
 
     /// Path to the API socket
     pub fn api_socket_path(&self) -> PathBuf {
-        self.state_dir.join("native.sock")
+        self.state_dir.join(crate::NATIVE_SOCKET_NAME)
     }
 
     /// Create a TUI activity for a process without launching it.
@@ -262,7 +517,7 @@ impl NativeProcessManager {
         if let Some(pid) = parent_id {
             builder = builder.parent(Some(pid));
         }
-        builder.start()
+        devenv_activity::start!(builder)
     }
 
     /// Register a process as waiting for dependencies.
@@ -398,7 +653,7 @@ impl NativeProcessManager {
         let has_sockets = !config.listen.is_empty();
         let has_caps = !config.linux.capabilities.is_empty();
 
-        if has_sockets || has_caps {
+        let process_setup = if has_sockets || has_caps {
             let fds = if has_sockets {
                 info!("Setting up socket activation for {}", config.name);
                 let spec = activation_from_listen(&config.listen)?;
@@ -421,10 +676,44 @@ impl NativeProcessManager {
             }
 
             let capabilities = config.linux.capabilities.clone();
-            job.set_spawn_hook(move |command_wrap, _ctx| {
+            Some((fds, capabilities))
+        } else {
+            None
+        };
+
+        // Set spawn hook to configure env, cwd, and stdio on the TokioCommand
+        // directly instead of baking them into the bash wrapper script. This
+        // avoids hitting the kernel ARG_MAX limit with large environments.
+        let spawn_env = proc_cmd.env;
+        let spawn_cwd = proc_cmd.cwd;
+        let spawn_stdout = proc_cmd.stdout_log.clone();
+        let spawn_stderr = proc_cmd.stderr_log.clone();
+
+        job.set_spawn_hook(move |command_wrap, _ctx| {
+            let cmd = command_wrap.command_mut();
+            cmd.envs(&spawn_env);
+            if let Some(ref cwd) = spawn_cwd {
+                cmd.current_dir(cwd);
+            }
+            cmd.stdin(std::process::Stdio::null());
+            cmd.stdout(
+                crate::command::open_log_file(&spawn_stdout)
+                    .map(std::process::Stdio::from)
+                    .unwrap_or_else(std::process::Stdio::null),
+            );
+            cmd.stderr(
+                crate::command::open_log_file(&spawn_stderr)
+                    .map(std::process::Stdio::from)
+                    .unwrap_or_else(std::process::Stdio::null),
+            );
+
+            // Inject OTEL trace context so instrumented subprocesses join the trace.
+            cmd.envs(devenv_activity::trace_propagation_env());
+
+            if let Some((ref fds, ref capabilities)) = process_setup {
                 command_wrap.wrap(ProcessSetupWrapper::new(fds.clone(), capabilities.clone()));
-            });
-        }
+            }
+        });
 
         job.start().await;
 
@@ -484,47 +773,245 @@ impl NativeProcessManager {
 
     /// Stop a process by name
     pub async fn stop(&self, name: &str) -> Result<()> {
-        let mut processes = self.processes.write().await;
+        // Extract the handle and immediately insert a Stopped entry so the process
+        // stays visible in the map during teardown. Without this, concurrent API
+        // queries (list, status) would see "not found" during the teardown window.
+        let (job, supervisor_task, output_readers, ports) = {
+            let mut processes = self.processes.write().await;
 
-        match processes.remove(name) {
-            Some(ProcessEntry::Active(handle)) => {
-                debug!("Stopping process: {}", name);
+            match processes.remove(name) {
+                Some(ProcessEntry::Active(handle)) => {
+                    let ports = declared_ports(&handle.resources.config);
+                    let JobHandle {
+                        resources,
+                        supervisor_task,
+                        output_readers,
+                        ..
+                    } = handle;
+                    let ProcessResources {
+                        config,
+                        activity,
+                        job,
+                        ..
+                    } = resources;
 
-                // Mark as stopped so the TUI shows the correct status
-                // before the Complete event arrives from Activity::drop.
-                handle.resources.activity.set_status(ProcessStatus::Stopped);
-                handle.resources.activity.reset();
+                    activity.set_status(ProcessStatus::Stopping);
+                    processes.insert(name.to_string(), ProcessEntry::Stopped { config, activity });
 
-                // Abort the supervisor task first to prevent restarts
-                handle.supervisor_task.abort();
-
-                // Abort output reader tasks
-                if let Some((stdout_reader, stderr_reader)) = handle.output_readers {
-                    stdout_reader.abort();
-                    stderr_reader.abort();
+                    (job, supervisor_task, output_readers, ports)
                 }
-
-                // Send terminate signal with grace period
-                handle
-                    .resources
-                    .job
-                    .stop_with_signal(Signal::Terminate, Duration::from_secs(5))
-                    .await;
-
-                info!("Process {} stopped", name);
-                Ok(())
+                Some(
+                    entry @ (ProcessEntry::NotStarted { .. }
+                    | ProcessEntry::Stopped { .. }
+                    | ProcessEntry::Waiting { .. }),
+                ) => {
+                    let state = match &entry {
+                        ProcessEntry::NotStarted { .. } => "auto start off",
+                        ProcessEntry::Stopped { .. } => "already stopped",
+                        ProcessEntry::Waiting { .. } => "waiting for dependencies",
+                        ProcessEntry::Active(_) => unreachable!(),
+                    };
+                    processes.insert(name.to_string(), entry);
+                    bail!("Process {} is {}, cannot stop", name, state)
+                }
+                None => bail!("Process {} not found", name),
             }
-            Some(entry @ (ProcessEntry::NotStarted { .. } | ProcessEntry::Waiting { .. })) => {
-                let state = if matches!(entry, ProcessEntry::NotStarted { .. }) {
-                    "auto start off"
-                } else {
-                    "waiting for dependencies"
-                };
-                processes.insert(name.to_string(), entry);
-                bail!("Process {} is {}, cannot stop", name, state)
-            }
-            None => bail!("Process {} not found", name),
+        };
+
+        let grace_period = Duration::from_secs(5);
+
+        debug!("Stopping process: {}", name);
+
+        // Abort the supervisor task first to prevent restarts
+        supervisor_task.abort();
+
+        // Abort output reader tasks
+        if let Some((stdout_reader, stderr_reader)) = output_readers {
+            stdout_reader.abort();
+            stderr_reader.abort();
         }
+
+        // Send terminate signal with grace period
+        job.stop_with_signal(Signal::Terminate, grace_period).await;
+
+        if !ports.is_empty() {
+            let release_status =
+                wait_for_port_conflicts_to_settle(&ports, PORT_RELEASE_TIMEOUT).await;
+
+            if !release_status.ownerless_ports().is_empty() {
+                let port_list = release_status
+                    .ownerless_ports()
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                debug!(
+                    "Ports still in transient ownerless teardown after stopping {}: {}",
+                    name, port_list
+                );
+            }
+
+            if !release_status.blocking_ports().is_empty() {
+                let port_list = release_status
+                    .blocking_ports()
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let details = release_status
+                    .owned
+                    .iter()
+                    .map(|(port, owner)| format!("{}{}", port, owner))
+                    .chain(
+                        release_status
+                            .unknown
+                            .iter()
+                            .map(|(port, reason)| format!("{} ({})", port, reason)),
+                    )
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                warn!(
+                    "Ports still busy after {:.1}s for process {}: {}",
+                    PORT_RELEASE_TIMEOUT.as_secs_f32(),
+                    name,
+                    port_list
+                );
+                debug!("Port release blockers for {}: {}", name, details);
+            }
+        }
+
+        // Update the TUI activity to Stopped now that teardown is complete.
+        {
+            let processes = self.processes.read().await;
+            if let Some(ProcessEntry::Stopped { activity, .. }) = processes.get(name) {
+                activity.set_status(ProcessStatus::Stopped);
+            }
+        }
+
+        info!("Process {} stopped", name);
+        Ok(())
+    }
+
+    /// Stop a process but keep it visible in the TUI and restartable via Ctrl+R.
+    ///
+    /// Unlike `stop()` which removes the entry (used during full shutdown), this
+    /// transitions the entry back to `NotStarted` so the process remains in the TUI
+    /// with "stopped" status and can be restarted with `start_not_started()`.
+    pub async fn stop_and_keep(&self, name: &str) -> Result<()> {
+        let handle = {
+            let mut processes = self.processes.write().await;
+
+            match processes.remove(name) {
+                Some(ProcessEntry::Active(handle)) => handle,
+                Some(
+                    entry @ (ProcessEntry::NotStarted { .. }
+                    | ProcessEntry::Waiting { .. }
+                    | ProcessEntry::Stopped { .. }),
+                ) => {
+                    let state = match &entry {
+                        ProcessEntry::NotStarted { .. } => "not running",
+                        ProcessEntry::Stopped { .. } => "already stopped",
+                        _ => "waiting for dependencies",
+                    };
+                    processes.insert(name.to_string(), entry);
+                    bail!("Process {} is {}, cannot stop", name, state)
+                }
+                None => bail!("Process {} not found", name),
+            }
+        };
+
+        let grace_period = Duration::from_secs(5);
+        let ports = declared_ports(&handle.resources.config);
+
+        debug!("Stopping process (keeping visible): {}", name);
+        handle
+            .resources
+            .activity
+            .set_status(ProcessStatus::Stopping);
+
+        handle.supervisor_task.abort();
+
+        if let Some((stdout_reader, stderr_reader)) = handle.output_readers {
+            stdout_reader.abort();
+            stderr_reader.abort();
+        }
+
+        handle
+            .resources
+            .job
+            .stop_with_signal(Signal::Terminate, grace_period)
+            .await;
+
+        if !ports.is_empty() {
+            let release_status =
+                wait_for_port_conflicts_to_settle(&ports, PORT_RELEASE_TIMEOUT).await;
+
+            if !release_status.ownerless_ports().is_empty() {
+                let port_list = release_status
+                    .ownerless_ports()
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                debug!(
+                    "Ports still in transient ownerless teardown after stopping {}: {}",
+                    name, port_list
+                );
+            }
+
+            if !release_status.blocking_ports().is_empty() {
+                let port_list = release_status
+                    .blocking_ports()
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let details = release_status
+                    .owned
+                    .iter()
+                    .map(|(port, owner)| format!("{}{}", port, owner))
+                    .chain(
+                        release_status
+                            .unknown
+                            .iter()
+                            .map(|(port, reason)| format!("{} ({})", port, reason)),
+                    )
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                warn!(
+                    "Ports still busy after {:.1}s for process {}: {}",
+                    PORT_RELEASE_TIMEOUT.as_secs_f32(),
+                    name,
+                    port_list
+                );
+                debug!("Port release blockers for {}: {}", name, details);
+            }
+        }
+
+        handle.resources.activity.set_status(ProcessStatus::Stopped);
+
+        // Destructure to move Activity out without dropping it.
+        // Activity::drop sends Process::Complete which would remove it from the TUI.
+        let ProcessResources {
+            config,
+            activity,
+            job: _,
+            notify_socket: _,
+            status_tx: _,
+            stderr_log: _,
+        } = handle.resources;
+
+        self.processes.write().await.insert(
+            name.to_string(),
+            ProcessEntry::NotStarted { config, activity },
+        );
+
+        if let Some(notify) = &self.task_notify {
+            notify.notify_waiters();
+        }
+
+        info!("Process {} stopped", name);
+        Ok(())
     }
 
     /// Signal all supervisors to shut down gracefully.
@@ -543,8 +1030,13 @@ impl NativeProcessManager {
         let names = active_names(&*self.processes.read().await);
 
         debug!("stop_all: stopping {} processes: {:?}", names.len(), names);
-        for name in &names {
-            let _ = self.stop(name).await; // Continue even if one fails
+        for (name, result) in names
+            .iter()
+            .zip(futures::future::join_all(names.iter().map(|name| self.stop(name))).await)
+        {
+            if let Err(err) = result {
+                warn!("Failed to stop process {}: {}", name, err);
+            }
         }
 
         // Clear not-started and waiting processes (their activities complete on drop)
@@ -564,9 +1056,17 @@ impl NativeProcessManager {
         let mut processes = self.processes.write().await;
         let handle = match processes.get_mut(name) {
             Some(ProcessEntry::Active(h)) => h,
-            Some(_) => {
-                debug!("restart: process {} is not active, ignoring", name);
-                return Ok(());
+            Some(ProcessEntry::NotStarted { .. }) => {
+                bail!(
+                    "Process {} has auto start disabled, use 'start' instead",
+                    name
+                )
+            }
+            Some(ProcessEntry::Stopped { .. }) => {
+                bail!("Process {} is stopped, use 'start' instead", name)
+            }
+            Some(ProcessEntry::Waiting { .. }) => {
+                bail!("Process {} is waiting for dependencies", name)
             }
             None => bail!("Process {} not running", name),
         };
@@ -630,18 +1130,19 @@ impl NativeProcessManager {
         Ok(())
     }
 
-    /// Start a previously not-started process, reusing its existing TUI activity.
+    /// Start a previously not-started or stopped process, reusing its existing TUI activity.
     pub async fn start_not_started(&self, name: &str) -> Result<Arc<Job>> {
         let (config, activity) = {
             let mut processes = self.processes.write().await;
             match processes.get(name) {
-                Some(ProcessEntry::NotStarted { .. }) => {}
-                Some(_) => bail!("Process {} is not in not-started state", name),
+                Some(ProcessEntry::NotStarted { .. } | ProcessEntry::Stopped { .. }) => {}
+                Some(_) => bail!("Process {} is already running", name),
                 None => bail!("Process {} not found", name),
             }
             // Safe: we just checked the variant above.
             match processes.remove(name).unwrap() {
-                ProcessEntry::NotStarted { config, activity } => (config, activity),
+                ProcessEntry::NotStarted { config, activity }
+                | ProcessEntry::Stopped { config, activity } => (config, activity),
                 _ => unreachable!(),
             }
         };
@@ -722,11 +1223,9 @@ impl NativeProcessManager {
     ///
     /// Listens on `state_dir/native.sock` using newline-delimited JSON (`ApiRequest`/`ApiResponse`).
     /// Must be called after all initial processes have been registered in `jobs`.
-    pub fn start_api_server(&self) -> Result<()> {
+    pub fn start_api_server(self: &Arc<Self>) -> Result<()> {
         let sock_path = self.api_socket_path();
         let _ = std::fs::remove_file(&sock_path);
-        let processes = self.processes.clone();
-        let task_notify = self.task_notify.clone();
 
         let listener = std::os::unix::net::UnixListener::bind(&sock_path)
             .into_diagnostic()
@@ -735,13 +1234,13 @@ impl NativeProcessManager {
         let listener = tokio::net::UnixListener::from_std(listener).into_diagnostic()?;
         info!("API server listening on {}", sock_path.display());
 
+        let manager = Arc::clone(self);
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
-                        let processes = processes.clone();
-                        let task_notify = task_notify.clone();
-                        tokio::spawn(Self::handle_api_client(stream, processes, task_notify));
+                        let manager = Arc::clone(&manager);
+                        tokio::spawn(Self::handle_api_client(stream, manager));
                     }
                     Err(e) => {
                         warn!("API accept error: {}", e);
@@ -754,12 +1253,78 @@ impl NativeProcessManager {
         Ok(())
     }
 
+    /// Build a `ProcessInfo` from a process entry.
+    fn process_info(name: &str, entry: &ProcessEntry) -> ProcessInfo {
+        let (phase, restart_count) = match entry {
+            ProcessEntry::NotStarted { .. } => (ProcessPhase::NotStarted, 0),
+            ProcessEntry::Stopped { .. } => (ProcessPhase::Stopped, 0),
+            ProcessEntry::Waiting { .. } => (ProcessPhase::Waiting, 0),
+            ProcessEntry::Active(handle) => {
+                let status = handle.status_rx.borrow();
+                (ProcessPhase::from(status.phase), status.restart_count)
+            }
+        };
+        ProcessInfo {
+            name: name.to_string(),
+            phase,
+            restart_count,
+        }
+    }
+
+    fn process_not_found(name: &str) -> ApiResponse {
+        ApiResponse::Error {
+            message: format!("process '{}' not found", name),
+        }
+    }
+
+    /// Read the last N lines from a file, returning them as a single string.
+    ///
+    /// Reads at most 1 MB from the end of the file to avoid loading
+    /// arbitrarily large log files into memory.
+    fn read_tail(path: &std::path::Path, max_lines: usize) -> String {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let Ok(mut file) = std::fs::File::open(path) else {
+            return String::new();
+        };
+        let Ok(metadata) = file.metadata() else {
+            return String::new();
+        };
+
+        let file_size = metadata.len();
+        let read_size = file_size.min(1024 * 1024) as usize;
+        let start_pos = file_size.saturating_sub(read_size as u64);
+
+        if file.seek(SeekFrom::Start(start_pos)).is_err() {
+            return String::new();
+        }
+
+        let mut bytes = Vec::with_capacity(read_size);
+        if file.read_to_end(&mut bytes).is_err() {
+            return String::new();
+        }
+
+        let buf = String::from_utf8_lossy(&bytes);
+
+        // Scan backwards to find the start of the last N lines
+        let mut newline_count = 0;
+        let start_byte = buf
+            .rmatch_indices('\n')
+            .find_map(|(i, _)| {
+                newline_count += 1;
+                if newline_count > max_lines {
+                    Some(i + 1)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+
+        buf[start_byte..].trim_end_matches('\n').to_string()
+    }
+
     /// Handle a single API client connection.
-    async fn handle_api_client(
-        stream: tokio::net::UnixStream,
-        processes: Arc<RwLock<HashMap<String, ProcessEntry>>>,
-        task_notify: Option<Arc<Notify>>,
-    ) {
+    async fn handle_api_client(stream: tokio::net::UnixStream, manager: Arc<Self>) {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
         let (reader, mut writer) = stream.into_split();
@@ -771,6 +1336,8 @@ impl NativeProcessManager {
 
         let response = match serde_json::from_str::<ApiRequest>(&line) {
             Ok(ApiRequest::Wait) => {
+                let processes = &manager.processes;
+                let task_notify = &manager.task_notify;
                 // Poll until no Waiting entries remain and all Active processes
                 // are ready. This avoids a race where the API server starts
                 // before processes transition from Waiting to Active.
@@ -813,7 +1380,9 @@ impl NativeProcessManager {
                             ProcessEntry::Active(handle) => {
                                 Some((name.clone(), handle.status_rx.clone()))
                             }
-                            ProcessEntry::NotStarted { .. } | ProcessEntry::Waiting { .. } => None,
+                            ProcessEntry::NotStarted { .. }
+                            | ProcessEntry::Stopped { .. }
+                            | ProcessEntry::Waiting { .. } => None,
                         })
                         .collect();
                     drop(procs);
@@ -838,6 +1407,114 @@ impl NativeProcessManager {
                 }
 
                 ApiResponse::Ready
+            }
+            Ok(ApiRequest::List) => {
+                let procs = manager.processes.read().await;
+                let mut list: Vec<ProcessInfo> = procs
+                    .iter()
+                    .map(|(name, entry)| Self::process_info(name, entry))
+                    .collect();
+                list.sort_by(|a, b| a.name.cmp(&b.name));
+                ApiResponse::ProcessList { processes: list }
+            }
+            Ok(ApiRequest::Status { name }) => {
+                let procs = manager.processes.read().await;
+                match procs.get(&name) {
+                    Some(entry) => ApiResponse::ProcessDetail {
+                        info: Self::process_info(&name, entry),
+                    },
+                    None => Self::process_not_found(&name),
+                }
+            }
+            Ok(ApiRequest::Logs { name, lines }) => {
+                let max_lines = lines.unwrap_or(100);
+                let procs = manager.processes.read().await;
+                if !procs.contains_key(&name) {
+                    Self::process_not_found(&name)
+                } else {
+                    drop(procs);
+                    let (stdout_path, stderr_path) =
+                        crate::command::log_paths(&manager.state_dir, &name);
+                    let (stdout, stderr) = tokio::task::spawn_blocking(move || {
+                        let stdout = Self::read_tail(&stdout_path, max_lines);
+                        let stderr = Self::read_tail(&stderr_path, max_lines);
+                        (stdout, stderr)
+                    })
+                    .await
+                    .unwrap_or_default();
+                    ApiResponse::ProcessLogs { stdout, stderr }
+                }
+            }
+            Ok(ApiRequest::Restart { name }) => {
+                let procs = manager.processes.read().await;
+                match procs.get(&name) {
+                    Some(ProcessEntry::NotStarted { .. } | ProcessEntry::Stopped { .. }) => {
+                        drop(procs);
+                        match manager.start_not_started(&name).await {
+                            Ok(_) => ApiResponse::Ok,
+                            Err(e) => ApiResponse::Error {
+                                message: format!("failed to restart process '{}': {}", name, e),
+                            },
+                        }
+                    }
+                    Some(_) => {
+                        drop(procs);
+                        match manager.restart(&name).await {
+                            Ok(()) => ApiResponse::Ok,
+                            Err(e) => ApiResponse::Error {
+                                message: format!("failed to restart process '{}': {}", name, e),
+                            },
+                        }
+                    }
+                    None => Self::process_not_found(&name),
+                }
+            }
+            Ok(ApiRequest::Start { name }) => {
+                let procs = manager.processes.read().await;
+                match procs.get(&name) {
+                    Some(ProcessEntry::NotStarted { .. } | ProcessEntry::Stopped { .. }) => {
+                        drop(procs);
+                        match manager.start_not_started(&name).await {
+                            Ok(_) => ApiResponse::Ok,
+                            Err(e) => ApiResponse::Error {
+                                message: format!("failed to start process '{}': {}", name, e),
+                            },
+                        }
+                    }
+                    Some(_) => ApiResponse::Error {
+                        message: format!(
+                            "process '{}' is already running; use restart instead",
+                            name
+                        ),
+                    },
+                    None => Self::process_not_found(&name),
+                }
+            }
+            Ok(ApiRequest::Stop { name }) => match manager.stop(&name).await {
+                Ok(()) => ApiResponse::Ok,
+                Err(e) => ApiResponse::Error {
+                    message: format!("failed to stop process '{}': {}", name, e),
+                },
+            },
+            Ok(ApiRequest::Ports) => {
+                let procs = manager.processes.read().await;
+                let mut ports = Vec::new();
+                for (name, entry) in procs.iter() {
+                    let config = match entry {
+                        ProcessEntry::NotStarted { config, .. }
+                        | ProcessEntry::Stopped { config, .. }
+                        | ProcessEntry::Waiting { config, .. } => config,
+                        ProcessEntry::Active(handle) => &handle.resources.config,
+                    };
+                    for (port_name, &port) in &config.ports {
+                        ports.push(PortInfo {
+                            process_name: name.clone(),
+                            port_name: port_name.clone(),
+                            port,
+                        });
+                    }
+                }
+                ApiResponse::PortAllocations { ports }
             }
             Err(e) => ApiResponse::Error {
                 message: format!("invalid request: {}", e),
@@ -890,6 +1567,7 @@ impl NativeProcessManager {
         match Self::api_request(socket_path, &ApiRequest::Wait).await? {
             ApiResponse::Ready => Ok(()),
             ApiResponse::Error { message } => bail!("Native manager error: {}", message),
+            other => bail!("Unexpected response: {:?}", other),
         }
     }
 
@@ -936,12 +1614,12 @@ impl NativeProcessManager {
     pub async fn handle_command(&self, cmd: ProcessCommand) {
         match cmd {
             ProcessCommand::Restart(name) => {
-                let is_not_started = matches!(
+                let needs_fresh_start = matches!(
                     self.processes.read().await.get(&name),
-                    Some(ProcessEntry::NotStarted { .. })
+                    Some(ProcessEntry::NotStarted { .. } | ProcessEntry::Stopped { .. })
                 );
-                if is_not_started {
-                    info!("Starting not-started process: {}", name);
+                if needs_fresh_start {
+                    info!("Starting inactive process: {}", name);
                     if let Err(e) = self.start_not_started(&name).await {
                         warn!("Failed to start process {}: {}", name, e);
                     }
@@ -950,6 +1628,12 @@ impl NativeProcessManager {
                     if let Err(e) = self.restart(&name).await {
                         warn!("Failed to restart process {}: {}", name, e);
                     }
+                }
+            }
+            ProcessCommand::Stop(name) => {
+                info!("Stopping process: {}", name);
+                if let Err(e) = self.stop_and_keep(&name).await {
+                    warn!("Failed to stop process {}: {}", name, e);
                 }
             }
         }
@@ -982,6 +1666,7 @@ impl NativeProcessManager {
             cancellation_token.is_cancelled()
         );
         info!("Manager event loop started (foreground)");
+        let mut saw_processes = false;
 
         loop {
             tokio::select! {
@@ -1002,8 +1687,12 @@ impl NativeProcessManager {
                     self.handle_command(cmd).await;
                 }
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                    if self.processes.read().await.is_empty() {
-                        debug!("No jobs running, exiting");
+                    let is_empty = self.processes.read().await.is_empty();
+                    if !is_empty {
+                        saw_processes = true;
+                    }
+                    if is_empty && saw_processes {
+                        debug!("All processes exited, shutting down");
                         break;
                     }
                 }
@@ -1053,14 +1742,17 @@ impl NativeProcessManager {
                     bail!("Process '{}' not found in configuration", name);
                 };
                 let mut config = process_config.clone();
-                config.env.extend(env.clone());
+                // Global env is the baseline; per-process values win
+                let mut merged_env = env.clone();
+                merged_env.extend(config.env);
+                config.env = merged_env;
                 result.push(config);
             }
             result
         };
 
         // Create parent activity for grouping all processes
-        let parent_activity = Activity::operation("Running processes").start();
+        let parent_activity = activity!(INFO, operation, "Running processes");
         let parent_id = parent_activity.id();
 
         // Store the parent activity to keep it alive
@@ -1076,9 +1768,6 @@ impl NativeProcessManager {
                 .await
                 .wrap_err_with(|| format!("Failed to start process '{}'", config.name))?;
         }
-
-        // Start the API socket server for external queries
-        self.start_api_server()?;
 
         Ok(())
     }
@@ -1164,11 +1853,8 @@ impl NativeProcessManager {
             }
         }
 
-        // Remove PID file
-        tokio::fs::remove_file(&manager_pid_file)
-            .await
-            .into_diagnostic()
-            .wrap_err("Failed to remove manager PID file")?;
+        // Remove PID file (may already be gone if the daemon cleaned up)
+        let _ = tokio::fs::remove_file(&manager_pid_file).await;
 
         info!("Native process manager stopped");
         Ok(())
@@ -1189,91 +1875,31 @@ impl ProcessManager for NativeProcessManager {
             PidStatus::NotFound | PidStatus::StaleRemoved => {}
         }
 
+        // Detach mode is handled at the CLI level via re-exec
+        // (see `devenv daemon-processes`). This trait method only supports
+        // foreground mode.
         if options.detach {
-            use daemonize::{Daemonize, Outcome};
-
-            let manager_pid_file = self.manager_pid_file();
-
-            // Clone data needed in the daemon before daemonizing
-            let state_dir = self.state_dir.clone();
-            let process_configs = options.process_configs.clone();
-            let process_names = options.processes.clone();
-            let env = options.env.clone();
-
-            // Configure and start the daemon (execute() keeps parent alive)
-            let daemonize = Daemonize::new().pid_file(&manager_pid_file);
-
-            match daemonize.execute() {
-                Outcome::Parent(Ok(_)) => {
-                    // Read PID from file that daemonize created
-                    let pid = std::fs::read_to_string(&manager_pid_file)
-                        .map(|s| s.trim().to_string())
-                        .unwrap_or_else(|_| "unknown".to_string());
-                    info!(
-                        "Native process manager started in background (PID: {})",
-                        pid
-                    );
-                    info!("Stop with: devenv processes down");
-                    return Ok(());
-                }
-                Outcome::Parent(Err(e)) => {
-                    bail!("Failed to daemonize: {}", e);
-                }
-                Outcome::Child(Ok(_)) => {
-                    // We're now in the daemon process
-                    // Create new tokio runtime for the daemon
-                    let runtime = match tokio::runtime::Runtime::new() {
-                        Ok(rt) => rt,
-                        Err(e) => {
-                            eprintln!("Failed to create tokio runtime: {}", e);
-                            std::process::exit(1);
-                        }
-                    };
-
-                    // Recreate manager and run event loop
-                    let result = runtime.block_on(async {
-                        let manager = Arc::new(NativeProcessManager::new(state_dir)?);
-                        manager
-                            .start_processes(&process_configs, &process_names, &env)
-                            .await?;
-                        manager.run().await
-                    });
-
-                    // Clean up PID file on exit
-                    let _ = std::fs::remove_file(&manager_pid_file);
-
-                    if let Err(e) = result {
-                        eprintln!("Manager event loop failed: {}", e);
-                        std::process::exit(1);
-                    }
-
-                    std::process::exit(0);
-                }
-                Outcome::Child(Err(e)) => {
-                    eprintln!("Daemon child failed: {}", e);
-                    std::process::exit(1);
-                }
-            }
-        } else {
-            // Start requested processes
-            self.start_processes(&options.process_configs, &options.processes, &options.env)
-                .await?;
-
-            // Foreground mode - run the event loop
-            info!("All processes started. Press Ctrl+C to stop.");
-
-            // Save PID for tracking
-            pid::write_pid(&self.manager_pid_file(), std::process::id()).await?;
-
-            // Run the event loop (shutdown via cancellation token from tokio-shutdown)
-            let token = options.cancellation_token.unwrap_or_default();
-            let result = self.run_foreground(token, None).await;
-
-            // Clean up PID file
-            let _ = tokio::fs::remove_file(&self.manager_pid_file()).await;
-
-            result
+            bail!("Native process manager detach is handled by the CLI via re-exec");
         }
+
+        // Start requested processes
+        self.start_processes(&options.process_configs, &options.processes, &options.env)
+            .await?;
+
+        // Foreground mode - run the event loop
+        info!("All processes started. Press Ctrl+C to stop.");
+
+        // Save PID for tracking
+        pid::write_pid(&self.manager_pid_file(), std::process::id()).await?;
+
+        // Run the event loop (shutdown via cancellation token from tokio-shutdown)
+        let token = options.cancellation_token.unwrap_or_default();
+        let result = self.run_foreground(token, None).await;
+
+        // Clean up PID file
+        let _ = tokio::fs::remove_file(&self.manager_pid_file()).await;
+
+        result
     }
 
     async fn stop(&self) -> Result<()> {
@@ -1308,6 +1934,7 @@ impl Drop for NativeProcessManager {
 mod tests {
     use super::*;
     use crate::config::{RestartPolicy, StartConfig};
+    use std::net::Ipv4Addr;
 
     #[tokio::test]
     async fn test_create_manager() {
@@ -1514,6 +2141,271 @@ mod tests {
         assert!(
             completed.is_ok(),
             "Notification should have fired within the timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_start_processes_preserves_process_env_over_global_env() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _manager = NativeProcessManager::new(temp_dir.path().to_path_buf()).unwrap();
+
+        // Process config with a per-process env var
+        let mut config = ProcessConfig {
+            name: "env-test".to_string(),
+            exec: "env".to_string(),
+            args: vec![],
+            restart: crate::config::RestartConfig {
+                on: RestartPolicy::Never,
+                max: Some(0),
+                window: None,
+            },
+            env: HashMap::from([
+                ("SHARED_VAR".to_string(), "per-process".to_string()),
+                ("PROCESS_ONLY".to_string(), "yes".to_string()),
+            ]),
+            ..Default::default()
+        };
+
+        // Global env that also defines SHARED_VAR
+        let global_env: HashMap<String, String> = HashMap::from([
+            ("SHARED_VAR".to_string(), "global".to_string()),
+            ("GLOBAL_ONLY".to_string(), "yes".to_string()),
+        ]);
+
+        // Simulate the merging logic from start_processes
+        let mut merged_env = global_env.clone();
+        merged_env.extend(config.env.clone());
+        config.env = merged_env;
+
+        // Per-process value must win
+        assert_eq!(config.env.get("SHARED_VAR").unwrap(), "per-process");
+        // Both sources should be present
+        assert_eq!(config.env.get("PROCESS_ONLY").unwrap(), "yes");
+        assert_eq!(config.env.get("GLOBAL_ONLY").unwrap(), "yes");
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_port_release_waits_until_port_is_bindable() {
+        let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        assert!(
+            !can_bind_exact_port(port),
+            "test listener should hold the port before release"
+        );
+
+        let started = std::time::Instant::now();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drop(listener);
+        });
+
+        let status = wait_for_port_conflicts_to_settle(&[port], Duration::from_secs(1)).await;
+
+        assert!(
+            status.blocking_ports().is_empty() && status.ownerless_ports().is_empty(),
+            "port should have been released"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "expected to wait for the listener to close"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_port_release_returns_early_for_ownerless_conflicts() {
+        let mut probes = 0;
+
+        let status = wait_for_port_conflicts_to_settle_with(
+            &[6380],
+            Duration::from_secs(1),
+            |_| {
+                probes += 1;
+                if probes < 3 {
+                    PortReleaseState::Owned(" (PID 123)".to_string())
+                } else {
+                    PortReleaseState::Ownerless
+                }
+            },
+            |_| std::future::ready(()),
+        )
+        .await;
+
+        assert_eq!(
+            probes, 3,
+            "should stop once only ownerless conflicts remain"
+        );
+        assert!(status.blocking_ports().is_empty());
+        assert_eq!(status.ownerless_ports(), &[6380]);
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_port_release_times_out_for_owned_conflicts() {
+        let started = std::time::Instant::now();
+
+        let status = wait_for_port_conflicts_to_settle_with(
+            &[6380],
+            Duration::from_millis(20),
+            |_| PortReleaseState::Owned(" (PID 123)".to_string()),
+            |_| tokio::time::sleep(Duration::from_millis(2)),
+        )
+        .await;
+
+        assert!(
+            started.elapsed() >= Duration::from_millis(20),
+            "owned conflicts should keep waiting until timeout"
+        );
+        assert_eq!(status.blocking_ports(), vec![6380]);
+        assert!(status.ownerless_ports().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_port_release_times_out_for_unknown_conflicts() {
+        let started = std::time::Instant::now();
+
+        let status = wait_for_port_conflicts_to_settle_with(
+            &[6380],
+            Duration::from_millis(20),
+            |_| PortReleaseState::Unknown("socket inspection failed".to_string()),
+            |_| tokio::time::sleep(Duration::from_millis(2)),
+        )
+        .await;
+
+        assert!(
+            started.elapsed() >= Duration::from_millis(20),
+            "unknown conflicts should keep waiting until timeout"
+        );
+        assert_eq!(status.blocking_ports(), vec![6380]);
+        assert_eq!(
+            status.unknown,
+            vec![(6380, "socket inspection failed".to_string())]
+        );
+        assert!(status.ownerless_ports().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_stop_and_keep_transitions_to_not_started() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = NativeProcessManager::new(temp_dir.path().to_path_buf()).unwrap();
+        let config = long_running_config("keepable");
+
+        manager.start_command(&config, None).await.unwrap();
+        assert!(manager.list().await.contains(&"keepable".to_string()));
+
+        manager.stop_and_keep("keepable").await.unwrap();
+
+        assert!(
+            manager.list().await.is_empty(),
+            "active list should not contain a stopped process"
+        );
+        assert_eq!(
+            manager.get_phase("keepable").await,
+            Some(ProcessPhase::NotStarted),
+            "stopped process should transition to NotStarted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stop_and_keep_rejects_not_started() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = NativeProcessManager::new(temp_dir.path().to_path_buf()).unwrap();
+        let config = auto_start_off_config("idle");
+
+        manager.register_waiting(config, None).await;
+        manager.launch_waiting("idle").await.unwrap();
+
+        let result = manager.stop_and_keep("idle").await;
+        assert!(
+            result.is_err(),
+            "should reject stopping a NotStarted process"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stop_and_keep_rejects_waiting() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = NativeProcessManager::new(temp_dir.path().to_path_buf()).unwrap();
+        let config = test_config("waiter");
+
+        manager.register_waiting(config, None).await;
+
+        let result = manager.stop_and_keep("waiter").await;
+        assert!(result.is_err(), "should reject stopping a Waiting process");
+    }
+
+    #[tokio::test]
+    async fn test_stop_and_keep_rejects_unknown() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = NativeProcessManager::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let result = manager.stop_and_keep("ghost").await;
+        assert!(result.is_err(), "should reject stopping an unknown process");
+    }
+
+    #[tokio::test]
+    async fn test_stop_and_keep_notifies_task_system() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut manager = NativeProcessManager::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let notify = Arc::new(Notify::new());
+        manager.set_task_notify(notify.clone());
+
+        let config = long_running_config("notifier");
+        manager.start_command(&config, None).await.unwrap();
+
+        let notified = notify.notified();
+        tokio::pin!(notified);
+
+        manager.stop_and_keep("notifier").await.unwrap();
+
+        let completed = tokio::time::timeout(Duration::from_secs(5), notified).await;
+        assert!(
+            completed.is_ok(),
+            "task_notify should fire after stop_and_keep"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stop_and_keep_then_restart() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = NativeProcessManager::new(temp_dir.path().to_path_buf()).unwrap();
+        let config = long_running_config("restartable");
+
+        manager.start_command(&config, None).await.unwrap();
+        assert!(manager.list().await.contains(&"restartable".to_string()));
+
+        manager.stop_and_keep("restartable").await.unwrap();
+        assert_eq!(
+            manager.get_phase("restartable").await,
+            Some(ProcessPhase::NotStarted)
+        );
+
+        manager.start_not_started("restartable").await.unwrap();
+        assert!(
+            manager.list().await.contains(&"restartable".to_string()),
+            "process should be active again after restart"
+        );
+
+        let _ = manager.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn test_handle_command_stop() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = NativeProcessManager::new(temp_dir.path().to_path_buf()).unwrap();
+        let config = long_running_config("cmd-stop");
+
+        manager.start_command(&config, None).await.unwrap();
+        assert!(manager.list().await.contains(&"cmd-stop".to_string()));
+
+        manager
+            .handle_command(ProcessCommand::Stop("cmd-stop".to_string()))
+            .await;
+
+        assert_eq!(
+            manager.get_phase("cmd-stop").await,
+            Some(ProcessPhase::NotStarted),
+            "handle_command(Stop) should call stop_and_keep"
         );
     }
 }

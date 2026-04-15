@@ -8,20 +8,13 @@ use crate::config::Config;
 use devenv_activity::Activity;
 use devenv_event_sources::{FileWatcher, FileWatcherConfig};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
 // Re-export protocol types from devenv-shell
 pub use devenv_shell::{ShellCommand, ShellEvent};
-
-/// Compute blake3 hash of file contents.
-/// Returns None if the file cannot be read.
-fn hash_file(path: &Path) -> Option<blake3::Hash> {
-    let content = std::fs::read(path).ok()?;
-    Some(blake3::hash(&content))
-}
 
 #[derive(Debug, Error)]
 pub enum CoordinatorError {
@@ -146,7 +139,7 @@ impl ShellCoordinator {
         // Track files that changed and triggered rebuilds
         let mut pending_changes: Vec<PathBuf> = Vec::new();
         // Track file content hashes to detect actual changes
-        let mut file_hashes: HashMap<PathBuf, blake3::Hash> = HashMap::new();
+        let mut file_hashes: HashMap<PathBuf, String> = HashMap::new();
         // Track if reload is ready (waiting for user to apply)
         let mut reload_ready = false;
         // Track if file watching is paused
@@ -183,9 +176,9 @@ impl ShellCoordinator {
                         continue;
                     }
                     // Check if file content actually changed by comparing hashes
-                    let new_hash = match hash_file(&path) {
-                        Some(h) => h,
-                        None => {
+                    let new_hash = match devenv_cache_core::compute_file_hash(&path) {
+                        Ok(h) => h,
+                        Err(_) => {
                             tracing::debug!("Could not read file: {:?}", path);
                             continue;
                         }
@@ -209,13 +202,17 @@ impl ShellCoordinator {
 
                     tracing::debug!("File content changed: {:?}", path);
 
+                    // If a build is already running, drop the event.
+                    // spawn_blocking tasks cannot actually be cancelled, so
+                    // aborting and restarting would accumulate zombie builds
+                    // that can cascade into more file changes (fork bomb).
+                    if current_build.is_some() {
+                        tracing::debug!("Build in progress, ignoring file change: {:?}", path);
+                        continue;
+                    }
+
                     // Track the file that triggered this rebuild
                     pending_changes.push(path.clone());
-
-                    // Cancel any running build
-                    if let Some(handle) = current_build.take() {
-                        handle.abort();
-                    }
 
                     // Notify TUI that build has started
                     let relative_files: Vec<PathBuf> = pending_changes
@@ -237,9 +234,9 @@ impl ShellCoordinator {
                         .iter()
                         .map(|p| p.display().to_string())
                         .collect();
-                    let activity = Activity::operation("Reloading shell")
-                        .detail(files_display.join(", "))
-                        .start();
+                    let activity = devenv_activity::start!(
+                        Activity::operation("Reloading shell").detail(files_display.join(", "))
+                    );
 
                     let ctx = BuildContext {
                         cwd: cwd.clone(),
@@ -271,6 +268,13 @@ impl ShellCoordinator {
 
                 Event::ReloadBuildComplete { result, activity } => {
                     current_build = None;
+
+                    // Refresh all inotify watches. Editors using atomic save
+                    // (write temp + rename) replace the file inode, which
+                    // silently invalidates the kernel-level inotify watch.
+                    // The watchexec diff logic won't re-watch paths it thinks
+                    // are already watched, so we force a full refresh.
+                    watcher_handle.rewatch_all().await;
 
                     // Collect changed files as relative paths
                     let files: Vec<PathBuf> = pending_changes
@@ -343,6 +347,7 @@ impl ShellCoordinator {
         // Abort any running build task
         if let Some(handle) = current_build.take() {
             handle.abort();
+            builder.interrupt();
         }
 
         // Abort forwarder tasks to prevent panics during runtime shutdown

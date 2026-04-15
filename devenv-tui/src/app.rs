@@ -385,6 +385,58 @@ impl TuiApp {
     }
 }
 
+pub(crate) fn request_interrupt_prompt(
+    command_tx: Option<&mpsc::Sender<ProcessCommand>>,
+    ui_state: &Arc<RwLock<UiState>>,
+) -> bool {
+    if command_tx.is_none() {
+        return false;
+    }
+
+    if let Ok(mut ui) = ui_state.write() {
+        ui.show_interrupt_prompt();
+        true
+    } else {
+        false
+    }
+}
+
+pub(crate) fn handle_interrupt_prompt_key(
+    key_event: &KeyEvent,
+    ui_state: &Arc<RwLock<UiState>>,
+    shutdown: &Arc<Shutdown>,
+) -> bool {
+    let prompt_active = ui_state
+        .read()
+        .map(|ui| ui.interrupt_prompt_active())
+        .unwrap_or(false);
+    if !prompt_active {
+        return false;
+    }
+
+    match key_event.code {
+        KeyCode::Char('c') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+            shutdown.handle_interrupt();
+        }
+        KeyCode::Char('q') => {
+            shutdown.handle_interrupt();
+        }
+        KeyCode::Esc => {
+            if let Ok(mut ui) = ui_state.write() {
+                ui.clear_interrupt_prompt();
+            }
+        }
+        KeyCode::Char('c') => {
+            if let Ok(mut ui) = ui_state.write() {
+                ui.clear_interrupt_prompt();
+            }
+        }
+        _ => {}
+    }
+
+    true
+}
+
 /// Save the current terminal state before starting the TUI.
 ///
 /// Must be called before iocraft's render_loop enters raw mode, so we have
@@ -528,9 +580,15 @@ fn MainView(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                 && key_event.kind != KeyEventKind::Release
             {
                 debug!("Key event: {:?}", key_event);
+                if handle_interrupt_prompt_key(&key_event, &ui_state, &shutdown) {
+                    return;
+                }
+
                 match key_event.code {
                     KeyCode::Char('c') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
-                        shutdown.handle_interrupt();
+                        if !request_interrupt_prompt(command_tx.as_ref(), &ui_state) {
+                            shutdown.handle_interrupt();
+                        }
                     }
                     KeyCode::Char('r') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                         // Restart selected process
@@ -538,7 +596,6 @@ fn MainView(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                             && let Ok(ui) = ui_state.read()
                             && let Some(activity_id) = ui.selected_activity
                         {
-                            // Get the process name from the activity
                             if let Ok(model) = activity_model.read()
                                 && let Some(activity) = model.get_activity(activity_id)
                                 && matches!(
@@ -547,6 +604,22 @@ fn MainView(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                                 )
                             {
                                 let _ = tx.try_send(ProcessCommand::Restart(activity.name.clone()));
+                            }
+                        }
+                    }
+                    KeyCode::Char('x') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                        // Stop selected process (only if active)
+                        if let Some(tx) = command_tx.as_ref()
+                            && let Ok(ui) = ui_state.read()
+                            && let Some(activity_id) = ui.selected_activity
+                        {
+                            if let Ok(model) = activity_model.read()
+                                && let Some(activity) = model.get_activity(activity_id)
+                                && let crate::model::ActivityVariant::Process(ref proc) =
+                                    activity.variant
+                                && proc.status.is_stoppable()
+                            {
+                                let _ = tx.try_send(ProcessCommand::Stop(activity.name.clone()));
                             }
                         }
                     }
@@ -562,11 +635,7 @@ fn MainView(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                         if let Ok(model) = activity_model.read() {
                             let selectable = model.get_selectable_activity_ids();
                             if let Ok(mut ui) = ui_state.write() {
-                                if key_event.code == KeyCode::Down {
-                                    ui.select_next_activity(&selectable);
-                                } else {
-                                    ui.select_previous_activity(&selectable);
-                                }
+                                ui.select_activity(&selectable, key_event.code == KeyCode::Down);
                                 if let Some(selected_id) = ui.selected_activity
                                     && *scroll_view_active.read()
                                 {
@@ -727,9 +796,11 @@ async fn run_view(
                         ContextProvider(value: Context::owned(notify.clone())) {
                             ContextProvider(value: Context::owned(activity_model.clone())) {
                                 ContextProvider(value: Context::owned(ui_state.clone())) {
-                                    ContextProvider(value: Context::owned(exit_flag.clone())) {
-                                        ContextProvider(value: Context::owned(activity_id)) {
-                                            ExpandedLogView
+                                    ContextProvider(value: Context::owned(command_tx.clone())) {
+                                        ContextProvider(value: Context::owned(exit_flag.clone())) {
+                                            ContextProvider(value: Context::owned(activity_id)) {
+                                                ExpandedLogView
+                                            }
                                         }
                                     }
                                 }
@@ -741,5 +812,41 @@ async fn run_view(
 
             element.fullscreen().ignore_ctrl_c().await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    #[test]
+    fn test_request_interrupt_prompt_requires_native_process_manager() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let ui_state = Arc::new(RwLock::new(UiState::new()));
+
+        assert!(!request_interrupt_prompt(None, &ui_state));
+        assert!(!ui_state.read().unwrap().interrupt_prompt_active());
+
+        assert!(request_interrupt_prompt(Some(&tx), &ui_state));
+        assert!(ui_state.read().unwrap().interrupt_prompt_active());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_interrupt_prompt_keys_dismiss_and_quit() {
+        let ui_state = Arc::new(RwLock::new(UiState::new()));
+        ui_state.write().unwrap().show_interrupt_prompt();
+        let shutdown = tokio_shutdown::Shutdown::new();
+
+        let dismiss = KeyEvent::new(KeyEventKind::Press, KeyCode::Char('c'));
+        assert!(handle_interrupt_prompt_key(&dismiss, &ui_state, &shutdown));
+        assert!(!ui_state.read().unwrap().interrupt_prompt_active());
+        assert!(!shutdown.is_cancelled());
+
+        ui_state.write().unwrap().show_interrupt_prompt();
+        let quit = KeyEvent::new(KeyEventKind::Press, KeyCode::Char('q'));
+        assert!(handle_interrupt_prompt_key(&quit, &ui_state, &shutdown));
+        assert!(shutdown.is_cancelled());
     }
 }

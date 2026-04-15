@@ -415,12 +415,6 @@ in
       description = "The command to run each process through devenv-tasks with exec prefix for proper signal handling.";
     };
 
-    process.nativeConfigJson = lib.mkOption {
-      type = types.package;
-      internal = true;
-      default = pkgs.writeText "process-config.json" (builtins.toJSON { });
-      description = "JSON configuration for native process manager";
-    };
   };
 
   config = lib.mkMerge [
@@ -434,20 +428,36 @@ in
     #
     # Infinite recursion, oh my!
     {
-      assertions = [{
-        assertion =
-          let
-            enabledImplementations =
-              lib.pipe supportedImplementations [
-                (map (name: config.process.managers.${name}.enable))
-                (lib.filter lib.id)
-              ];
-          in
-          lib.length enabledImplementations == 1;
-        message = ''
-          Only a single process manager can be enabled at a time.
-        '';
-      }];
+      assertions = [
+        {
+          assertion =
+            let
+              enabledImplementations =
+                lib.pipe supportedImplementations [
+                  (map (name: config.process.managers.${name}.enable))
+                  (lib.filter lib.id)
+                ];
+            in
+            lib.length enabledImplementations == 1;
+          message = ''
+            Only a single process manager can be enabled at a time.
+          '';
+        }
+        {
+          assertion = implementation != "native" || config.process.manager.before == "";
+          message = ''
+            process.manager.before is not supported with the native process manager.
+            Use tasks with process dependencies instead. See https://devenv.sh/tasks/
+          '';
+        }
+        {
+          assertion = implementation != "native" || config.process.manager.after == "";
+          message = ''
+            process.manager.after is not supported with the native process manager.
+            Use tasks with process dependencies instead. See https://devenv.sh/tasks/
+          '';
+        }
+      ];
 
       process.managers.${implementation}.enable = lib.mkDefault true;
     }
@@ -475,7 +485,9 @@ in
                 restart = process.restart;
                 listen = process.listen;
                 ports = lib.mapAttrs (_: portCfg: portCfg.value) process.ports;
-                watch = process.watch;
+                watch = process.watch // {
+                  paths = map toString process.watch.paths;
+                };
                 watchdog = process.watchdog;
               };
             };

@@ -2,6 +2,7 @@ use miette::{IntoDiagnostic, Result, WrapErr, bail};
 use pathdiff;
 use schemars::{JsonSchema, schema_for};
 use schematic::ConfigLoader;
+use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -11,6 +12,19 @@ use std::{
 
 const YAML_CONFIG: &str = "devenv.yaml";
 const YAML_LOCAL_CONFIG: &str = "devenv.local.yaml";
+
+/// Version requirement for the devenv CLI.
+///
+/// - `true`: CLI version must match the modules version (checked during Nix evaluation)
+/// - A constraint string like `">=2.0.0"`: checked before Nix evaluation
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, schematic::Schematic)]
+#[serde(untagged)]
+pub enum RequireVersion {
+    /// When true, CLI version must match the modules version
+    Match(bool),
+    /// Version constraint string (e.g., ">=2.0.0", "2.0.7")
+    Constraint(String),
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, schematic::Schematic)]
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
@@ -25,30 +39,106 @@ pub enum NixBackendType {
 
 #[derive(schematic::Config, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[config(rename_all = "camelCase")]
-#[serde(rename_all = "camelCase")]
-pub struct NixpkgsConfig {
-    #[serde(skip_serializing_if = "is_false", default = "false_default")]
+#[serde(rename_all = "snake_case")]
+pub struct AndroidSdkConfig {
+    #[serde(
+        alias = "acceptLicense",
+        skip_serializing_if = "is_false",
+        default = "false_default"
+    )]
     #[setting(merge = schematic::merge::replace)]
-    pub allow_unfree: bool,
-    #[serde(skip_serializing_if = "is_false", default = "false_default")]
-    #[setting(merge = schematic::merge::replace)]
-    pub allow_broken: bool,
-    #[serde(skip_serializing_if = "is_false", default = "false_default")]
-    #[setting(merge = schematic::merge::replace)]
-    pub cuda_support: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    #[setting(merge = schematic::merge::append_vec)]
-    pub cuda_capabilities: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    #[setting(merge = schematic::merge::append_vec)]
-    pub permitted_insecure_packages: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub permitted_unfree_packages: Vec<String>,
+    pub accept_license: bool,
 }
 
 #[derive(schematic::Config, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[config(rename_all = "camelCase")]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+pub struct NixpkgsConfig {
+    #[serde(
+        alias = "allowUnfree",
+        skip_serializing_if = "is_false",
+        default = "false_default"
+    )]
+    #[setting(merge = schematic::merge::replace)]
+    pub allow_unfree: bool,
+    #[serde(
+        alias = "allowUnsupportedSystem",
+        skip_serializing_if = "is_false",
+        default = "false_default"
+    )]
+    #[setting(merge = schematic::merge::replace)]
+    pub allow_unsupported_system: bool,
+    #[serde(
+        alias = "allowBroken",
+        skip_serializing_if = "is_false",
+        default = "false_default"
+    )]
+    #[setting(merge = schematic::merge::replace)]
+    pub allow_broken: bool,
+    #[serde(
+        alias = "allowNonSource",
+        skip_serializing_if = "is_false",
+        default = "false_default"
+    )]
+    #[setting(merge = schematic::merge::replace)]
+    pub allow_non_source: bool,
+    #[serde(
+        alias = "cudaSupport",
+        skip_serializing_if = "is_false",
+        default = "false_default"
+    )]
+    #[setting(merge = schematic::merge::replace)]
+    pub cuda_support: bool,
+    #[serde(
+        alias = "cudaCapabilities",
+        skip_serializing_if = "Vec::is_empty",
+        default
+    )]
+    #[setting(merge = schematic::merge::append_vec)]
+    pub cuda_capabilities: Vec<String>,
+    #[serde(
+        alias = "rocmSupport",
+        skip_serializing_if = "is_false",
+        default = "false_default"
+    )]
+    #[setting(merge = schematic::merge::replace)]
+    pub rocm_support: bool,
+    #[serde(
+        alias = "permittedInsecurePackages",
+        skip_serializing_if = "Vec::is_empty",
+        default
+    )]
+    #[setting(merge = schematic::merge::append_vec)]
+    pub permitted_insecure_packages: Vec<String>,
+    #[serde(
+        alias = "permittedUnfreePackages",
+        skip_serializing_if = "Vec::is_empty",
+        default
+    )]
+    pub permitted_unfree_packages: Vec<String>,
+    /// License names to allow (e.g. "mit", "gpl3Only").
+    /// Only applied in bootstrapLib.nix where lib.licenses is available;
+    /// not serialized to NIXPKGS_CONFIG since raw strings won't match license attrsets.
+    #[serde(alias = "allowlistedLicenses", skip_serializing, default)]
+    #[setting(merge = schematic::merge::append_vec)]
+    pub allowlisted_licenses: Vec<String>,
+    /// License names to block (e.g. "unfree", "bsl11").
+    /// Only applied in bootstrapLib.nix; not serialized to NIXPKGS_CONFIG.
+    #[serde(alias = "blocklistedLicenses", skip_serializing, default)]
+    #[setting(merge = schematic::merge::append_vec)]
+    pub blocklisted_licenses: Vec<String>,
+    #[serde(
+        rename = "android_sdk",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    #[setting(nested)]
+    pub android_sdk: Option<AndroidSdkConfig>,
+}
+
+#[derive(schematic::Config, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[config(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct Input {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub url: Option<String>,
@@ -152,13 +242,13 @@ impl Clean {
 
 #[derive(schematic::Config, Clone, Serialize, Debug, JsonSchema)]
 #[config(rename_all = "camelCase", allow_unknown_fields)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct Nixpkgs {
     #[serde(flatten)]
     #[setting(nested)]
     pub config_: NixpkgsConfig,
     #[serde(
-        rename = "per-platform",
+        alias = "per-platform",
         skip_serializing_if = "BTreeMap::is_empty",
         default
     )]
@@ -168,15 +258,36 @@ pub struct Nixpkgs {
 
 #[derive(schematic::Config, Clone, Serialize, Debug, JsonSchema)]
 #[config(rename_all = "camelCase", allow_unknown_fields)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct Config {
+    /// Version requirement for the devenv CLI.
+    /// Set to `true` to enforce CLI matches the modules version,
+    /// or a constraint string like `">=2.0.0"`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[setting(merge = schematic::merge::replace)]
+    pub require_version: Option<RequireVersion>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     #[setting(nested, merge = schematic::merge::merge_btreemap)]
     pub inputs: BTreeMap<String, Input>,
-    #[serde(skip_serializing_if = "is_false", default = "false_default")]
+    #[serde(
+        alias = "allowUnfree",
+        skip_serializing_if = "is_false",
+        default = "false_default"
+    )]
     #[setting(merge = schematic::merge::replace)]
     pub allow_unfree: bool,
-    #[serde(skip_serializing_if = "is_false", default = "false_default")]
+    #[serde(
+        alias = "allowUnsupportedSystem",
+        skip_serializing_if = "is_false",
+        default = "false_default"
+    )]
+    #[setting(merge = schematic::merge::replace)]
+    pub allow_unsupported_system: bool,
+    #[serde(
+        alias = "allowBroken",
+        skip_serializing_if = "is_false",
+        default = "false_default"
+    )]
     #[setting(merge = schematic::merge::replace)]
     pub allow_broken: bool,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -185,7 +296,11 @@ pub struct Config {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     #[setting(merge = schematic::merge::append_vec)]
     pub imports: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    #[serde(
+        alias = "permittedInsecurePackages",
+        skip_serializing_if = "Vec::is_empty",
+        default
+    )]
     #[setting(merge = schematic::merge::append_vec)]
     pub permitted_insecure_packages: Vec<String>,
     #[setting(nested)]
@@ -206,7 +321,11 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     #[setting(merge = schematic::merge::replace)]
     pub reload: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        alias = "strictPorts",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     #[setting(merge = schematic::merge::replace)]
     pub strict_ports: Option<bool>,
     /// Git repository root path (not serialized, computed during load)
@@ -281,7 +400,9 @@ impl Config {
         let base_path = path.as_ref();
         let base_yaml = base_path.join(YAML_CONFIG);
 
-        // Collect all yaml files to load (base + imports)
+        // Collect all yaml files to load (imports first, then base).
+        // merge_btreemap gives precedence to later entries, so the base
+        // config must be loaded last to let its inputs override imports.
         let mut yaml_files = Vec::new();
         let mut visited = HashSet::new();
 
@@ -293,7 +414,6 @@ impl Config {
                     .wrap_err_with(|| {
                         format!("Failed to canonicalize base path: {}", base_yaml.display())
                     })?;
-            yaml_files.push(base_yaml.clone());
             visited.insert(canonical_base);
         }
 
@@ -315,7 +435,7 @@ impl Config {
         // Detect git repository root for import resolution
         let git_root = Self::detect_git_root(base_path);
 
-        // Recursively collect all imported yaml files
+        // Recursively collect imported yaml files (loaded first, lowest priority)
         Self::collect_import_files(
             &temp_result.config.imports,
             base_path,
@@ -324,6 +444,11 @@ impl Config {
             &mut visited,
             0,
         )?;
+
+        // Base config is loaded last so it takes precedence over imports
+        if base_yaml.exists() {
+            yaml_files.push(base_yaml.clone());
+        }
 
         // Load all configs and track which inputs come from which config file
         // This is needed to correctly normalize relative URLs
@@ -348,12 +473,10 @@ impl Config {
                 )
             })?;
 
-            // Record the source directory for each input defined in this config
-            // Earlier configs take precedence (first definition wins)
+            // Record the source directory for each input defined in this config.
+            // Later configs take precedence (base overrides imports).
             for input_name in single_result.config.inputs.keys() {
-                input_source_dirs
-                    .entry(input_name.clone())
-                    .or_insert_with(|| config_dir.clone());
+                input_source_dirs.insert(input_name.clone(), config_dir.clone());
             }
 
             loader
@@ -512,6 +635,62 @@ impl Config {
         Ok(config)
     }
 
+    /// Check that `current` (e.g. "2.0.7") satisfies the version requirement in
+    /// `devenv.yaml`. No-op when no requirement is set or when `require_version: true`
+    /// (deferred to Nix evaluation where the modules version is available).
+    pub fn check_version(&self, current: &str) -> Result<()> {
+        let constraint = match &self.require_version {
+            // Match(_) is either disabled (false) or deferred to Nix eval (true)
+            None | Some(RequireVersion::Match(_)) => return Ok(()),
+            Some(RequireVersion::Constraint(c)) => c,
+        };
+
+        // Bare version "2.0.7" means exact match; semver crate treats it as "^2.0.7"
+        let req_str = if constraint.starts_with('>')
+            || constraint.starts_with('<')
+            || constraint.starts_with('=')
+        {
+            constraint.clone()
+        } else {
+            format!("={constraint}")
+        };
+
+        let cur = Self::parse_version(current)
+            .wrap_err_with(|| format!("Failed to parse current devenv version '{current}'"))?;
+        let req = VersionReq::parse(&req_str)
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!("Failed to parse version constraint '{constraint}' in devenv.yaml")
+            })?;
+
+        if !req.matches(&cur) {
+            bail!(
+                "devenv version {current} does not satisfy the constraint '{constraint}' in devenv.yaml"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Returns true when `require_version: true` is set, meaning the Nix modules
+    /// should assert that CLI version matches the modules version.
+    pub fn requires_version_match(&self) -> bool {
+        matches!(&self.require_version, Some(RequireVersion::Match(true)))
+    }
+
+    /// Parse a version string, accepting "X.Y" (appending ".0") and "X.Y.Z".
+    fn parse_version(s: &str) -> Result<Version> {
+        // semver crate requires X.Y.Z; support X.Y by appending .0
+        let normalized = if s.matches('.').count() == 1 {
+            format!("{s}.0")
+        } else {
+            s.to_string()
+        };
+        Version::parse(&normalized)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("expected version format X.Y or X.Y.Z, got '{s}'"))
+    }
+
     /// Detects the git repository root starting from the given path.
     ///
     /// # Arguments
@@ -600,19 +779,24 @@ impl Config {
         } else if canonical_import.is_none()
             && let Some(canonical_root) = canonical_root
         {
-            // Import path doesn't exist, but root does - validate lexically
-            // First make the import path absolute, then normalize
-            let abs_import = if import_path.is_absolute() {
-                Self::normalize_path_components(import_path)
-            } else {
-                // Make relative path absolute from current directory first
-                if let Ok(cwd) = std::env::current_dir() {
-                    let absolute = cwd.join(import_path);
-                    Self::normalize_path_components(&absolute)
+            // Import path doesn't exist, but root does.
+            // Canonicalize the parent directory to resolve symlinks
+            // (e.g. /tmp -> /run/user/...), falling back to lexical
+            // normalization only when the parent doesn't exist either.
+            let abs_import = if let Some(parent) = import_path.parent() {
+                if let Ok(canonical_parent) = parent.canonicalize() {
+                    canonical_parent.join(import_path.file_name().unwrap_or_default())
+                } else if import_path.is_absolute() {
+                    Self::normalize_path_components(import_path)
+                } else if let Ok(cwd) = std::env::current_dir() {
+                    Self::normalize_path_components(&cwd.join(import_path))
                 } else {
-                    // Can't get cwd, skip validation
                     return Ok(());
                 }
+            } else if import_path.is_absolute() {
+                Self::normalize_path_components(import_path)
+            } else {
+                return Ok(());
             };
 
             if !abs_import.starts_with(&canonical_root) {
@@ -853,7 +1037,7 @@ impl Config {
     /// Merges configuration with the following priority (highest to lowest):
     /// 1. `nixpkgs.per_platform.{system}.{field}`
     /// 2. `nixpkgs.{field}` (base nixpkgs config)
-    /// 3. Top-level `{field}` (for allow_unfree, allow_broken, permitted_insecure_packages)
+    /// 3. Top-level `{field}` (for allow_unfree, allow_unsupported_system, allow_broken, permitted_insecure_packages)
     /// 4. Default value
     ///
     /// This matches the logic in bootstrapLib.nix's getPlatformConfig helper.
@@ -861,6 +1045,7 @@ impl Config {
         // Apply top-level settings (lowest priority for these fields)
         let mut config = NixpkgsConfig {
             allow_unfree: self.allow_unfree,
+            allow_unsupported_system: self.allow_unsupported_system,
             allow_broken: self.allow_broken,
             permitted_insecure_packages: self.permitted_insecure_packages.clone(),
             ..Default::default()
@@ -872,8 +1057,14 @@ impl Config {
             if base.allow_unfree {
                 config.allow_unfree = true;
             }
+            if base.allow_unsupported_system {
+                config.allow_unsupported_system = true;
+            }
             if base.allow_broken {
                 config.allow_broken = true;
+            }
+            if base.allow_non_source {
+                config.allow_non_source = true;
             }
             if base.cuda_support {
                 config.cuda_support = true;
@@ -881,11 +1072,23 @@ impl Config {
             if !base.cuda_capabilities.is_empty() {
                 config.cuda_capabilities = base.cuda_capabilities.clone();
             }
+            if base.rocm_support {
+                config.rocm_support = true;
+            }
             if !base.permitted_insecure_packages.is_empty() {
                 config.permitted_insecure_packages = base.permitted_insecure_packages.clone();
             }
             if !base.permitted_unfree_packages.is_empty() {
                 config.permitted_unfree_packages = base.permitted_unfree_packages.clone();
+            }
+            if !base.allowlisted_licenses.is_empty() {
+                config.allowlisted_licenses = base.allowlisted_licenses.clone();
+            }
+            if !base.blocklisted_licenses.is_empty() {
+                config.blocklisted_licenses = base.blocklisted_licenses.clone();
+            }
+            if base.android_sdk.is_some() {
+                config.android_sdk = base.android_sdk.clone();
             }
 
             // Apply per-platform config (highest priority)
@@ -893,14 +1096,23 @@ impl Config {
                 if platform_config.allow_unfree {
                     config.allow_unfree = true;
                 }
+                if platform_config.allow_unsupported_system {
+                    config.allow_unsupported_system = true;
+                }
                 if platform_config.allow_broken {
                     config.allow_broken = true;
+                }
+                if platform_config.allow_non_source {
+                    config.allow_non_source = true;
                 }
                 if platform_config.cuda_support {
                     config.cuda_support = true;
                 }
                 if !platform_config.cuda_capabilities.is_empty() {
                     config.cuda_capabilities = platform_config.cuda_capabilities.clone();
+                }
+                if platform_config.rocm_support {
+                    config.rocm_support = true;
                 }
                 if !platform_config.permitted_insecure_packages.is_empty() {
                     config.permitted_insecure_packages =
@@ -909,6 +1121,15 @@ impl Config {
                 if !platform_config.permitted_unfree_packages.is_empty() {
                     config.permitted_unfree_packages =
                         platform_config.permitted_unfree_packages.clone();
+                }
+                if !platform_config.allowlisted_licenses.is_empty() {
+                    config.allowlisted_licenses = platform_config.allowlisted_licenses.clone();
+                }
+                if !platform_config.blocklisted_licenses.is_empty() {
+                    config.blocklisted_licenses = platform_config.blocklisted_licenses.clone();
+                }
+                if platform_config.android_sdk.is_some() {
+                    config.android_sdk = platform_config.android_sdk.clone();
                 }
             }
         }
@@ -1077,19 +1298,19 @@ mod tests {
     }
 
     #[test]
-    fn strict_ports_field_serializes_as_camel_case() {
+    fn strict_ports_field_serializes_as_snake_case() {
         let mut config = Config::default();
         config.strict_ports = Some(true);
 
         let yaml = serde_yaml::to_string(&config).expect("Failed to serialize config");
-        assert!(yaml.contains("strictPorts: true"));
+        assert!(yaml.contains("strict_ports: true"));
     }
 
     #[test]
     fn strict_ports_field_not_serialized_when_none() {
         let config = Config::default();
         let yaml = serde_yaml::to_string(&config).expect("Failed to serialize config");
-        assert!(!yaml.contains("strictPorts"));
+        assert!(!yaml.contains("strict_ports"));
     }
 
     #[test]
@@ -1214,5 +1435,162 @@ inputs:
             "Should not be converted to relative path with ../, got: {}",
             url
         );
+    }
+
+    #[test]
+    fn imported_config_does_not_override_base_inputs() {
+        // When a sub project imports a shared config and both define the same
+        // input, the sub project's (base) definition should take precedence.
+        // Regression test for https://github.com/cachix/devenv/issues/2728
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let root = temp_dir.path();
+
+        // Initialize a git repo so import security checks pass
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(root)
+            .output()
+            .expect("Failed to git init");
+
+        // Shared config defines nixpkgs with the default URL
+        let shared_dir = root.join("shared");
+        std::fs::create_dir(&shared_dir).expect("Failed to create shared dir");
+        std::fs::write(
+            shared_dir.join("devenv.yaml"),
+            r#"
+inputs:
+  nixpkgs:
+    url: github:cachix/devenv-nixpkgs/rolling
+"#,
+        )
+        .expect("Failed to write shared config");
+
+        // Sub project imports shared and overrides nixpkgs
+        let sub_dir = root.join("sub");
+        std::fs::create_dir(&sub_dir).expect("Failed to create sub dir");
+        std::fs::write(
+            sub_dir.join("devenv.yaml"),
+            r#"
+inputs:
+  nixpkgs:
+    url: github:NixOS/nixpkgs/nixos-25.11
+
+imports:
+  - ../shared
+"#,
+        )
+        .expect("Failed to write sub config");
+
+        let config = Config::load_from(&sub_dir).expect("Failed to load config");
+
+        let nixpkgs = config.inputs.get("nixpkgs").expect("nixpkgs not found");
+        assert_eq!(
+            nixpkgs.url,
+            Some("github:NixOS/nixpkgs/nixos-25.11".to_string()),
+            "Base config's nixpkgs URL should take precedence over imported config's URL"
+        );
+    }
+
+    #[test]
+    fn check_version_none_always_passes() {
+        let config = Config::default();
+        assert!(config.check_version("2.0.7").is_ok());
+    }
+
+    #[test]
+    fn check_version_false_always_passes() {
+        let config = Config {
+            require_version: Some(RequireVersion::Match(false)),
+            ..Default::default()
+        };
+        assert!(config.check_version("2.0.7").is_ok());
+    }
+
+    #[test]
+    fn check_version_true_deferred_to_nix() {
+        let config = Config {
+            require_version: Some(RequireVersion::Match(true)),
+            ..Default::default()
+        };
+        // `true` is checked during Nix evaluation, so Rust check always passes
+        assert!(config.check_version("2.0.7").is_ok());
+        assert!(config.requires_version_match());
+    }
+
+    #[test]
+    fn check_version_exact_match() {
+        let config = Config {
+            require_version: Some(RequireVersion::Constraint("2.0.7".to_string())),
+            ..Default::default()
+        };
+        assert!(config.check_version("2.0.7").is_ok());
+        assert!(config.check_version("2.0.8").is_err());
+    }
+
+    #[test]
+    fn check_version_gte() {
+        let config = Config {
+            require_version: Some(RequireVersion::Constraint(">=2.0.0".to_string())),
+            ..Default::default()
+        };
+        assert!(config.check_version("2.0.0").is_ok());
+        assert!(config.check_version("2.0.7").is_ok());
+        assert!(config.check_version("3.0.0").is_ok());
+        assert!(config.check_version("1.9.9").is_err());
+    }
+
+    #[test]
+    fn check_version_lt() {
+        let config = Config {
+            require_version: Some(RequireVersion::Constraint("<3.0.0".to_string())),
+            ..Default::default()
+        };
+        assert!(config.check_version("2.0.7").is_ok());
+        assert!(config.check_version("3.0.0").is_err());
+    }
+
+    #[test]
+    fn check_version_two_component() {
+        let config = Config {
+            require_version: Some(RequireVersion::Constraint(">=2.1".to_string())),
+            ..Default::default()
+        };
+        assert!(config.check_version("2.1.0").is_ok());
+        assert!(config.check_version("2.1.5").is_ok());
+        assert!(config.check_version("2.0.9").is_err());
+    }
+
+    #[test]
+    fn check_version_invalid_constraint() {
+        let config = Config {
+            require_version: Some(RequireVersion::Constraint(">=abc".to_string())),
+            ..Default::default()
+        };
+        assert!(config.check_version("2.0.7").is_err());
+    }
+
+    #[test]
+    fn check_version_invalid_current() {
+        let config = Config {
+            require_version: Some(RequireVersion::Constraint(">=2.0.0".to_string())),
+            ..Default::default()
+        };
+        assert!(config.check_version("not-a-version").is_err());
+    }
+
+    #[test]
+    fn require_version_yaml_bool() {
+        let yaml = "require_version: true\n";
+        let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let rv: RequireVersion = serde_yaml::from_value(parsed["require_version"].clone()).unwrap();
+        assert_eq!(rv, RequireVersion::Match(true));
+    }
+
+    #[test]
+    fn require_version_yaml_string() {
+        let yaml = "require_version: \">=2.0.0\"\n";
+        let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let rv: RequireVersion = serde_yaml::from_value(parsed["require_version"].clone()).unwrap();
+        assert_eq!(rv, RequireVersion::Constraint(">=2.0.0".to_string()));
     }
 }

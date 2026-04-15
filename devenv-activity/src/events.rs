@@ -144,6 +144,17 @@ pub enum FetchKind {
     Copy,
 }
 
+impl FetchKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FetchKind::Download => "download",
+            FetchKind::Query => "query",
+            FetchKind::Tree => "tree",
+            FetchKind::Copy => "copy",
+        }
+    }
+}
+
 /// A filesystem or environment operation observed during Nix evaluation.
 ///
 /// These operations are logged during evaluation and can be used for
@@ -351,6 +362,8 @@ pub enum ProcessStatus {
     Ready,
     /// Stop + start cycle in progress.
     Restarting,
+    /// Graceful shutdown in progress (SIGTERM sent, waiting for exit and port release).
+    Stopping,
     /// Exited.
     Stopped,
 }
@@ -360,7 +373,20 @@ impl ProcessStatus {
     pub fn is_active(&self) -> bool {
         matches!(
             self,
-            Self::Waiting | Self::Starting | Self::Running | Self::Ready | Self::Restarting
+            Self::Waiting
+                | Self::Starting
+                | Self::Running
+                | Self::Ready
+                | Self::Restarting
+                | Self::Stopping
+        )
+    }
+
+    /// Whether the process can be stopped by the user.
+    pub fn is_stoppable(&self) -> bool {
+        matches!(
+            self,
+            Self::Starting | Self::Running | Self::Ready | Self::Restarting
         )
     }
 }
@@ -491,6 +517,26 @@ pub enum ActivityOutcome {
     Skipped,
     /// Task's dependency failed
     DependencyFailed,
+}
+
+impl ActivityOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ActivityOutcome::Success => "success",
+            ActivityOutcome::Failed => "failed",
+            ActivityOutcome::Cancelled => "cancelled",
+            ActivityOutcome::Cached => "cached",
+            ActivityOutcome::Skipped => "skipped",
+            ActivityOutcome::DependencyFailed => "dependency_failed",
+        }
+    }
+
+    pub fn is_error(&self) -> bool {
+        matches!(
+            self,
+            ActivityOutcome::Failed | ActivityOutcome::DependencyFailed
+        )
+    }
 }
 
 /// Activity level (maps to tracing::Level)
@@ -769,5 +815,17 @@ mod tests {
             }
             _ => panic!("Expected Operation::Complete event"),
         }
+    }
+
+    #[test]
+    fn test_is_stoppable() {
+        assert!(!ProcessStatus::NotStarted.is_stoppable());
+        assert!(!ProcessStatus::Waiting.is_stoppable());
+        assert!(ProcessStatus::Starting.is_stoppable());
+        assert!(ProcessStatus::Running.is_stoppable());
+        assert!(ProcessStatus::Ready.is_stoppable());
+        assert!(ProcessStatus::Restarting.is_stoppable());
+        assert!(!ProcessStatus::Stopping.is_stoppable());
+        assert!(!ProcessStatus::Stopped.is_stoppable());
     }
 }

@@ -1,4 +1,6 @@
 use super::{InteractiveArgs, RcfileContext, ShellDialect};
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Bash shell dialect implementation.
@@ -54,7 +56,16 @@ fi
 export PATH="$_DEVENV_PATH"
 # Note: _DEVENV_PATH is kept set for the reload hook to restore PATH after direnv
 
-# Hot-reload hook (keybinding and PROMPT_COMMAND integration)
+# Source terminal shell integration that was bypassed by --noprofile --rcfile.
+# Ghostty injects via --posix + ENV which our launch flags override, so
+# re-source its integration here. GHOSTTY_BASH_INJECT is already unset,
+# so the script only defines hooks and PROMPT_COMMAND without re-sourcing
+# profile/bashrc.
+if [[ -n "${{GHOSTTY_RESOURCES_DIR:-}}" && -r "${{GHOSTTY_RESOURCES_DIR}}/shell-integration/bash/ghostty.bash" ]]; then
+    source "${{GHOSTTY_RESOURCES_DIR}}/shell-integration/bash/ghostty.bash"
+fi
+
+# Hot-reload hook (PROMPT_COMMAND integration)
 {reload_hook}
 
 # Re-enable history after init
@@ -224,13 +235,9 @@ __devenv_restore_path() {{
 }}
 
 __devenv_reload_hook() {{
+    __devenv_reload_apply
     __devenv_restore_path
 }}
-
-if [[ $- == *i* ]] && command -v bind >/dev/null 2>&1; then
-    __devenv_reload_keybind="${{DEVENV_RELOAD_KEYBIND:-\\e\\C-r}}"
-    bind -x "\"${{__devenv_reload_keybind}}\":__devenv_reload_apply"
-fi
 
 # Append hook so it runs AFTER direnv's _direnv_hook (only if not already added)
 if [[ "$PROMPT_COMMAND" != *"__devenv_reload_hook"* ]]; then
@@ -247,5 +254,27 @@ fi
 
     fn prompt_prefix(&self) -> &str {
         r#"PS1="(devenv) ${PS1:-}"#
+    }
+
+    fn format_task_exports(&self, exports: &BTreeMap<String, String>) -> String {
+        let mut result = String::with_capacity(exports.len() * 50);
+        for (key, value) in exports {
+            result.push_str("export ");
+            result.push_str(&shell_escape::escape(Cow::Borrowed(key)));
+            result.push('=');
+            result.push_str(&shell_escape::escape(Cow::Borrowed(value)));
+            result.push('\n');
+        }
+        result
+    }
+
+    fn format_task_messages(&self, messages: &[String]) -> String {
+        let mut result = String::with_capacity(messages.len() * 40);
+        for msg in messages {
+            result.push_str("printf '%s\\n' ");
+            result.push_str(&shell_escape::escape(Cow::Borrowed(msg)));
+            result.push('\n');
+        }
+        result
     }
 }

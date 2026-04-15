@@ -12,6 +12,16 @@ use std::path::{Path, PathBuf};
 use crate::config::Input;
 use crate::nix_args::NixArgs;
 
+/// Build the shared eval-cache key input used by the FFI backend and shell
+/// watcher lookups.
+pub fn eval_cache_key_args(
+    nix_args_str: &str,
+    port_allocation_enabled: bool,
+    strict_ports: bool,
+) -> String {
+    format!("{nix_args_str}:port_allocation={port_allocation_enabled}:strict_ports={strict_ports}")
+}
+
 /// Output of dev_env evaluation.
 #[derive(Debug, Clone, Default)]
 pub struct DevEnvOutput {
@@ -54,8 +64,6 @@ pub struct Options {
     pub refresh_cached_output: bool,
     /// Maximum number of results to return (for search). None means unlimited.
     pub max_results: Option<usize>,
-    /// Extra flags to pass to nix commands.
-    pub nix_flags: &'static [&'static str],
 }
 
 impl Default for Options {
@@ -66,20 +74,6 @@ impl Default for Options {
             cache_output: false,
             refresh_cached_output: false,
             max_results: Some(100),
-            nix_flags: &[
-                "--show-trace",
-                "--extra-experimental-features",
-                "nix-command",
-                "--extra-experimental-features",
-                "flakes",
-                "--option",
-                "lazy-trees",
-                "true",
-                "--option",
-                "warn-dirty",
-                "false",
-                "--keep-going",
-            ],
         }
     }
 }
@@ -105,8 +99,17 @@ pub trait NixBackend: Send + Sync {
     /// Get the development environment
     async fn dev_env(&self, json: bool, gc_root: &Path) -> Result<DevEnvOutput>;
 
-    /// Open a Nix REPL
-    async fn repl(&self) -> Result<()>;
+    /// Evaluate the devenv configuration in preparation for the REPL.
+    ///
+    /// This performs the heavy Nix evaluation with full activity/TUI support.
+    /// Must be called before `launch_repl()`.
+    async fn prepare_repl(&self) -> Result<()>;
+
+    /// Launch the interactive Nix REPL.
+    ///
+    /// Assumes `prepare_repl()` was called first to evaluate the configuration.
+    /// This takes over the terminal for interactive use.
+    async fn launch_repl(&self) -> Result<()>;
 
     /// Build the specified attributes
     async fn build(
@@ -153,5 +156,17 @@ pub trait NixBackend: Send + Sync {
     ///
     /// This clears any cached evaluation state to force re-evaluation on the next operation.
     /// Used by hot-reload to ensure file changes are picked up.
-    fn invalidate(&self);
+    fn invalidate(&self) -> Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eval_cache_key_args_includes_port_flags() {
+        let key = eval_cache_key_args("{ foo = 1; }", true, false);
+        assert!(key.contains("port_allocation=true"));
+        assert!(key.contains("strict_ports=false"));
+    }
 }

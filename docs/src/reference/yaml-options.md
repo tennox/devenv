@@ -66,17 +66,52 @@ See [Supported URI formats](../inputs.md#supported-uri-formats).
 
 *Type:* `string`
 
+## nixpkgs.androidSdk.acceptLicense
+
+Accept the Android SDK license.
+Can also be set via the `NIXPKGS_ACCEPT_ANDROID_SDK_LICENSE=1` environment variable.
+
+*Type:* `boolean` · *Default:* `false`
+
 ## nixpkgs.allowBroken
 
 Allow packages marked as broken.
 
 *Type:* `boolean` · *Default:* `false` · *Added in 1.7*
 
+## nixpkgs.allowNonSource
+
+Allow packages not built from source.
+
+*Type:* `boolean` · *Default:* `true` (nixpkgs default)
+
+## nixpkgs.allowUnsupportedSystem
+
+Allow packages that are not supported on the current system.
+
+*Type:* `boolean` · *Default:* `false` · *Added in 2.0.5*
+
 ## nixpkgs.allowUnfree
 
 Allow unfree packages.
 
 *Type:* `boolean` · *Default:* `false` · *Added in 1.7*
+
+## nixpkgs.allowlistedLicenses
+
+A list of license names to allow.
+Uses nixpkgs license attribute names (e.g. `gpl3Only`, `mit`, `asl20`).
+See [nixpkgs license list](https://github.com/NixOS/nixpkgs/blob/master/lib/licenses.nix).
+
+*Type:* `list of string` · *Default:* `[]`
+
+## nixpkgs.blocklistedLicenses
+
+A list of license names to block.
+Uses nixpkgs license attribute names (e.g. `unfree`, `bsl11`).
+See [nixpkgs license list](https://github.com/NixOS/nixpkgs/blob/master/lib/licenses.nix).
+
+*Type:* `list of string` · *Default:* `[]`
 
 ## nixpkgs.cudaCapabilities
 
@@ -89,6 +124,12 @@ Select CUDA capabilities for nixpkgs.
 Enable CUDA support for nixpkgs.
 
 *Type:* `boolean` · *Default:* `false` · *Added in 1.7*
+
+## nixpkgs.rocmSupport
+
+Enable ROCm support for nixpkgs.
+
+*Type:* `boolean` · *Default:* `false` · *Added in 2.0.7*
 
 ## nixpkgs.permittedInsecurePackages
 
@@ -105,7 +146,7 @@ A list of unfree packages to allow by name.
 ## nixpkgs.per-platform.\<system\>
 
 Per-platform nixpkgs configuration.
-Accepts the same options as `nixpkgs` (`allowBroken`, `allowUnfree`, `cudaCapabilities`, `cudaSupport`, `permittedInsecurePackages`, `permittedUnfreePackages`).
+Accepts the same options as `nixpkgs`.
 
 *Type:* `attribute set of nixpkgs config` · *Added in 1.7*
 
@@ -148,3 +189,26 @@ Error if a port is already in use instead of auto-allocating the next available 
 Can be overridden by `--strict-ports` or `--no-strict-ports` CLI flags.
 
 *Type:* `boolean` · *Default:* `false`
+
+## require_version
+
+Require a specific devenv CLI version. Set to `true` to enforce that the CLI version matches
+the modules version (from the `devenv` input), or use a constraint string with operators.
+
+```yaml
+# Enforce CLI matches modules version (recommended for teams)
+require_version: true
+
+# Or use an explicit constraint
+require_version: ">=2.1"
+```
+
+Supported constraint operators: `>=`, `<=`, `>`, `<`, `=`, or a bare version for exact match.
+
+When set to `true`, the check happens during Nix evaluation and compares the CLI version
+against the version embedded in the `devenv` input. This keeps versions in sync automatically
+after running `devenv update`.
+
+*Type:* `boolean | string` · *Default:* not set
+
+!!! tip "New in version 2.1"

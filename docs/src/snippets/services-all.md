@@ -19,6 +19,7 @@
   services.memcached.enable = true;
   services.minio.enable = true;
   services.mongodb.enable = true;
+  services.mosquitto.enable = true;
   services.mysql.enable = true;
   services.nats.enable = true;
   services.nginx.enable = true;
@@ -29,6 +30,7 @@
   services.prometheus.enable = true;
   services.rabbitmq.enable = true;
   services.redis.enable = true;
+  services.rustfs.enable = true;
   services.sqld.enable = true;
   services.tailscale.enable = true;
   services.temporal.enable = true;

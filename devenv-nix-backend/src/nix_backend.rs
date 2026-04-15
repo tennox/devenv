@@ -15,22 +15,23 @@ use cstr::cstr;
 use include_dir::{Dir, include_dir};
 use tokio_shutdown::Shutdown;
 
-use devenv_activity::{Activity, ActivityInstrument, ActivityLevel};
+use devenv_activity::{Activity, ActivityInstrument, activity};
 use devenv_cache_core::compute_string_hash;
 use devenv_core::PortAllocator;
-use devenv_core::cachix::{CachixCacheInfo, CachixConfig, CachixManager};
+use devenv_core::cachix::{Cachix, CachixCacheInfo, CachixManager};
 use devenv_core::config::{Input, NixpkgsConfig};
 use devenv_core::eval_op::EvalOp;
 use devenv_core::nix_args::NixArgs;
 use devenv_core::nix_backend::{
     DevEnvOutput, DevenvPaths, NixBackend, Options, PackageSearchResult, SearchResults,
+    eval_cache_key_args,
 };
 use devenv_core::nix_log_bridge::{EvalActivityGuard, NixLogBridge};
 use devenv_core::{CacheSettings, NixSettings};
 use devenv_eval_cache::{
     CacheError, CachedEval, CachingConfig, CachingEvalService, CachingEvalState, ResourceManager,
 };
-use miette::{IntoDiagnostic, Result, WrapErr, miette};
+use miette::{IntoDiagnostic, Result, WrapErr, bail, miette};
 use nix_bindings_expr::eval_state::{EvalState, EvalStateBuilder, gc_register_my_thread};
 use nix_bindings_expr::primop::{PrimOp, PrimOpMeta};
 use nix_bindings_expr::to_json::value_to_json;
@@ -108,10 +109,6 @@ pub struct NixRustBackend {
     // Note: Uses tokio::sync::OnceCell to match the framework layer type
     eval_cache_pool: Option<Arc<tokio::sync::OnceCell<sqlx::SqlitePool>>>,
 
-    // Flag to force cache bypass on next operation (for hot-reload)
-    // Set by invalidate(), checked and cleared by dev_env()
-    cache_invalidated: AtomicBool,
-
     // Cachix manager for handling binary cache configuration
     cachix_manager: Arc<CachixManager>,
 
@@ -145,11 +142,16 @@ pub struct NixRustBackend {
     // Lock ordering: cached_devenv_value → nix_log_bridge.observers (via replay_ops).
     cached_devenv_value: Mutex<Option<(nix_bindings_expr::value::Value, Vec<EvalOp>)>>,
 
-    // Caching wrapper around EvalState (drops first — releases Arc to eval_state)
-    caching_eval_state: OnceCell<CachingEvalState<Arc<Mutex<EvalState>>>>,
+    // Flag set by the resource invalidation callback to signal that cached_devenv_value
+    // should be cleared before the next use. Needed because Value is not Send.
+    devenv_value_invalidated: Arc<AtomicBool>,
 
-    // EvalState (drops after caching wrapper; its C++ destructor may reference the store)
-    eval_state: Arc<Mutex<EvalState>>,
+    // Caching wrapper around EvalState (drops first — releases Arc to eval_state)
+    caching_eval_state: OnceCell<CachingEvalState<Arc<Mutex<Option<EvalState>>>>>,
+
+    // EvalState (drops after caching wrapper; its C++ destructor may reference the store).
+    // Option allows dropping old state before creating new one during hot-reload.
+    eval_state: Arc<Mutex<Option<EvalState>>>,
 
     // Store (EvalState destructor may reference it)
     #[allow(dead_code)]
@@ -198,6 +200,20 @@ pub struct NixRustBackend {
 unsafe impl Send for NixRustBackend {}
 unsafe impl Sync for NixRustBackend {}
 
+fn core_config_watch_paths(root: &Path) -> Vec<PathBuf> {
+    [
+        "devenv.nix",
+        "devenv.yaml",
+        "devenv.lock",
+        "devenv.local.nix",
+        "devenv.local.yaml",
+    ]
+    .into_iter()
+    .map(|path| root.join(path))
+    .filter(|path| path.exists())
+    .collect()
+}
+
 /// RAII guard that manages eval_state lock and evaluation activity tracking.
 ///
 /// When created (via `eval_session(activity)`):
@@ -211,20 +227,20 @@ unsafe impl Sync for NixRustBackend {}
 /// The caller owns the Activity and controls its lifecycle. This guard just
 /// ensures file evaluations are logged to the correct activity.
 pub(crate) struct EvalSession<'a> {
-    guard: std::sync::MutexGuard<'a, EvalState>,
+    guard: std::sync::MutexGuard<'a, Option<EvalState>>,
     _eval_activity: EvalActivityGuard<'a>,
 }
 
 impl<'a> std::ops::Deref for EvalSession<'a> {
     type Target = EvalState;
     fn deref(&self) -> &Self::Target {
-        &self.guard
+        self.guard.as_ref().expect("EvalState not available")
     }
 }
 
 impl<'a> std::ops::DerefMut for EvalSession<'a> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.guard
+        self.guard.as_mut().expect("EvalState not available")
     }
 }
 
@@ -307,17 +323,26 @@ impl NixRustBackend {
             .wrap_err("Failed to create fetchers settings")?;
 
         // Write pre-computed nixpkgs config to temp file for NIXPKGS_CONFIG env var
-        // Wrap in a let expression that adds allowUnfreePredicate (a Nix function)
-        // Note: NIXPKGS_CONFIG expects a file path, not inline Nix content
+        // Wrap in a let expression that adds predicate functions.
+        // Note: NIXPKGS_CONFIG expects a file path, not inline Nix content.
+        // We do NOT override allowInsecurePredicate: nixpkgs' check-meta.nix
+        // natively creates it from permittedInsecurePackages using the full
+        // derivation name (with version). Our old getName via parseDrvName
+        // stripped the version, causing mismatches.
+        // For unfree packages, nixpkgs does not natively support
+        // permittedUnfreePackages, so we provide a custom predicate.
         let nixpkgs_config_base = ser_nix::to_string(&nixpkgs_config)
             .map_err(|e| miette::miette!("Failed to serialize nixpkgs config: {}", e))?;
         let nixpkgs_config_nix = format!(
-            r#"let cfg = {base}; in cfg // {{
+            r#"let
+  cfg = {base};
+  getName = pkg: (builtins.parseDrvName (pkg.name or pkg.pname or "")).name;
+in cfg // {{
   allowUnfreePredicate =
     if cfg.allowUnfree or false then
       (_: true)
     else if (cfg.permittedUnfreePackages or []) != [] then
-      (pkg: builtins.elem ((builtins.parseDrvName (pkg.name or pkg.pname or pkg)).name) (cfg.permittedUnfreePackages or []))
+      (pkg: builtins.elem (getName pkg) (cfg.permittedUnfreePackages or []))
     else
       (_: false);
 }}"#,
@@ -432,7 +457,6 @@ impl NixRustBackend {
             nixpkgs_config_path,
             nix_log_bridge: log_bridge,
             eval_cache_pool,
-            cache_invalidated: AtomicBool::new(false),
             cachix_manager,
             cachix_daemon: cachix_daemon.clone(),
             cachix_activity: cachix_activity.clone(),
@@ -441,8 +465,9 @@ impl NixRustBackend {
             shutdown: shutdown.clone(),
             port_allocator,
             cached_devenv_value: Mutex::new(None),
+            devenv_value_invalidated: Arc::new(AtomicBool::new(false)),
             caching_eval_state: OnceCell::new(),
-            eval_state: Arc::new(Mutex::new(eval_state)),
+            eval_state: Arc::new(Mutex::new(Some(eval_state))),
             store: Arc::new(store),
             flake_settings,
             fetchers_settings,
@@ -474,6 +499,10 @@ impl NixRustBackend {
             .eval_state
             .lock()
             .map_err(|e| miette!("Failed to lock eval state: {}", e))?;
+
+        if guard.is_none() {
+            bail!("EvalState is not available (hot-reload may have failed to create a new one)");
+        }
 
         // begin_eval returns a guard that calls end_eval on drop
         let eval_activity = self.nix_log_bridge.begin_eval(activity.id());
@@ -651,6 +680,14 @@ impl NixRustBackend {
         &self,
         eval_state: &mut EvalState,
     ) -> Result<nix_bindings_expr::value::Value> {
+        // Check if the resource invalidation callback requested clearing the cache
+        if self.devenv_value_invalidated.swap(false, Ordering::AcqRel) {
+            let mut cached = self
+                .cached_devenv_value
+                .lock()
+                .map_err(|e| miette!("Failed to lock cached devenv value: {}", e))?;
+            *cached = None;
+        }
         {
             let cached = self
                 .cached_devenv_value
@@ -739,12 +776,9 @@ impl NixRustBackend {
                 .wrap_err("Failed to set system")?;
         }
 
-        // impure: allow impure evaluation (relaxes hermeticity)
-        if nix_settings.impure {
-            settings::set("impure", "1")
-                .to_miette()
-                .wrap_err("Failed to set impure mode")?;
-        } else {
+        // pure-eval: restrict evaluation to explicitly declared inputs
+        // When impure mode is requested, skip setting pure-eval (defaults to false)
+        if !nix_settings.impure {
             // Enable pure evaluation by default when not in impure mode
             // This restricts file system and network access during evaluation
             settings::set("pure-eval", "true")
@@ -763,6 +797,20 @@ impl NixRustBackend {
             .to_miette()
             .wrap_err("Failed to set use-registries")?;
 
+        // refresh_fetchers: bypass Nix's fetcher cache (equivalent to nix --refresh)
+        if nix_settings.refresh_fetchers {
+            settings::set("tarball-ttl", "0")
+                .to_miette()
+                .wrap_err("Failed to set tarball-ttl")?;
+        }
+
+        // show-trace: always show full evaluation stack traces on error
+        // Without this, Nix truncates traces and suggests --show-trace which
+        // does not exist in the devenv CLI.
+        settings::set("show-trace", "true")
+            .to_miette()
+            .wrap_err("Failed to set show-trace")?;
+
         // nix_options: apply custom Nix configuration pairs
         // These are passed as pairs: ["key1", "value1", "key2", "value2", ...]
         for pair in nix_settings.nix_options.chunks_exact(2) {
@@ -776,29 +824,25 @@ impl NixRustBackend {
         Ok(())
     }
 
-    /// Get cachix configuration from devenv.nix via eval cache.
+    /// Evaluate a single cachix config field via the eval cache.
     ///
-    /// Returns the cachix configuration if enabled, None otherwise.
-    async fn get_cachix_config(&self) -> Result<Option<CachixCacheInfo>> {
-        if self.nix_settings.offline {
-            return Ok(None);
-        }
-
+    /// Evaluating individual fields avoids forcing expensive fields like `binary`
+    /// (which requires evaluating the cachix derivation) when they are not needed.
+    async fn eval_cachix_field<T: serde::de::DeserializeOwned>(&self, field: &str) -> Result<T> {
         let caching_state = self
             .caching_eval_state
             .get()
             .expect("assemble() must be called first");
 
-        let cache_key = caching_state.cache_key("config.cachix");
-        let activity = Activity::evaluate("Checking cachix config")
-            .level(ActivityLevel::Debug)
-            .start();
+        let attr_path = format!("config.cachix.{}", field);
+        let cache_key = caching_state.cache_key(&attr_path);
+        let activity = activity!(DEBUG, evaluate, format!("Checking cachix.{}", field));
 
-        let (json_str, _cache_hit) = async {
+        let (json_str, _) = async {
             caching_state
                 .cached_eval()
                 .eval(&cache_key, &activity, || async {
-                    self.eval_attr_uncached("config.cachix", "config.cachix", &activity)
+                    self.eval_attr_uncached(&attr_path, &attr_path, &activity)
                 })
                 .await
         }
@@ -806,17 +850,28 @@ impl NixRustBackend {
         .await
         .map_err(cache_error_to_miette)?;
 
-        let cachix_config: CachixConfig = match serde_json::from_str(&json_str) {
-            Ok(config) => config,
-            Err(e) => {
-                tracing::warn!("Failed to parse cachix config: {}", e);
-                return Ok(None);
-            }
-        };
+        serde_json::from_str(&json_str)
+            .into_diagnostic()
+            .wrap_err(format!("Failed to parse cachix.{}", field))
+    }
 
-        if !cachix_config.enable {
+    /// Get cachix configuration from devenv.nix via eval cache.
+    ///
+    /// Only evaluates lightweight fields (enable, pull, push). The expensive
+    /// `binary` field (which forces the cachix derivation) is evaluated
+    /// separately via `eval_cachix_field` only when needed.
+    async fn get_cachix_config(&self) -> Result<Option<CachixCacheInfo>> {
+        if self.nix_settings.offline {
             return Ok(None);
         }
+
+        let enable: bool = self.eval_cachix_field("enable").await?;
+        if !enable {
+            return Ok(None);
+        }
+
+        let pull: Vec<String> = self.eval_cachix_field("pull").await?;
+        let push: Option<String> = self.eval_cachix_field("push").await?;
 
         // Load known keys from trusted keys file
         let trusted_keys_path = &self.cachix_manager.paths.trusted_keys;
@@ -830,9 +885,8 @@ impl NixRustBackend {
         };
 
         Ok(Some(CachixCacheInfo {
-            caches: cachix_config.caches,
+            caches: Cachix { pull, push },
             known_keys,
-            binary: cachix_config.binary,
         }))
     }
 
@@ -884,7 +938,7 @@ impl NixRustBackend {
     ///
     /// This matches the behavior of flakes - locks are automatically created/updated as needed.
     async fn validate_lock_file(&self, inputs: &BTreeMap<String, Input>) -> Result<()> {
-        use crate::{create_flake_inputs, load_lock_file};
+        use crate::{create_flake_inputs, load_lock_file, write_lock_file};
 
         let fetch_settings = &self.fetchers_settings;
         let flake_settings = &self.flake_settings;
@@ -929,9 +983,7 @@ impl NixRustBackend {
             .mode(LockMode::Virtual)
             .use_registries(true);
 
-        let activity = Activity::evaluate("Validating lock")
-            .level(ActivityLevel::Debug)
-            .start();
+        let activity = activity!(DEBUG, evaluate, "Validating lock");
 
         let lock_result = {
             let eval_state = self.eval_session(&activity)?;
@@ -943,8 +995,14 @@ impl NixRustBackend {
         match lock_result {
             Ok(new_lock) => {
                 if new_lock.has_changes(&old_lock).to_miette()? {
-                    tracing::debug!("Lock validation found changes, updating lock");
-                    return self.update(&None, inputs, &[]).await;
+                    tracing::debug!("Lock validation found changes, writing updated lock");
+                    // Write the new lock directly instead of calling update(), which
+                    // would call update_all() and re-fetch every input. The new_lock
+                    // was computed with the old lock as a base, so unchanged inputs
+                    // are preserved and only new/changed inputs are resolved.
+                    write_lock_file(&new_lock, &lock_file_path)
+                        .to_miette()
+                        .wrap_err("Failed to write lock file")?;
                 }
             }
             Err(e) => {
@@ -975,7 +1033,7 @@ impl NixRustBackend {
             dry_run: false,
         };
 
-        let activity = Activity::operation(format!("Pushing to {}", push_cache)).start();
+        let activity = activity!(INFO, operation, format!("Pushing to {}", push_cache));
 
         match crate::cachix_daemon::OwnedDaemon::spawn(
             spawn_config,
@@ -1095,20 +1153,45 @@ impl NixBackend for NixRustBackend {
         let lock_file = crate::load_lock_file(&self.fetchers_settings, &lock_file_path)
             .to_miette()
             .wrap_err("Failed to load lock file for fingerprint computation")?;
-        crate::compute_lock_fingerprint(lock_file.as_ref(), &self.store)
+        crate::compute_lock_fingerprint(lock_file.as_ref(), &self.fetchers_settings, &self.store)
             .to_miette()
             .wrap_err("Failed to compute lock fingerprint")
     }
 
     async fn assemble(&self, args: &NixArgs<'_>) -> Result<()> {
+        // Validate lock file FIRST so the lock fingerprint is stable for cache key computation.
+        // On first run, the lock file doesn't exist yet, so lock_fingerprint (computed before
+        // this call) returns the hash of "". validate_lock_file creates it, and we re-compute
+        // the fingerprint below so the cache key matches what subsequent runs will produce.
+        self.validate_lock_file(args.devenv_inputs).await?;
+
         // Initialize caching eval state if not already set
         if self.caching_eval_state.get().is_none() {
-            let args_nix = ser_nix::to_string(args).unwrap_or_else(|_| "{}".to_string());
-            let cache_key_args = format!(
-                "{}:port_allocation={}:strict_ports={}",
-                args_nix,
+            // Re-compute the lock fingerprint now that validate_lock_file has ensured
+            // the lock file exists. This corrects the cache key on first run.
+            let lock_fingerprint = self.lock_fingerprint().await?;
+            let corrected_args;
+            let args_to_serialize = if lock_fingerprint != args.lock_fingerprint {
+                tracing::debug!(
+                    old = %args.lock_fingerprint,
+                    new = %lock_fingerprint,
+                    "Lock fingerprint changed after validation, using corrected value for cache key"
+                );
+                corrected_args = NixArgs {
+                    lock_fingerprint: &lock_fingerprint,
+                    ..args.clone()
+                };
+                &corrected_args
+            } else {
+                args
+            };
+            let args_nix =
+                ser_nix::to_string(args_to_serialize).unwrap_or_else(|_| "{}".to_string());
+
+            let cache_key_args = eval_cache_key_args(
+                &args_nix,
                 self.port_allocator.is_enabled(),
-                self.port_allocator.is_strict()
+                self.port_allocator.is_strict(),
             );
 
             // Unquote special Nix expressions that should be evaluated
@@ -1132,6 +1215,7 @@ impl NixBackend for NixRustBackend {
                 if let Some(pool) = pool_cell.get() {
                     let config = CachingConfig {
                         force_refresh: self.cache_settings.refresh_eval_cache,
+                        extra_watch_paths: core_config_watch_paths(&self.paths.root),
                         // NIXPKGS_CONFIG is already tracked via NixArgs.nixpkgs_config
                         excluded_envs: vec!["NIXPKGS_CONFIG".to_string()],
                         // The nixpkgs config file content is already reflected in the cache key
@@ -1140,8 +1224,12 @@ impl NixBackend for NixRustBackend {
                     };
                     let service = CachingEvalService::with_config(pool.clone(), config.clone());
                     tracing::debug!(?config, "Eval caching enabled from framework pool");
+                    let invalidation_flag = self.devenv_value_invalidated.clone();
                     CachedEval::with_cache(service, self.nix_log_bridge.clone(), config)
                         .with_resource_manager(resource_manager)
+                        .with_on_resource_invalidation(Arc::new(move || {
+                            invalidation_flag.store(true, Ordering::Release);
+                        }))
                 } else {
                     tracing::debug!("Eval caching disabled (pool not ready)");
                     CachedEval::without_cache(self.nix_log_bridge.clone())
@@ -1157,16 +1245,24 @@ impl NixBackend for NixRustBackend {
             self.caching_eval_state.set(caching_eval_state).ok();
         }
 
-        // Validate lock file once during assembly
-        // This ensures all subsequent evaluations have a valid lock to work with
-        self.validate_lock_file(args.devenv_inputs).await?;
-
         // Configure cachix substituters and start daemon if push is configured
         if let Some(cachix_config) = self.get_cachix_config().await? {
             self.apply_cachix_substituters(&cachix_config).await?;
             if let Some(ref push_cache) = cachix_config.caches.push {
-                self.init_cachix_daemon(push_cache, &cachix_config.binary)
-                    .await?;
+                // Prefer "cachix" from PATH (bundled via the devenv wrapper).
+                // Only evaluate config.cachix.binary (which forces the cachix
+                // derivation) as a fallback when cachix is not on PATH.
+                let binary = match which::which("cachix") {
+                    Ok(path) => path,
+                    Err(_) => {
+                        // Evaluate the binary path, then build the package so
+                        // the store path is actually realized on disk.
+                        let binary_path: PathBuf = self.eval_cachix_field("binary").await?;
+                        self.build(&["config.cachix.package"], None, None).await?;
+                        binary_path
+                    }
+                };
+                self.init_cachix_daemon(push_cache, &binary).await?;
             }
         }
 
@@ -1187,18 +1283,11 @@ impl NixBackend for NixRustBackend {
         // Create cache key for shell paths
         let cache_key = caching_state.cache_key("shell");
 
-        // Check if cache was invalidated (for hot-reload)
-        let cache_invalidated = self.cache_invalidated.swap(false, Ordering::AcqRel);
-        if cache_invalidated {
-            tracing::debug!("Cache bypassed due to invalidation (hot-reload)");
-        }
-
         // Try to get cached paths and verify they still exist
         // Note: dev_env requires explicit path validation because store paths can be GC'd
-        let cached_paths: Option<CachedShellPaths> = if cache_invalidated {
-            // Skip cache lookup entirely when invalidated
-            None
-        } else if let Some(service) = caching_state.cached_eval().service() {
+        let cached_paths: Option<CachedShellPaths> = if let Some(service) =
+            caching_state.cached_eval().service()
+        {
             match service.get_cached(&cache_key).await {
                 Ok(Some(cached)) => {
                     match serde_json::from_str::<CachedShellPaths>(&cached.json_output) {
@@ -1226,7 +1315,17 @@ impl NixBackend for NixRustBackend {
                                             error = %e,
                                             "Resource replay failed for shell cache hit, re-evaluating"
                                         );
+                                        // Purge all port-dependent cache entries
+                                        if let Some(svc) = caching_state.cached_eval().service() {
+                                            if let Err(db_err) = devenv_eval_cache::db::delete_evals_with_resource_specs(svc.pool()).await {
+                                                tracing::warn!(error = %db_err, "Failed to delete port-dependent cache entries");
+                                            }
+                                        }
                                         caching_state.cached_eval().clear_resources();
+                                        // Clear cached Nix value to force fresh evaluation
+                                        if let Ok(mut cached) = self.cached_devenv_value.lock() {
+                                            *cached = None;
+                                        }
                                         None
                                     }
                                 }
@@ -1260,16 +1359,16 @@ impl NixBackend for NixRustBackend {
             None
         };
 
-        let activity = Activity::evaluate("Evaluating shell")
-            .level(ActivityLevel::Info)
-            .start();
+        let activity = activity!(INFO, evaluate, "Evaluating shell");
 
         let (drv_path_str, out_path_str, env_path, cache_hit) = if let Some(paths) = cached_paths {
             // Cache hit - skip evaluation entirely
             activity.cached();
             (paths.drv_path, paths.out_path, paths.env_path, true)
         } else {
-            // Cache miss or invalid paths - do full evaluation
+            // Cache miss or invalid paths - do full evaluation.
+            // For hot-reload, the fresh EvalState ensures Nix re-evaluates files,
+            // and the eval cache's validate_inputs detects file content changes.
             let result = async {
                 caching_state
                     .cached_eval()
@@ -1356,12 +1455,35 @@ impl NixBackend for NixRustBackend {
         })
     }
 
-    async fn repl(&self) -> Result<()> {
+    async fn prepare_repl(&self) -> Result<()> {
         // Initialize the Nix command library (REPL support)
         nix_cmd::init()
             .to_miette()
             .wrap_err("Failed to initialize Nix command library")?;
 
+        // Evaluate the devenv configuration (the slow part).
+        // Result is cached in cached_devenv_value for launch_repl().
+        let activity = activity!(INFO, evaluate, "Evaluating Nix");
+        let mut eval_state = self.eval_session(&activity)?;
+        let devenv_attrs = self.get_or_eval_devenv(&mut eval_state)?;
+
+        // Force evaluation so the module system runs now (with TUI active)
+        // rather than lazily during launch_repl().
+        eval_state
+            .force(&devenv_attrs)
+            .to_miette()
+            .wrap_err("Failed to evaluate devenv configuration")?;
+
+        // Also force pkgs since launch_repl() will access it
+        eval_state
+            .require_attrs_select(&devenv_attrs, "pkgs")
+            .to_miette()
+            .wrap_err("Failed to evaluate pkgs attribute")?;
+
+        Ok(())
+    }
+
+    async fn launch_repl(&self) -> Result<()> {
         // Reset the logger to restore normal stderr output for the REPL
         self.activity_logger.reset();
 
@@ -1370,20 +1492,16 @@ impl NixBackend for NixRustBackend {
             eprintln!("{}", error);
         }
 
-        // Lock the eval_state for REPL access
-        let activity = Activity::evaluate("Evaluating Nix")
-            .level(ActivityLevel::Info)
-            .start();
+        let activity = activity!(INFO, evaluate, "Launching REPL");
         let mut eval_state = self.eval_session(&activity)?;
 
         // Check if there's a pending debugger session from a previous error
-        // If so, run the debugger REPL which has the error context
         let status = if nix_cmd::debugger_is_pending() {
             nix_cmd::debugger_run_pending(&mut eval_state)
                 .to_miette()
                 .wrap_err("Debugger REPL failed")?
         } else {
-            // Load default.nix with primops into the REPL scope
+            // get_or_eval_devenv uses the cached result from prepare_repl()
             let devenv_attrs = self.get_or_eval_devenv(&mut eval_state)?;
 
             // Create a ValMap to inject variables into the REPL scope
@@ -1494,9 +1612,7 @@ impl NixBackend for NixRustBackend {
                 None
             };
 
-            let activity = Activity::evaluate(format!("Evaluating {}", attr_path))
-                .level(ActivityLevel::Info)
-                .start();
+            let activity = activity!(INFO, evaluate, format!("Evaluating {}", attr_path));
 
             let (path_str, cache_hit) = if let Some(path) = cached_path {
                 // Cache hit - skip evaluation entirely
@@ -1581,9 +1697,7 @@ impl NixBackend for NixRustBackend {
             let clean_path = attr_path.trim_start_matches(".#");
 
             let cache_key = caching_state.cache_key(clean_path);
-            let activity = Activity::evaluate("Evaluating Nix")
-                .level(ActivityLevel::Info)
-                .start();
+            let activity = activity!(INFO, evaluate, "Evaluating Nix");
 
             let attr_path_owned = attr_path.to_string();
             let clean_path_owned = clean_path.to_string();
@@ -1698,9 +1812,7 @@ impl NixBackend for NixRustBackend {
 
         // Get eval state from mutex only when needed for locking
         // This ensures we reuse the same eval state across calls
-        let activity = Activity::evaluate("Updating inputs")
-            .level(ActivityLevel::Info)
-            .start();
+        let activity = activity!(INFO, evaluate, "Updating inputs");
         let eval_state = self.eval_session(&activity)?;
 
         // Lock the inputs - pass eval_state by reference to avoid cloning
@@ -1764,9 +1876,7 @@ impl NixBackend for NixRustBackend {
         // Uses the nix search C API which handles recurseForDerivations logic
         // Respects overlays, locked versions, and devenv configuration
 
-        let activity = Activity::evaluate("Searching packages")
-            .level(ActivityLevel::Info)
-            .start();
+        let activity = activity!(INFO, evaluate, "Searching packages");
         let mut eval_state = self.eval_session(&activity)?;
 
         // Import default.nix with primops to get the configured pkgs
@@ -1824,8 +1934,6 @@ impl NixBackend for NixRustBackend {
     }
 
     async fn gc(&self, paths: Vec<PathBuf>) -> Result<(u64, u64)> {
-        use devenv_activity::Activity;
-
         // Delete store paths using FFI
         // Strategy: Try to delete each path individually, skipping paths that
         // are still alive (referenced by other GC roots).
@@ -1844,7 +1952,7 @@ impl NixBackend for NixRustBackend {
         let mut total_bytes_freed = 0u64;
         let total_paths = paths.len() as u64;
 
-        let activity = Activity::operation("Deleting store paths").start();
+        let activity = activity!(INFO, operation, "Deleting store paths");
 
         for (i, path) in paths.iter().enumerate() {
             let path_str = match path.to_str() {
@@ -1948,41 +2056,35 @@ impl NixBackend for NixRustBackend {
         }
     }
 
-    fn invalidate(&self) {
-        // Set the invalidation flag so the next dev_env() call bypasses cache
-        self.cache_invalidated.store(true, Ordering::Release);
+    fn invalidate(&self) -> Result<()> {
+        // Clear cached devenv value FIRST — it holds a Nix Value pointer into the
+        // old EvalState's GC heap. Dropping EvalState while this reference exists
+        // risks use-after-free during GC finalization.
+        self.cached_devenv_value
+            .lock()
+            .map_err(|e| {
+                miette!("Failed to clear cached devenv value, skipping EvalState replacement: {e}")
+            })?
+            .take();
 
-        // Clear cached devenv value — it belongs to the old EvalState's GC heap.
-        // If this fails, we must NOT replace the EvalState, as the cached Value
-        // would point into the freed GC heap (use-after-free).
-        match self.cached_devenv_value.lock() {
-            Ok(mut cached) => *cached = None,
-            Err(e) => {
-                tracing::error!(
-                    "Failed to clear cached devenv value, skipping EvalState replacement: {}",
-                    e
-                );
-                return;
-            }
-        }
+        // Drop old EvalState BEFORE creating new one to ensure C++ global state
+        // (fileEvalCache, GC roots, etc.) is fully cleaned up first.
+        let mut guard = self
+            .eval_state
+            .lock()
+            .map_err(|e| miette!("Failed to lock eval state for replacement: {e}"))?;
 
-        // Replace the EvalState to clear C++ fileEvalCache.
-        // The old EvalState caches evalFile() results by path, so reusing it
-        // returns stale ASTs even when files have changed on disk.
-        match self.create_fresh_eval_state() {
-            Ok(new_state) => match self.eval_state.lock() {
-                Ok(mut guard) => {
-                    *guard = new_state;
-                    tracing::debug!("EvalState replaced for hot-reload");
-                }
-                Err(e) => {
-                    tracing::error!("Failed to lock eval state for replacement: {}", e);
-                }
-            },
-            Err(e) => {
-                tracing::error!("Failed to create fresh eval state for reload: {}", e);
-            }
-        }
+        let old_state = guard.take();
+        drop(old_state);
+        tracing::debug!("Old EvalState dropped for hot-reload");
+
+        let new_state = self
+            .create_fresh_eval_state()
+            .map_err(|e| miette!("Failed to create fresh eval state for reload: {e}"))?;
+        *guard = Some(new_state);
+        tracing::debug!("Fresh EvalState created for hot-reload");
+
+        Ok(())
     }
 }
 
@@ -2373,5 +2475,27 @@ impl Drop for NixRustBackend {
         // Callers who want to wait for cleanup should call
         // shutdown.wait_for_shutdown_complete().await before dropping.
         self.shutdown.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::core_config_watch_paths;
+    use tempfile::TempDir;
+
+    #[test]
+    fn core_config_watch_paths_only_tracks_existing_project_files() {
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        std::fs::write(temp_dir.path().join("devenv.nix"), "{ ... }: { }").unwrap();
+        std::fs::write(temp_dir.path().join("devenv.yaml"), "inputs: {}\n").unwrap();
+        std::fs::write(temp_dir.path().join("devenv.lock"), "{}\n").unwrap();
+
+        let tracked = core_config_watch_paths(temp_dir.path());
+
+        assert!(tracked.contains(&temp_dir.path().join("devenv.nix")));
+        assert!(tracked.contains(&temp_dir.path().join("devenv.yaml")));
+        assert!(tracked.contains(&temp_dir.path().join("devenv.lock")));
+        assert!(!tracked.contains(&temp_dir.path().join("devenv.local.nix")));
+        assert!(!tracked.contains(&temp_dir.path().join("devenv.local.yaml")));
     }
 }

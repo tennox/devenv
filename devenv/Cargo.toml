@@ -17,8 +17,10 @@ devenv-processes.workspace = true
 devenv-tasks.workspace = true
 devenv-tui.workspace = true
 devenv-cache-core.workspace = true
+devenv-event-sources.workspace = true
 devenv-reload.workspace = true
 devenv-shell.workspace = true
+portable-pty.workspace = true
 devenv-snix-backend = { workspace = true, optional = true }
 devenv-nix-backend.workspace = true
 rand.workspace = true
@@ -33,7 +35,6 @@ dialoguer.workspace = true
 dotlock.workspace = true
 fd-lock.workspace = true
 futures.workspace = true
-hex.workspace = true
 hostname.workspace = true
 include_dir.workspace = true
 indoc.workspace = true
@@ -47,7 +48,6 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 ser_nix.workspace = true
-sha2.workspace = true
 sqlx.workspace = true
 tempfile.workspace = true
 termimad.workspace = true
@@ -68,11 +68,17 @@ rmcp.workspace = true
 rmcp-macros.workspace = true
 axum.workspace = true
 async-trait.workspace = true
-blake3.workspace = true
 chrono.workspace = true
 secretspec.workspace = true
 secrecy.workspace = true
+url.workspace = true
 valuable.workspace = true
+
+# Optional OpenTelemetry dependencies
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
 
 # Optional snix dependencies
 snix-eval = { workspace = true, optional = true }
@@ -90,7 +96,16 @@ vergen-gitcl.workspace = true
 devenv-nix-backend-macros.workspace = true
 
 [features]
-default = []
+default = ["otlp-grpc"]
+otlp = [
+  "dep:opentelemetry",
+  "dep:opentelemetry_sdk",
+  "dep:tracing-opentelemetry",
+  "dep:opentelemetry-otlp",
+]
+otlp-grpc = ["otlp", "opentelemetry-otlp/grpc-tonic"]
+otlp-http-protobuf = ["otlp", "opentelemetry-otlp/http-proto"]
+otlp-http-json = ["otlp", "opentelemetry-otlp/http-json"]
 test-all = [
   "test-mcp",
   "devenv-processes/test-all",

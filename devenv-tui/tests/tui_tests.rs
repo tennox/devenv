@@ -1124,6 +1124,73 @@ fn test_error_message_without_details() {
     insta::assert_snapshot!(output);
 }
 
+/// Test that failed evaluations show error details inline (not hidden behind navigation).
+/// The error details must be propagated from the child Message to the parent Evaluate
+/// activity's build_logs, because the child expires after the linger duration and gets
+/// pushed out by newer children (max_lines=5 default).
+/// Regression test for https://github.com/cachix/devenv/issues/2720
+#[test]
+fn test_evaluate_failed_shows_error_details() {
+    let (mut model, ui_state) = new_test_model();
+
+    // Start an evaluation
+    let eval_event = ActivityEvent::Evaluate(Evaluate::Start {
+        id: 1,
+        name: "Evaluating shell".to_string(),
+        level: ActivityLevel::Info,
+        parent: None,
+        timestamp: Timestamp::now(),
+    });
+    model.apply_activity_event(eval_event);
+
+    // Add an error message with details (as nix_log_bridge does for eval errors)
+    let error_event = ActivityEvent::Message(Message {
+        id: 100,
+        level: ActivityLevel::Error,
+        text: "Evaluation error: Failed to get drvPath from shell derivation".to_string(),
+        details: Some(
+            "… while evaluating the option `packages':\n\
+             … while evaluating definitions from `languages/rust.nix':\n\
+             \n\
+             error: To use 'languages.rust.channel', run the following command:\n\
+             \n\
+             $ devenv inputs add rust-overlay github:oxalica/rust-overlay --follows nixpkgs"
+                .to_string(),
+        ),
+        parent: Some(1),
+        timestamp: Timestamp::now(),
+    });
+    model.apply_activity_event(error_event);
+
+    // Complete the evaluation with failure
+    let complete_event = ActivityEvent::Evaluate(Evaluate::Complete {
+        id: 1,
+        outcome: ActivityOutcome::Failed,
+        timestamp: Timestamp::now(),
+    });
+    model.apply_activity_event(complete_event);
+
+    // Simulate the child error message expiring: backdate it past the linger duration,
+    // then add 5 lingering siblings to fill max_lines and push the expired error out.
+    if let Some(child) = model.activities.get_mut(&100) {
+        child.completed_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+    }
+    for i in 0..5 {
+        let filler = ActivityEvent::Message(Message {
+            id: 200 + i,
+            level: ActivityLevel::Info,
+            text: format!("evaluating file {i}"),
+            details: None,
+            parent: Some(1),
+            timestamp: Timestamp::now(),
+        });
+        model.apply_activity_event(filler);
+    }
+
+    let output = render_to_string(&model, &ui_state);
+    insta::assert_snapshot!(output);
+}
+
 /// Test that failed devenv operations show logs automatically (not just when selected).
 #[test]
 fn test_devenv_failed_shows_logs() {
@@ -1267,16 +1334,16 @@ fn test_selectable_ids_dedup_for_multi_parent_tasks() {
     let selectable = model.get_selectable_activity_ids();
     assert_eq!(selectable, vec![1, 3]);
 
-    ui_state.select_next_activity(&selectable);
+    ui_state.select_activity(&selectable, true);
     assert_eq!(ui_state.selected_activity, Some(1));
 
-    ui_state.select_next_activity(&selectable);
+    ui_state.select_activity(&selectable, true);
     assert_eq!(ui_state.selected_activity, Some(3));
 
-    ui_state.select_next_activity(&selectable);
+    ui_state.select_activity(&selectable, true);
     assert_eq!(ui_state.selected_activity, Some(3));
 
-    ui_state.select_previous_activity(&selectable);
+    ui_state.select_activity(&selectable, false);
     assert_eq!(ui_state.selected_activity, Some(1));
 }
 

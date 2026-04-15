@@ -849,57 +849,65 @@ impl ShellSession {
 
         // Spawn stdin reader thread
         let stdin_tx = event_tx_internal.clone();
-        std::thread::spawn(move || {
-            let mut stdin = stdin_source;
-            let mut buf = [0u8; 1024];
-            loop {
-                match stdin.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if stdin_tx
-                            .blocking_send(Event::Stdin(buf[..n].to_vec()))
-                            .is_err()
-                        {
+        std::thread::Builder::new()
+            .name("session-stdin".into())
+            .spawn(move || {
+                let mut stdin = stdin_source;
+                let mut buf = [0u8; 1024];
+                loop {
+                    match stdin.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if stdin_tx
+                                .blocking_send(Event::Stdin(buf[..n].to_vec()))
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("session: stdin read error: {}", e);
                             break;
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!("session: stdin read error: {}", e);
-                        break;
-                    }
                 }
-            }
-        });
+            })
+            .expect("failed to spawn session-stdin thread");
 
         // Spawn PTY reader thread
         let pty_tx = event_tx_internal.clone();
         let pty_reader = Arc::clone(&pty);
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            loop {
-                match pty_reader.read(&mut buf) {
-                    Ok(0) => {
-                        let exit_code = pty_reader.try_wait().ok().flatten().map(|s| s.exit_code());
-                        let _ = pty_tx.blocking_send(Event::PtyExit(exit_code));
-                        break;
-                    }
-                    Ok(n) => {
-                        if pty_tx
-                            .blocking_send(Event::PtyOutput(buf[..n].to_vec()))
-                            .is_err()
-                        {
+        std::thread::Builder::new()
+            .name("session-pty".into())
+            .spawn(move || {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match pty_reader.read(&mut buf) {
+                        Ok(0) => {
+                            let exit_code =
+                                pty_reader.try_wait().ok().flatten().map(|s| s.exit_code());
+                            let _ = pty_tx.blocking_send(Event::PtyExit(exit_code));
+                            break;
+                        }
+                        Ok(n) => {
+                            if pty_tx
+                                .blocking_send(Event::PtyOutput(buf[..n].to_vec()))
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("session: PTY read error: {}", e);
+                            let exit_code =
+                                pty_reader.try_wait().ok().flatten().map(|s| s.exit_code());
+                            let _ = pty_tx.blocking_send(Event::PtyExit(exit_code));
                             break;
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!("session: PTY read error: {}", e);
-                        let exit_code = pty_reader.try_wait().ok().flatten().map(|s| s.exit_code());
-                        let _ = pty_tx.blocking_send(Event::PtyExit(exit_code));
-                        break;
-                    }
                 }
-            }
-        });
+            })
+            .expect("failed to spawn session-pty thread");
 
         // Forward coordinator commands to internal event channel
         let cmd_tx = event_tx_internal.clone();
@@ -979,6 +987,21 @@ impl ShellSession {
                 tokio::select! {
                     event = event_rx.recv() => event,
                     _ = tokio::time::sleep(spinner_interval) => {
+                        if self.config.show_status_line {
+                            queue!(stdout, terminal::BeginSynchronizedUpdate)?;
+                            self.status_line.draw(stdout, self.size.cols, self.size.rows)?;
+                            renderer.write_cursor(stdout, vt)?;
+                            queue!(stdout, terminal::EndSynchronizedUpdate)?;
+                            stdout.flush()?;
+                        }
+                        continue;
+                    }
+                }
+            } else if let Some(remaining) = self.status_line.state().reloaded_remaining() {
+                tokio::select! {
+                    event = event_rx.recv() => event,
+                    _ = tokio::time::sleep(remaining) => {
+                        self.status_line.state_mut().clear_reloaded();
                         if self.config.show_status_line {
                             queue!(stdout, terminal::BeginSynchronizedUpdate)?;
                             self.status_line.draw(stdout, self.size.cols, self.size.rows)?;
@@ -1256,7 +1279,7 @@ impl ShellSession {
             }
 
             ShellCommand::ReloadApplied => {
-                self.status_line.state_mut().clear();
+                self.status_line.state_mut().set_reloaded();
             }
 
             ShellCommand::WatchedFiles { files } => {
@@ -1366,6 +1389,10 @@ impl ShellSession {
     }
 
     /// Reset any forwarded DEC modes on exit so the terminal is left clean.
+    ///
+    /// XTSHIFTESCAPE and DECSCUSR are forwarded without explicit cleanup:
+    /// mouse tracking modes (cleaned up above) make XTSHIFTESCAPE inert,
+    /// and most terminals reset cursor shape on their own.
     fn cleanup_forwarded_modes(esc: &EscapeState, stdout: &mut impl Write) -> io::Result<()> {
         let mut needs_flush = false;
         if esc.in_alternate_screen {

@@ -9,18 +9,21 @@ let
   envContainerName = builtins.getEnv "DEVENV_CONTAINER";
   projectRoot = builtins.path { path = self; name = "source"; };
 
-  nix2containerInput = config.lib.getInput {
-    name = "nix2container";
-    url = "github:nlewo/nix2container";
-    attribute = "containers";
-    follows = [ "nixpkgs" ];
-  };
-  nix2container = nix2containerInput.packages.${pkgs.stdenv.system};
-  mk-shell-bin = config.lib.getInput {
-    name = "mk-shell-bin";
-    url = "github:rrbutani/nix-mk-shell-bin";
-    attribute = "containers";
-  };
+  requiredInputs = config.lib.getInputs [
+    {
+      name = "nix2container";
+      url = "github:nlewo/nix2container";
+      attribute = "containers";
+      follows = [ "nixpkgs" ];
+    }
+    {
+      name = "mk-shell-bin";
+      url = "github:rrbutani/nix-mk-shell-bin";
+      attribute = "containers";
+    }
+  ];
+  nix2container = requiredInputs.nix2container.packages.${pkgs.stdenv.system};
+  mk-shell-bin = requiredInputs.mk-shell-bin;
   shell = mk-shell-bin.lib.mkShellBin { drv = config.shell; nixpkgs = pkgs; };
   bash = "${pkgs.bashInteractive}/bin/bash";
   mkEntrypoint = cfg: pkgs.writeScript "entrypoint" ''
@@ -93,7 +96,7 @@ let
     };
 
 
-  mkDerivation = cfg: nix2container.nix2container.buildImage {
+  mkDerivation = cfg: nix2container.nix2container.buildImage ({
     name = cfg.name;
     tag = cfg.version;
     initializeNixDatabase = true;
@@ -158,7 +161,9 @@ let
         then cfg.startupCommand
         else [ cfg.startupCommand ];
     };
-  };
+  } // lib.optionalAttrs (cfg.fromImage != null) {
+    fromImage = cfg.fromImage;
+  });
 
   # <container> <registry> <args>
   mkCopyScript = cfg: pkgs.writeShellScript "copy-container" ''
@@ -195,6 +200,12 @@ let
         description = "Name of the container.";
         defaultText = "top-level name or containers.mycontainer.name";
         default = "${projectName name}-${name}";
+      };
+
+      fromImage = lib.mkOption {
+        type = types.nullOr types.package;
+        description = "An existing OCI base image to build on top of, built with nix2container's pullImage.";
+        default = null;
       };
 
       version = lib.mkOption {
@@ -384,9 +395,9 @@ let
         internal = true;
         default = pkgs.writeShellScript "docker-run" ''
           if [ -t 0 ]; then
-            docker run -it ${config.name}:${config.version} "$@"
+            ${pkgs.docker-client}/bin/docker run -it ${config.name}:${config.version} "$@"
           else
-            docker run -i ${config.name}:${config.version} "$@"
+            ${pkgs.docker-client}/bin/docker run -i ${config.name}:${config.version} "$@"
           fi
         '';
       };
